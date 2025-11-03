@@ -1,9 +1,10 @@
-from PyQt6.QtCore import Qt, QSize, pyqtSignal
-from PyQt6.QtGui import QFont, QPixmap, QDragEnterEvent, QDropEvent, QMouseEvent
+from PyQt6.QtCore import Qt, QSize, pyqtSignal, QRect
+from PyQt6.QtGui import QFont, QPixmap, QDragEnterEvent, QDropEvent, QMouseEvent, QPainter, QColor
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton, QLineEdit, QComboBox,
     QHBoxLayout, QVBoxLayout, QGridLayout, QTableWidget, QTableWidgetItem, QHeaderView,
-    QSizePolicy, QSpacerItem, QButtonGroup, QStackedWidget, QFileDialog, QMessageBox
+    QSizePolicy, QSpacerItem, QButtonGroup, QStackedWidget, QFileDialog, QMessageBox, QProgressBar,
+    QSplitter, QCheckBox, QGroupBox, QScrollArea
 )
 from pathlib import Path
 import sys
@@ -333,7 +334,7 @@ class Chip(QLabel):
         """)
 
 class Card(QFrame):
-    def __init__(self, title: str, icon_emoji="🗂", trailing_widget: QWidget|None=None):
+    def __init__(self, title: str, trailing_widget: QWidget|None=None):
         super().__init__()
         self.setObjectName("Card")
         self.setStyleSheet("""
@@ -349,7 +350,7 @@ class Card(QFrame):
 
         # header
         hdr = QHBoxLayout()
-        title_lbl = QLabel(f"<b style='font-size:30px;'>{icon_emoji} {title}</b>")
+        title_lbl = QLabel(f"<b style='font-size:30px;'>{title}</b>")
         title_lbl.setTextFormat(Qt.TextFormat.RichText)
         hdr.addWidget(title_lbl)
         hdr.addStretch(1)
@@ -361,6 +362,8 @@ class Card(QFrame):
         self.body.setSpacing(10)
         lay.addLayout(self.body)
 
+
+
 class UploadPage(QWidget):
     def __init__(self, engine, parent=None):
         super().__init__(parent)
@@ -371,7 +374,7 @@ class UploadPage(QWidget):
         root.setSpacing(60)
 
         # ------------------ Card 1: Schedule Data Import ------------------
-        card1 = Card("Schedule Data Import", icon_emoji="🗓", trailing_widget=None)
+        card1 = Card("Schedule Data Import", trailing_widget=None)
         drop1 = FileDropArea(
             title="Schedule Data Import",
             exts=[".csv"],
@@ -400,7 +403,7 @@ class UploadPage(QWidget):
         card1.body.addWidget(opt)
 
         # ------------------ Card 2: 3D Building Model Upload ---------------
-        card2 = Card("3D Building Model Upload", icon_emoji="🏗")
+        card2 = Card("3D Building Model Upload")
         drop2 = FileDropArea(
             title="3D Building Model Upload",
             exts=[".ifc", ".rvt"],
@@ -433,7 +436,7 @@ class UploadPage(QWidget):
 
     # ---------------- Process Our Data ----------------
     REQUIRED_COLS = {
-        'Task ID', 'Task Type', 'Plan Start Date', 'Plan End Date', 'Plan Duration', 
+        'Task ID', 'Task Element', 'Task Type', 'Plan Start Date', 'Plan End Date', 'Plan Duration', 
         'Actual Start Date', 'Actual End Date', 'Actual Duration', 'Complete %', 
         'Slack Day', 'Risk', 'Predecessors', 'Difference'
     }
@@ -467,6 +470,290 @@ class UploadPage(QWidget):
                 conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{table}_start ON {table}(start_date)"))
             except Exception:
                 pass  # Index may already exist
+        
+# ---------- Helpers ----------
+def pill_label(text: str, bg: str, fg: str = "#0d0d0d") -> QLabel:
+    lab = QLabel(text)
+    lab.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    lab.setStyleSheet(f"""
+        QLabel {{
+            background: {bg};
+            color: {fg};
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 12px;
+        }}
+    """)
+    return lab
+
+"""
+def risk_badge(level: str) -> QLabel:
+    color = {"Low": "#34c759", "Medium": "#ff9f0a", "High": "#ff3b30"}.get(level, "#999")
+    return pill_label(level, "transparent", color)
+"""
+class ProgressBarCell(QWidget):
+    def __init__(self, percent: int):
+        super().__init__()
+        layout = QHBoxLayout(self); layout.setContentsMargins(0, 8, 0, 8)
+        bar = QProgressBar()
+        bar.setRange(0, 100)
+        bar.setValue(percent)
+        bar.setFormat(f"{percent}%")
+        bar.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        bar.setStyleSheet("""
+            QProgressBar {
+                background: #f1f3f5; border-radius: 6px; text-align: right; padding-right: 6px; height: 10px;
+                color: #0d0d0d; font-size: 11px;
+            }
+            QProgressBar::chunk { background: #0ea5e9; border-radius: 6px; }
+        """)
+        layout.addWidget(bar)
+"""
+ 
+class TimelineCell(QWidget):
+   
+    简易时间线：绘制一条浅灰底条，上面叠加2段彩色块（示例用蓝+深蓝，红代表高风险）
+    可根据需要扩展成按日期计算的真正甘特条。
+    
+    def __init__(self, segments: list[tuple[float, float, str]]):
+        super().__init__()
+        self.segments = segments
+        self.setMinimumHeight(22)
+
+    def paintEvent(self, e):
+        painter = QPainter(self)
+        rect = self.rect().adjusted(6, 8, -6, -8)
+        # 背景条
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(QColor("#e9ecef"))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(rect, 6, 6)
+        # 段条
+        for start, width, color in self.segments:
+            w = max(0, min(1.0, width)) * rect.width()
+            x = rect.x() + max(0, min(1.0, start)) * rect.width()
+            seg = QRect(int(x), rect.y(), int(w), rect.height())
+            painter.setBrush(QColor(color))
+            painter.drawRoundedRect(seg, 6, 6)
+"""
+
+class TagCell(QWidget):
+    def __init__(self, text: str, bg="#eef2ff", fg="#1e40af"):
+        super().__init__()
+        h = QHBoxLayout(self); h.setContentsMargins(0, 6, 0, 6)
+        h.addStretch(1)
+        h.addWidget(pill_label(text, bg, fg))
+        h.addStretch(1)
+
+# ---------- Main Window ----------
+class SchedulePage(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Schedule")
+        self.resize(1240, 760)
+        self._apply_style()
+        self._build_ui()
+
+    def _apply_style(self):
+        self.setStyleSheet("""
+            QMainWindow { background: #ffffff; }
+            QLabel.title { font-size: 14px; font-weight: 600; color: #111; }
+            QLabel.section { font-size: 12px; color:#111; font-weight:600; }
+            QGroupBox { border: none; margin-top: 8px; }
+            QPushButton {
+                background: #f1f3f5; border: 1px solid #e5e7eb; border-radius: 8px;
+                padding: 6px 10px; font-weight: 500;
+            }
+            QPushButton:hover { background:#e9ecef; }
+            QPushButton.primary {
+                background:#0ea5e9; color:white; border: none;
+            }
+            QComboBox, QLineEdit {
+                border:1px solid #e5e7eb; border-radius:8px; padding:6px 8px; background:#fff;
+            }
+            QTableWidget {
+                gridline-color: #eef1f4; selection-background-color: #dbeafe;
+                selection-color: #0d0d0d; font-size: 13px;
+            }
+            QHeaderView::section {
+                background:#f8fafc; padding:10px; border:none; border-bottom:1px solid #e5e7eb;
+                font-weight:600;
+            }
+            QCheckBox { font-size: 13px; }
+            QScrollArea { border: none; }
+            #SidePanel { background:#fafafa; border-right:1px solid #e5e7eb; }
+            #Toolbar { background:#ffffff; border-bottom:1px solid #e5e7eb; }
+            #ScenarioBtn { padding:6px 10px; border-radius:8px; }
+            #ScenarioBtn[active=\"true\"] { background:#111827; color:white; }
+        """)
+
+    def _build_ui(self):
+        splitter = QSplitter()
+        splitter.setHandleWidth(1)
+        splitter.addWidget(self._build_sidebar())
+        splitter.addWidget(self._build_main())
+
+        # 初始尺寸（左窄右宽）
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([300, 1000])
+
+        # 关键：把 splitter 放进本控件的布局
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(splitter)
+
+    # ----- Sidebar -----
+    def _build_sidebar(self) -> QWidget:
+        side = QWidget(); side.setObjectName("SidePanel")
+        layout = QVBoxLayout(side); layout.setContentsMargins(12, 12, 12, 12); layout.setSpacing(20)
+
+        hdr = QHBoxLayout()
+        t = QLabel("Filters"); t.setProperty("class", "title")
+        clear = QPushButton("Clear All"); clear.clicked.connect(self._clear_all_filters)
+        clear.setToolTip("Clear all filters")
+        hdr.addWidget(t); hdr.addStretch(1); hdr.addWidget(clear)
+        layout.addLayout(hdr)
+
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        body = QWidget(); v = QVBoxLayout(body); v.setContentsMargins(0,0,0,0); v.setSpacing(16)
+
+        sections = [
+            ("Status", ["Completed","In Progress","Delayed","Upcoming"]),
+            ("Type", ["Element Assembly","Transportation","Onsite Installation"]),
+            #("Risk Level", ["Low","Medium","High"]),
+            #("Zone", ["North Wing","South Wing","Core"]),
+            #("Level", ["Ground","Level 1"]),
+        ]
+        self._filter_boxes: list[QCheckBox] = []
+        for title, items in sections:
+            box = QGroupBox()
+            grid = QGridLayout(box); grid.setHorizontalSpacing(8); grid.setVerticalSpacing(6)
+            grid.addWidget(QLabel(title, parent=box, objectName=""), 0, 0, 1, 2, alignment=Qt.AlignmentFlag.AlignLeft)
+            r = 1; c = 0
+            for it in items:
+                cb = QCheckBox(it); cb.setChecked(True)
+                self._filter_boxes.append(cb)
+                grid.addWidget(cb, r, c)
+                c = 1 - c
+                if c == 0: r += 1
+            v.addWidget(box)
+
+        v.addStretch(1)
+        scroll.setWidget(body)
+        layout.addWidget(scroll)
+        return side
+
+    def _clear_all_filters(self):
+        for cb in self._filter_boxes:
+            cb.setChecked(False)
+
+    # ----- Main -----
+    def _build_main(self) -> QWidget:
+        wrap = QWidget()
+        v = QVBoxLayout(wrap); v.setContentsMargins(0,0,0,0); v.setSpacing(0)
+        v.addWidget(self._build_toolbar())
+        v.addWidget(self._build_table(), 1)
+        return wrap
+
+    def _build_toolbar(self) -> QWidget:
+        bar = QWidget(); bar.setObjectName("Toolbar")
+        h = QHBoxLayout(bar); h.setContentsMargins(12,10,12,10); h.setSpacing(10)
+
+        # Time Scale
+        h.addWidget(QLabel("Time Scale:"))
+        cb_timescale = QComboBox(); cb_timescale.addItems(["One Week","Two Weeks"]); cb_timescale.setCurrentText("One Week")
+        h.addWidget(cb_timescale)
+
+        # View
+        h.addSpacing(10)
+        h.addWidget(QLabel("View:"))
+        cb_view = QComboBox(); cb_view.addItems(["Current","Baseline"]); cb_view.setCurrentText("Baseline") # switch between different db
+        h.addWidget(cb_view)
+
+        # Scenario
+        h.addSpacing(18)
+        h.addWidget(QLabel("Scenario:"))
+        self.btn_master = QPushButton("Without Opt"); self.btn_master.setObjectName("ScenarioBtn"); self.btn_master.setProperty("active", True)
+        self.btn_a = QPushButton("What-if A"); self.btn_a.setObjectName("ScenarioBtn")
+        self.btn_b = QPushButton("What-if B"); self.btn_b.setObjectName("ScenarioBtn")
+        for b in (self.btn_master, self.btn_a, self.btn_b):
+            b.setCheckable(True); b.clicked.connect(self._scenario_clicked)
+        self.btn_master.setChecked(True)
+        h.addWidget(self.btn_master); h.addWidget(self.btn_a); h.addWidget(self.btn_b)
+        h.addStretch(1)
+
+        # Right buttons
+        btn_4d = QPushButton("4D Model")
+        btn_add = QPushButton("Add Task")
+        btn_export = QPushButton("Export")
+        for b in (btn_4d, btn_add, btn_export):
+            h.addWidget(b)
+        return bar
+
+    def _scenario_clicked(self):
+        # 互斥选择
+        sender = self.sender()
+        for b in (self.btn_master, self.btn_a, self.btn_b):
+            b.setChecked(b is sender)
+            b.setProperty("active", b is sender)
+            b.style().unpolish(b); b.style().polish(b); b.update()
+
+    def _build_table(self) -> QTableWidget:
+        table = QTableWidget(0, 8)
+        table.setHorizontalHeaderLabels([
+            "Element ID","Task Type", "Start","Finish", "Duration", "% Complete", "Delay", "Comment"
+        ])
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        for i, w in enumerate([150, 240, 120, 120, 120, 200, 120, 250]):
+            header.resizeSection(i, w)
+        table.verticalHeader().setVisible(False)
+        table.setShowGrid(False)
+        table.setAlternatingRowColors(False)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+
+        # 数据（示例与截图一致）
+        rows = [
+            ("T-101","Element Assembly", "Sep 1","Sep 15","15d",100,"0d", "None"),
+        ]
+
+        for r, row in enumerate(rows):
+            table.insertRow(r)
+            # 基本文字列
+            for c, val in enumerate([row[0], "", row[2], row[3], row[4], "", row[6], row[7]]):
+                item = QTableWidgetItem(val)
+                if c in (0, 1, 2, 3, 4, 5, 6, 7):  # all text in center
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter)
+                table.setItem(r, c, item)
+
+            # Trade 成 pill
+            trade = row[1]
+            color_map = {
+                "Element Assembly": ("#e6f4ff","#0b6bcb"),
+                "Transportation": ("#fff1f2","#be123c"),
+                "Onsite Installation": ("#f5f3ff","#6d28d9")
+            }
+            bg, fg = color_map.get(trade, ("#eef1f5","#0d0d0d"))
+            table.setCellWidget(r, 1, TagCell(trade, bg, fg))
+
+            # %Complete
+            table.setCellWidget(r, 5, ProgressBarCell(row[5]))
+
+            # Slack
+            #table.setItem(r, 8, QTableWidgetItem(row[8]))
+
+            # Risk
+            #table.setCellWidget(r, 9, risk_badge(row[9]))
+
+            # Timeline
+            #table.setCellWidget(r, 10, TimelineCell(row[10]))
+
+            # 尾部撑位
+            #table.setItem(r, 8, QTableWidgetItem(""))
+
+        return table
 
 class MainWindow(QMainWindow):
     def __init__(self, engine, parent=None):
@@ -533,7 +820,7 @@ def main():
     app = QApplication(sys.argv)
     app.setFont(QFont("Segoe UI"))
     engine = create_engine(
-        "sqlite:///input_database.db",  # 或你的PG/MySQL连接串
+        "sqlite:///input_database.db",  
         echo=False, future=True
     )
     w = MainWindow(engine=engine)
