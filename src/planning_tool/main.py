@@ -4,12 +4,13 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton, QLineEdit, QComboBox,
     QHBoxLayout, QVBoxLayout, QGridLayout, QTableWidget, QTableWidgetItem, QHeaderView,
     QSizePolicy, QSpacerItem, QButtonGroup, QStackedWidget, QFileDialog, QMessageBox, QProgressBar,
-    QSplitter, QCheckBox, QGroupBox, QScrollArea
+    QSplitter, QCheckBox, QGroupBox, QScrollArea, QInputDialog
 )
 from pathlib import Path
 import sys
 import pandas as pd
 from sqlalchemy import create_engine, text
+from planning_tool.datamanager import ScheduleDataManager
 
 
 class SidebarButton(QPushButton):
@@ -69,9 +70,16 @@ class TopBar(QFrame):
         title = QLabel("Dynamical Construction Planning Tool")
         title.setObjectName("appTitle")
 
-        project_combo = QComboBox()
-        project_combo.addItems(["Rapla Lasteaed", "Project A", "Project B"])
-        project_combo.setMinimumWidth(300)
+        self.project_combo = QComboBox()
+        # No initial items - projects will be added when created
+        self.project_combo.setMinimumWidth(300)
+        
+        # Delete project button (only visible when a project is selected)
+        self.delete_project_btn = QPushButton("🗑️")
+        self.delete_project_btn.setToolTip("Delete current project")
+        self.delete_project_btn.setFixedSize(32, 32)
+        self.delete_project_btn.setObjectName("DeleteProjectBtn")
+        self.delete_project_btn.hide()  # Hidden by default, shown when project selected
 
         search = QLineEdit()
         search.setPlaceholderText("Search tasks, resources…")
@@ -82,7 +90,8 @@ class TopBar(QFrame):
         #left.addWidget(brand)
         left.addWidget(title)
         left.addSpacing(40)
-        left.addWidget(project_combo)
+        left.addWidget(self.project_combo)
+        left.addWidget(self.delete_project_btn)
 
         lay = QHBoxLayout(self)
         lay.addLayout(left)
@@ -299,7 +308,7 @@ class FileDropArea(QFrame):
         filt = "Files (" + " ".join(f"*{e}" for e in self._exts) + ")"
         paths, _ = QFileDialog.getOpenFileNames(self, "Select files", "", filt)
         if paths:
-            self._emit_one(paths[0])  
+            self._emit_one(paths[0])  # Emit first selected file 
 
     # drag & drop
     def dragEnterEvent(self, e: QDragEnterEvent) -> None:
@@ -365,9 +374,12 @@ class Card(QFrame):
 
 
 class UploadPage(QWidget):
+    projectCreated = pyqtSignal(int, str)  # (project_id, project_name)
+    
     def __init__(self, engine, parent=None):
         super().__init__(parent)
         self.engine = engine
+        self.dm = ScheduleDataManager(self.engine)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)
@@ -379,7 +391,7 @@ class UploadPage(QWidget):
             title="Schedule Data Import",
             exts=[".csv"],
         )
-        drop1.fileSelected.connect(self.on_schedule_files) # we will connect this to our sql db later
+        drop1.fileSelected.connect(self.on_create_project_from_csv) # we will connect this to our sql db later
 
         card1.body.addWidget(drop1)
 
@@ -388,7 +400,7 @@ class UploadPage(QWidget):
         req_lay = QHBoxLayout(req_wrap)
         req_lay.setContentsMargins(0,0,0,0); req_lay.setSpacing(8)
         req_lay.addWidget(QLabel("<b>Required Fields in Upload</b>"))
-        for t in ["Task ID", "Task Name", "Plan Start Date", "Plan End Date", "Risk", "Predecessors"]:
+        for t in ["Module ID", "Installation Duration", "Production Duration", "Transportation Duration", "Installation Precedence"]:
             req_lay.addWidget(Chip(t))
         req_lay.addStretch(1)
         card1.body.addWidget(req_wrap)
@@ -406,7 +418,7 @@ class UploadPage(QWidget):
         card2 = Card("3D Building Model Upload")
         drop2 = FileDropArea(
             title="3D Building Model Upload",
-            exts=[".ifc", ".rvt"],
+            exts=[".rvt"],
         )
         drop2.fileSelected.connect(self.on_model_files)
         card2.body.addWidget(drop2)
@@ -425,10 +437,6 @@ class UploadPage(QWidget):
         root.addStretch(1)
 
     # ---------------- callbacks ----------------
-    def on_schedule_files(self, path: str):
-        df = self.parse_csv(path)
-        self._write_to_db(df, "schedule_tasks", if_exists="append")
-        QMessageBox.information(self, "Success", f"Imported {len(df):,} rows from:\n{path}")
 
     def on_model_files(self, path: str):
         # TODO: 在这里解析IFC/GLTF等或触发后端处理
@@ -436,40 +444,28 @@ class UploadPage(QWidget):
 
     # ---------------- Process Our Data ----------------
     REQUIRED_COLS = {
-        'Task ID', 'Task Element', 'Task Type', 'Plan Start Date', 'Plan End Date', 'Plan Duration', 
-        'Actual Start Date', 'Actual End Date', 'Actual Duration', 'Complete %', 
-        'Slack Day', 'Risk', 'Predecessors', 'Difference'
+        "Module ID", "Installation Duration", "Production Duration", "Transportation Duration", "Installation Precedence"
     }
 
-    def parse_csv(self, path: str) -> pd.DataFrame:
-        """Parse CSV file and process dates and durations"""
-        input_df = pd.read_csv(path)
-
-        # Convert date columns
-        for col in ("Plan Start Date", "Plan End Date"):
-            if col in input_df:
-                input_df[col] = pd.to_datetime(input_df[col], errors="coerce")
-
-        # Calculate planned duration (based on start and end dates)
-        if {"Plan Start Date", "Plan End Date"}.issubset(input_df.columns):
-            delta = input_df["Plan End Date"] - input_df["Plan Start Date"]
-            input_df["Plan Duration"] = (
-                delta.dt.total_seconds() / 3600
-            ).round(2).astype("Float64")
-
-        return input_df
-
-    def _write_to_db(self, df: pd.DataFrame, table: str, if_exists="append"):
-        """Write DataFrame to database"""
-        df.to_sql(table, self.engine, if_exists=if_exists, index=False, method="multi", chunksize=1000)
-
-        # Create indexes to improve query performance
-        with self.engine.begin() as conn:
-            try:
-                conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{table}_task_id ON {table}(task_id)"))
-                conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{table}_start ON {table}(start_date)"))
-            except Exception:
-                pass  # Index may already exist
+    def on_create_project_from_csv(self, path: str = None):
+        # If path is not provided (e.g., called from elsewhere), open file dialog
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(self, "Select CSV", "", "CSV Files (*.csv)")
+            if not path: 
+                return
+        
+        # Now ask for project name
+        name, ok = QInputDialog.getText(self, "New Project", "Project name:")
+        if not ok or not name.strip(): 
+            return
+        
+        try:
+            pid = self.dm.create_project_from_csv(name.strip(), path)
+            QMessageBox.information(self, "Created", f"Project '{name}' (ID={pid}) ready.")
+            # Emit signal to notify MainWindow to update project combo
+            self.projectCreated.emit(pid, name.strip())
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
         
 # ---------- Helpers ----------
 def pill_label(text: str, bg: str, fg: str = "#0d0d0d") -> QLabel:
@@ -756,11 +752,14 @@ class SchedulePage(QWidget):
         return table
 
 class MainWindow(QMainWindow):
-    def __init__(self, engine, parent=None):
+    def __init__(self, engine=None, parent=None):
         super().__init__()
         self.setWindowTitle("ConstructPlan - PyQt6")
         self.resize(1280, 760)
+        if engine is None:
+            engine = create_engine("sqlite:///scheduler.db", echo=False, future=True)
         self.engine = engine
+        self.mgr = ScheduleDataManager(engine)
 
         self.sidebar = Sidebar()
         self.sidebar.pageRequested.connect(self.switch_page)
@@ -769,6 +768,12 @@ class MainWindow(QMainWindow):
         self.dashboardtable.pageRequested.connect(self.switch_page)
 
         self.topbar = TopBar()
+        # Connect delete button signal
+        self.topbar.delete_project_btn.clicked.connect(self._on_delete_project_clicked)
+        self.project_lookup: dict[str, int] = {}
+        self.current_project_id: int | None = None
+        self._populate_project_combo()
+        self.topbar.project_combo.currentTextChanged.connect(self._on_project_selected)
 
         self.stack = QStackedWidget()
 
@@ -784,6 +789,8 @@ class MainWindow(QMainWindow):
 
         try:
             page_upload = UploadPage(engine=self.engine)
+            # Connect signal to update project combo in topbar
+            page_upload.projectCreated.connect(self._on_project_created)
         except NameError:
             page_upload = QLabel("Upload"); page_upload.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
@@ -814,6 +821,117 @@ class MainWindow(QMainWindow):
         idx = self.page_index.get(name)
         if idx is not None:
             self.stack.setCurrentIndex(idx)
+    
+    def _populate_project_combo(self):
+        """Load existing projects from DB into the combo box."""
+        projects = self.mgr.list_projects()
+        combo = self.topbar.project_combo
+        combo.blockSignals(True)
+        combo.clear()
+        self.project_lookup = {}
+        for proj in projects:
+            name = proj["project_name"]
+            pid = proj["project_id"]
+            self.project_lookup[name] = pid # we will use this pid later for executing processes on a specific project
+            combo.addItem(name)
+        combo.blockSignals(False)
+        if projects:
+            first_name = projects[0]["project_name"] # setting the first project as the default project
+            combo.setCurrentText(first_name)
+            self.current_project_id = projects[0]["project_id"]
+            self.topbar.delete_project_btn.show()  # Show delete button when projects exist
+        else:
+            self.current_project_id = None
+            self.topbar.delete_project_btn.hide()  # Hide delete button when no projects
+
+    def _on_project_selected(self, project_name: str):
+        """Triggered when user selects a project from the combo box."""
+        if project_name and project_name in self.project_lookup:
+            self.current_project_id = self.project_lookup[project_name]
+            self.topbar.delete_project_btn.show()  # Show delete button when project is selected
+            # Future: refresh views based on selected project tables
+        else:
+            self.current_project_id = None
+            self.topbar.delete_project_btn.hide()  # Hide delete button when no project selected
+
+    def _on_project_created(self, project_id: int, project_name: str):
+        """Handler for when a new project is created - updates the project combo"""
+        combo = self.topbar.project_combo
+        existing = [combo.itemText(i) for i in range(combo.count())]
+        self.project_lookup[project_name] = project_id
+        if project_name not in existing:
+            combo.addItem(project_name)
+        combo.setCurrentText(project_name)
+        self.current_project_id = project_id
+        self.topbar.delete_project_btn.show()  # Show delete button when project exists
+    
+    def _on_delete_project_clicked(self):
+        """Handler for delete project button click"""
+        if not self.current_project_id:
+            return
+        
+        current_name = self.topbar.project_combo.currentText()
+        if not current_name:
+            return
+        
+        # Confirm deletion
+        reply = QMessageBox.question(
+            self,
+            "Delete Project",
+            f"Are you sure you want to delete project '{current_name}'?\n\n"
+            "This will permanently delete:\n"
+            "- All input data (raw_schedule)\n"
+            "- All optimization results (solution_schedule)\n"
+            "- All summary and inventory data\n\n"
+            "This action cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                # Delete the project from database
+                success = self.mgr.delete_project(self.current_project_id)
+                
+                if success:
+                    # Remove from combo box
+                    combo = self.topbar.project_combo
+                    index = combo.findText(current_name)
+                    if index >= 0:
+                        combo.removeItem(index)
+                    
+                    # Remove from lookup
+                    if current_name in self.project_lookup:
+                        del self.project_lookup[current_name]
+                    
+                    # Update current project
+                    if combo.count() > 0:
+                        # Select first project if available
+                        new_name = combo.itemText(0)
+                        combo.setCurrentText(new_name)
+                        self.current_project_id = self.project_lookup.get(new_name)
+                    else:
+                        # No projects left
+                        self.current_project_id = None
+                        self.topbar.delete_project_btn.hide()
+                    
+                    QMessageBox.information(
+                        self,
+                        "Project Deleted",
+                        f"Project '{current_name}' has been deleted successfully."
+                    )
+                else:
+                    QMessageBox.critical(
+                        self,
+                        "Delete Failed",
+                        f"Failed to delete project '{current_name}'. Please check the console for details."
+                    )
+            except Exception as e:
+                QMessageBox.critical(
+                    self,
+                    "Error",
+                    f"An error occurred while deleting the project:\n{str(e)}"
+                )
 
 
 def main():

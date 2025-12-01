@@ -1,0 +1,512 @@
+from gurobipy import Model, GRB, quicksum
+import pandas as pd
+from sqlalchemy import Engine, text
+from typing import Optional, Dict, Any
+
+class PrefabScheduler:
+    def __init__(self,
+                 N,
+                 T,
+                 d,
+                 E,
+                 D,
+                 L,
+                 C_install,
+                 M_machine,
+                 S_site,
+                 S_fac,
+                 OC,
+                 C_I,
+                 C_F, 
+                 C_O):
+        """
+        in English
+        N: number of modules (real modules 1..N)
+        T: time horizon
+        d: installation duration dict{i: duration}
+        E: installation precedence list of (i, j)
+        D: factory production duration dict{i: duration}
+        L: transport / extra lead time dict{i: lead time}
+        C_install: crew number at site
+        M_machine: machine number at factory
+        S_site: onsite storage capacity
+        S_fac: factory buffer storage capacity
+        OC: cost per order batch
+        C_I: penalty cost per unit time
+        C_F: factory inventory cost per unit time per unit
+        """
+        self.N = N
+        self.T = T
+        self.d = d.copy()
+        self.E = E
+        self.D = D
+        self.L = L
+        self.C_install = C_install
+        self.M_machine = M_machine
+        self.S_site = S_site
+        self.S_fac = S_fac
+        self.OC = OC
+        self.C_I = C_I
+        self.C_F = C_F
+        self.C_O = C_O
+        # dummies
+        self.dummy_start = 0
+        self.dummy_end = N + 1
+        self.d[self.dummy_start] = 0
+        self.d[self.dummy_end] = 0
+
+        # placeholders: model & variables
+        self.m = None
+        self.x = {}
+        self.y = {}
+        self.p = {}
+        self.I = {}
+        self.q = {}
+        self.z = {}
+        self.F = {}
+
+        # preprocessing roots / leaves
+        self.roots, self.leaves = self._find_roots_and_leaves()
+
+    def _find_roots_and_leaves(self):
+        preds = {i: [] for i in range(1, self.N + 1)}
+        succs = {i: [] for i in range(1, self.N + 1)}
+        for (i, j) in self.E:
+            succs[i].append(j)
+            preds[j].append(i)
+        roots = [i for i in range(1, self.N + 1) if len(preds[i]) == 0]
+        leaves = [i for i in range(1, self.N + 1) if len(succs[i]) == 0]    
+        return roots, leaves
+
+    def build_model(self):
+        m = Model("prefab_with_factory_buffer")
+        m.Params.TimeLimit = 120      # 最多算 120 秒
+        m.Params.MIPGap    = 0.2     # 允许 20% 最优间隙
+        m.Params.MIPFocus  = 1        # 更关注找可行解
+        m.Params.Heuristics = 0.2     # 增强启发式（默认 0.05 左右）
+        m.Params.Cuts = 0             # 如果节点过多，可以适当减弱 cuts
+        # 利用多核
+        m.Params.Threads = 0   
+
+        N, T = self.N, self.T
+        d = self.d
+        D = self.D
+        L = self.L
+        dummy_start = self.dummy_start
+        dummy_end = self.dummy_end
+
+        # ============ 3. variables ============
+        # x[i,t] start installation (including dummy)
+        x = {}
+        for i in range(0, N + 2):
+            for t in range(1, T + 1):
+                x[i, t] = m.addVar(vtype=GRB.BINARY, name=f"x_{i}_{t}")
+
+        # y[i,t] installing (only real activities)
+        y = {}
+        for i in range(1, N + 1):
+            for t in range(1, T + 1):
+                y[i, t] = m.addVar(vtype=GRB.BINARY, name=f"y_{i}_{t}")
+
+        # p[i,t] arrival at site
+        p = {}
+        for i in range(1, N + 1):
+            for t in range(1, T + 1):
+                p[i, t] = m.addVar(vtype=GRB.BINARY, name=f"p_{i}_{t}")
+
+        # site inventory
+        I = {}
+        for i in range(1, N + 1):
+            for t in range(1, T + 1):
+                I[i, t] = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, name=f"I_{i}_{t}")
+
+        # factory production start
+        q = {}
+        for i in range(1, N + 1):
+            for t in range(1, T + 1):
+                q[i, t] = m.addVar(vtype=GRB.BINARY, name=f"q_{i}_{t}")
+
+        # order per time (batch)
+        z = {}
+        for t in range(1, T + 1):
+            z[t] = m.addVar(vtype=GRB.BINARY, name=f"z_{t}")
+
+        # factory inventory
+        F = {}
+        for s in range(1, T + 1):
+            F[s] = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, name=f"F_{s}")
+
+        m.update()
+
+        # ============ 4. constraints ============
+
+        # (1) dummy start fixed at time 1
+        m.addConstr(x[dummy_start, 1] == 1, "dummy_start_fix")
+        for t in range(2, T + 1):
+            m.addConstr(x[dummy_start, t] == 0, f"dummy_start_zero_{t}")
+
+        # (2) each real activity starts once
+        for i in range(1, N + 1):
+            m.addConstr(quicksum(x[i, t] for t in range(1, T + 1)) == 1,
+                        f"start_once_{i}")
+
+        # (3) dummy end starts once
+        m.addConstr(quicksum(x[dummy_end, t] for t in range(1, T + 1)) == 1,
+                    "dummy_end_once")
+
+        # (4) precedence between real activities
+        for (i, j) in self.E:
+            start_i = quicksum(t * x[i, t] for t in range(1, T + 1))
+            start_j = quicksum(t * x[j, t] for t in range(1, T + 1))
+            m.addConstr(start_i + d[i] <= start_j, f"prec_{i}_{j}")
+
+        # (5) roots after dummy start
+        for i in self.roots:
+            start_i = quicksum(t * x[i, t] for t in range(1, T + 1))
+            m.addConstr(1 <= start_i, f"root_after_dummy_{i}")
+
+        # (6) leaves before dummy end
+        for i in self.leaves:
+            start_i = quicksum(t * x[i, t] for t in range(1, T + 1))
+            end_d = quicksum(t * x[dummy_end, t] for t in range(1, T + 1))
+            m.addConstr(start_i + d[i] <= end_d, f"leaf_before_dummy_end_{i}")
+
+        # (7) installation state
+        for i in range(1, N + 1):
+            for t in range(1, T + 1):
+                tau_min = max(1, t - d[i] + 1)
+                m.addConstr(
+                    y[i, t] == quicksum(x[i, tau] for tau in range(tau_min, t + 1)),
+                    f"in_install_{i}_{t}"
+                )
+
+        # (8) installation crew capacity
+        for t in range(1, T + 1):
+            m.addConstr(quicksum(y[i, t] for i in range(1, N + 1)) <= self.C_install,
+                        f"crew_{t}")
+
+        # (9) arrival once
+        for i in range(1, N + 1):
+            m.addConstr(quicksum(p[i, t] for t in range(1, T + 1)) == 1,
+                        f"arrive_once_{i}")
+
+        # (10) arrival no later than installation start
+        for i in range(1, N + 1):
+            arr = quicksum(t * p[i, t] for t in range(1, T + 1))
+            sta = quicksum(t * x[i, t] for t in range(1, T + 1))
+            m.addConstr(arr <= sta, f"arrive_before_install_{i}")
+
+        # (11) site inventory balance
+        for i in range(1, N + 1):
+            # t = 1
+            m.addConstr(I[i, 1] == p[i, 1] - x[i, 1], f"site_inv_init_{i}")
+            # t >= 2
+            for t in range(2, T + 1):
+                m.addConstr(
+                    I[i, t] == I[i, t - 1] + p[i, t] - x[i, t],
+                    f"site_inv_bal_{i}_{t}"
+                )
+
+        # (12) site warehouse capacity
+        for t in range(1, T + 1):
+            m.addConstr(
+                quicksum(I[i, t] for i in range(1, N + 1)) <= self.S_site,
+                f"site_cap_{t}"
+            )
+
+        # (13) production -> arrival timing
+        for i in range(1, N + 1):
+            for t in range(1, T + 1):
+                latest_prod = t - D[i] - L[i]
+                if latest_prod >= 1:
+                    m.addConstr(
+                        p[i, t] <= quicksum(q[i, tau] for tau in range(1, latest_prod + 1)),
+                        f"prod_to_arrive_{i}_{t}"
+                    )
+                else:
+                    # cannot arrive this early
+                    m.addConstr(p[i, t] == 0, f"too_early_arrive_{i}_{t}")
+
+        # (14) factory machine capacity
+        for t in range(1, T + 1):
+            m.addConstr(
+                quicksum(
+                    q[i, tau]
+                    for i in range(1, N + 1)
+                    for tau in range(max(1, t - D[i] + 1), t + 1)
+                ) <= self.M_machine,
+                f"machine_cap_{t}"
+            )
+
+        # (15) order bundling
+        for t in range(1, T + 1):
+            for i in range(1, N + 1):
+                m.addConstr(p[i, t] <= z[t], f"link_order_{i}_{t}")
+
+        # (16) factory inventory: F1 = 0
+        m.addConstr(F[1] == 0, "factory_init")
+
+        # (17) factory inventory recursion
+        for s in range(2, T + 1):
+            finished_here = quicksum(
+                q[i, s - D[i]] for i in range(1, N + 1) if s - D[i] >= 1
+            )
+            shipped_here = quicksum(
+                p[i, s + L[i]] for i in range(1, N + 1) if s + L[i] <= T
+            )
+            m.addConstr(
+                F[s] == F[s - 1] + finished_here - shipped_here,
+                f"factory_inv_bal_{s}"
+            )
+
+        # (18) factory buffer capacity
+        for s in range(1, T + 1):
+            m.addConstr(F[s] <= self.S_fac, f"factory_cap_{s}")
+
+        # ============ 5. objective ============
+        finish_time = quicksum(t * x[dummy_end, t] for t in range(1, T + 1))
+        order_cost = quicksum(self.OC * z[t] for t in range(1, T + 1))
+        factory_cost = quicksum(self.C_F * F[s] for s in range(1, T + 1))
+        onsite_cost = quicksum(self.C_O * I[i, t] for i in range(1, N + 1) for t in range(1, T + 1))
+        indirect_cost = self.C_I * finish_time
+
+        m.setObjective(order_cost + factory_cost + onsite_cost + indirect_cost, GRB.MINIMIZE) # add onsite cost
+
+        # 保存对象
+        self.m = m
+        self.x = x
+        self.y = y
+        self.p = p
+        self.I = I
+        self.q = q
+        self.z = z
+        self.F = F
+
+        return m
+
+    def solve(self, time_limit=None, mip_gap=None):
+        if self.m is None:
+            self.build_model()
+
+        if time_limit is not None: # consider the possible change later
+            self.m.Params.TimeLimit = time_limit
+        if mip_gap is not None:
+            self.m.Params.MIPGap = mip_gap
+
+        self.m.optimize()
+        return self.m.Status
+
+    def get_solution_dict(self) -> Optional[Dict[str, Any]]:
+        """
+        Extract solution values from the solved model.
+        Returns a dictionary with all solution data, or None if model not solved.
+        """
+        if self.m is None:
+            return None
+        
+        if self.m.Status not in [GRB.OPTIMAL, GRB.TIME_LIMIT, GRB.SUBOPTIMAL]:
+            return None
+        
+        solution = {
+            'objective': self.m.ObjVal, # just the objective value, not the total cost
+            'status': self.m.Status,
+            'installation_start': {},  # {module_id: time}
+            'arrival_time': {},        # {module_id: time}
+            'production_start': {},    # {module_id: time}
+            'order_times': [],         # list of times when orders are placed
+            'factory_inventory': {},  # {time: inventory_level}
+            'site_inventory': {},     # {(module_id, time): inventory_level}
+            'project_finish_time': None
+        }
+        
+        N, T = self.N, self.T
+        x, p, q, F, z = self.x, self.p, self.q, self.F, self.z
+        dummy_end = self.dummy_end
+        
+        # Extract installation start times
+        for i in range(1, N + 1):
+            for t in range(1, T + 1):
+                if x[i, t].X > 0.5:
+                    solution['installation_start'][i] = t
+                    break
+        
+        # Extract arrival times
+        for i in range(1, N + 1):
+            for t in range(1, T + 1):
+                if p[i, t].X > 0.5:
+                    solution['arrival_time'][i] = t
+                    break
+        
+        # Extract production start times
+        for i in range(1, N + 1):
+            for t in range(1, T + 1):
+                if q[i, t].X > 0.5:
+                    solution['production_start'][i] = t
+                    break
+        
+        # Extract order times
+        for t in range(1, T + 1):
+            if z[t].X > 0.5:
+                solution['order_times'].append(t)
+        
+        # Extract factory inventory
+        for s in range(1, T + 1):
+            if F[s].X > 1e-6:
+                solution['factory_inventory'][s] = F[s].X
+        
+        # Extract site inventory
+        for i in range(1, N + 1):
+            for t in range(1, T + 1):
+                if self.I[i, t].X > 1e-6:
+                    solution['site_inventory'][(i, t)] = self.I[i, t].X
+        
+        # Extract project finish time
+        for t in range(1, T + 1):
+            if x[dummy_end, t].X > 0.5:
+                solution['project_finish_time'] = t
+                break
+        
+        return solution
+
+    def save_results_to_db(self, 
+                          engine: Engine, 
+                          project_id: int,
+                          module_id_mapping: Optional[Dict[int, str]] = None) -> bool:
+        """
+        Save optimization results to the database.
+        
+        For each project, this creates/maintains:
+        - raw_schedule_{project_id}: Input data from user's file (read-only, managed by datamanager)
+        - solution_schedule_{project_id}: Optimization solution results (this method creates/updates)
+        - optimization_summary_{project_id}: Project-level summary statistics
+        - factory_inventory_{project_id}: Factory inventory levels over time
+        - site_inventory_{project_id}: Site inventory levels over time
+        
+        Args:
+            engine: SQLAlchemy Engine instance
+            project_id: Project ID to save results for
+            module_id_mapping: Optional mapping from module index (1..N) to module ID string.
+                             If None, uses module index as ID.
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        solution = self.get_solution_dict()
+        if solution is None:
+            return False
+        
+        try:
+            # Get table names from datamanager if available
+            try:
+                from .datamanager import ScheduleDataManager
+                solution_table = ScheduleDataManager.solution_table_name(project_id)
+                summary_table = ScheduleDataManager.summary_table_name(project_id)
+                factory_inv_table = ScheduleDataManager.factory_inventory_table_name(project_id)
+                site_inv_table = ScheduleDataManager.site_inventory_table_name(project_id)
+            except ImportError:
+                # Fallback if datamanager is not available
+                solution_table = f'solution_schedule_{project_id}'
+                summary_table = f'optimization_summary_{project_id}'
+                factory_inv_table = f'factory_inventory_{project_id}'
+                site_inv_table = f'site_inventory_{project_id}'
+            
+            # Create results DataFrame
+            results_data = []
+            N = self.N
+            
+            for i in range(1, N + 1):
+                module_id = module_id_mapping[i] if module_id_mapping else f"Module_{i}"
+                install_start = solution['installation_start'].get(i)
+                arrival_time = solution['arrival_time'].get(i)
+                prod_start = solution['production_start'].get(i)
+                prod_finish = prod_start + self.D.get(i, 0) - 1 if prod_start else None
+                factory_wait_start = prod_finish
+                onsite_wait_start = arrival_time
+                onsite_wait_duration = install_start - onsite_wait_start
+                transport_duration = self.L.get(i, 0)
+                transport_start = arrival_time - transport_duration if arrival_time else None
+                factory_wait_duration = transport_start - factory_wait_start
+                install_duration = self.d.get(i, 0)
+                install_finish = install_start + install_duration - 1 if install_start else None
+                
+                results_data.append({
+                    'Module_ID': module_id,
+                    'Module_Index': i,
+                    'Installation_Start': install_start,
+                    'Installation_Finish': install_finish,
+                    'Installation_Duration': install_duration,
+                    'Arrival_Time': arrival_time,
+                    'Production_Start': prod_start,
+                    'Production_Duration': self.D.get(i, 0),
+                    'Transport_Duration': self.L.get(i, 0),
+                    'Factory_Wait_Start': factory_wait_start,
+                    'Factory_Wait_Duration': factory_wait_duration,
+                    'Onsite_Wait_Start': onsite_wait_start,
+                    'Onsite_Wait_Duration': onsite_wait_duration,
+                    'Transport_Start': transport_start,
+                    'Transport_Duration': transport_duration
+                })
+            
+            results_df = pd.DataFrame(results_data)
+            
+            # Save solution to dedicated solution table (separate from input data)
+            # This is the main solution table that records optimization results
+            results_df.to_sql(
+                solution_table, 
+                engine, 
+                if_exists='replace', 
+                index=False,
+                method='multi',
+                chunksize=1000
+            )
+            
+            # Also create a summary table with project-level results
+            summary_data = [{
+                'project_id': project_id,
+                'objective_value': solution['objective'],
+                'status': solution['status'],
+                'project_finish_time': solution['project_finish_time'],
+                'num_orders': len(solution['order_times']),
+                'order_times': ','.join(map(str, sorted(solution['order_times'])))
+            }]
+            
+            summary_df = pd.DataFrame(summary_data)
+            summary_df.to_sql(
+                summary_table,
+                engine,
+                if_exists='replace',
+                index=False
+            )
+            
+            # Create factory inventory table
+            if solution['factory_inventory']:
+                factory_inv_data = [
+                    {'time': t, 'inventory_level': inv}
+                    for t, inv in sorted(solution['factory_inventory'].items())
+                ]
+                factory_inv_df = pd.DataFrame(factory_inv_data)
+                factory_inv_df.to_sql(
+                    factory_inv_table,
+                    engine,
+                    if_exists='replace',
+                    index=False
+                )
+            
+            # Create site inventory table
+            if solution['site_inventory']:
+                site_inv_data = [
+                    {'time': t, 'inventory_level': inv}
+                    for t, inv in sorted(solution['site_inventory'].items())
+                ]
+                site_inv_df = pd.DataFrame(site_inv_data)
+                site_inv_df.to_sql(
+                    site_inv_table,
+                    engine,
+                    if_exists='replace',
+                    index=False
+                )
+            return True
+            
+        except Exception as e:
+            print(f"Error saving results to database: {e}")
+            return False
