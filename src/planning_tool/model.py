@@ -2,6 +2,30 @@ from gurobipy import Model, GRB, quicksum
 import pandas as pd
 from sqlalchemy import Engine, text
 from typing import Optional, Dict, Any
+from datetime import date
+
+
+def estimate_time_horizon(start_date: date, end_date: date, safety_factor: float = 1.2) -> int:
+    """
+    Estimate time horizon T from project start/end dates.
+
+    For now we ignore working calendar and simply take:
+        base_days = max(1, (end_date - start_date).days + 1)
+        T = ceil(safety_factor * base_days)
+
+    This matches the requirement T ≈ 1.2 * (end_date - start_date).
+    """
+    if end_date <= start_date:
+        base_days = 1
+    else:
+        base_days = (end_date - start_date).days + 1
+
+    raw_T = safety_factor * base_days
+    T = int(raw_T)
+    if raw_T > T:  # ceil for non-integers
+        T += 1
+    return max(1, T)
+
 
 class PrefabScheduler:
     def __init__(self,
