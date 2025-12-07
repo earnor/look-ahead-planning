@@ -13,7 +13,6 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 from planning_tool.datamanager import ScheduleDataManager
 from planning_tool.model import PrefabScheduler, estimate_time_horizon
-from planning_tool.model import PrefabScheduler, estimate_time_horizon
 from datetime import datetime, time, timedelta
 
 
@@ -762,6 +761,7 @@ class SchedulePage(QWidget):
         # connect calculate button to a handler in parent window via signal/slot later
         # we expose it as an attribute so MainWindow can wire it
         self.btn_calculate = btn_calculate
+        self.btn_export = btn_export
         
         return bar
 
@@ -823,7 +823,7 @@ class SchedulePage(QWidget):
                 row.get("Transport Duration (h)", ""),
                 row.get("Installation Start Time", ""),
                 row.get("Installation Duration (h)", ""),
-                row.get("Status", "Completed"), # ckeck the status calculation rules
+                row.get("Status", "upcoming"), # check the status calculation rules
                 row.get("Fab. Delay (h)", "0"),
                 row.get("Trans. Delay (h)", "0"),
                 row.get("Inst. Delay (h)", "0"),
@@ -857,14 +857,15 @@ class SchedulePage(QWidget):
         rules_label.setStyleSheet("font-size: 12px; font-weight: 600; color: #374151; margin-top: 8px;")
         info_layout.addWidget(rules_label)
         
-        rules_text = QLabel( # 有一点显示问题，过会儿调整
-            "• If current time ≥ installation end → Completed<br/>"
-            "• If current time ≥ fabrication start and < installation end → In Progress<br/>"
-            "• If delay > 0 → Delayed<br/>"
-            "• Else → Upcoming"
+        rules_text = QLabel(
+            "• If current time ≥ installation end → <span style='color: #065F46; font-weight: 500;'>Completed</span><br/>"
+            "• If current time ≥ fabrication start and &lt; installation end → <span style='color: #1E40AF; font-weight: 500;'>In Progress</span><br/>"
+            "• If delay &gt; 0 → <span style='color: #991B1B; font-weight: 500;'>Delayed</span><br/>"
+            "• Else → <span style='color: #374151; font-weight: 500;'>Upcoming</span>"
         )
         rules_text.setStyleSheet("font-size: 12px; color: #6B7280;")
         rules_text.setTextFormat(Qt.TextFormat.RichText)
+        rules_text.setWordWrap(True)
         info_layout.addWidget(rules_text)
         
         return info_widget
@@ -1450,6 +1451,7 @@ class MainWindow(QMainWindow):
         if isinstance(page_schedule, SchedulePage):
             self.page_schedule = page_schedule
             page_schedule.btn_calculate.clicked.connect(self.on_calculate_clicked)
+            page_schedule.btn_export.clicked.connect(self.on_export_schedule)
 
         central = QWidget()
         central_lay = QVBoxLayout(central)
@@ -1645,6 +1647,23 @@ class MainWindow(QMainWindow):
                     if idx is None or idx <= 0 or idx >= len(slots):
                         return ""
                     return slots[idx].strftime("%Y-%m-%d %H:%M")
+                
+                def idx_to_dt_obj(idx: int) -> datetime | None:
+                    """Convert index to datetime object for comparison"""
+                    if idx is None or idx <= 0 or idx >= len(slots):
+                        return None
+                    return slots[idx]
+
+                # Get current simulation time
+                # Check if we should use system time from settings
+                idx_settings = self.page_index.get("settings")
+                use_system_time = True
+                if idx_settings is not None:
+                    settings_widget = self.stack.widget(idx_settings)
+                    if isinstance(settings_widget, SettingsPage):
+                        use_system_time = settings_widget.use_system_time.isChecked()
+                
+                current_time = datetime.now() if use_system_time else datetime.now()  # For now always use system time, may change later
 
                 rows = []
                 for _, row in df_sol.iterrows():
@@ -1655,6 +1674,34 @@ class MainWindow(QMainWindow):
                     trans_dur = int(row.get("Transport_Duration", 0))
                     inst_start_idx = int(row["Installation_Start"]) if not pd.isna(row.get("Installation_Start")) else None
                     inst_dur = int(row.get("Installation_Duration", 0))
+                    install_finish_idx = int(row["Installation_Finish"]) if not pd.isna(row.get("Installation_Finish")) else None
+                    
+                    # Calculate status based on current time
+                    # According to rules:
+                    # 1. If current time ≥ installation end → Completed
+                    # 2. If current time ≥ fabrication start and < installation end → In Progress
+                    # 3. If delay > 0 → Delayed
+                    # 4. Else → Upcoming
+                    
+                    install_start_dt = idx_to_dt_obj(inst_start_idx) if inst_start_idx else None
+                    install_finish_dt = idx_to_dt_obj(install_finish_idx) if install_finish_idx else None
+                    fab_start_dt = idx_to_dt_obj(fab_start_idx) if fab_start_idx else None
+                    
+                    # Get delay values (for now all are 0, but we check for future use)
+                    fab_delay = 0  # Will be populated later
+                    trans_delay = 0
+                    inst_delay = 0
+                    has_delay = (fab_delay > 0) or (trans_delay > 0) or (inst_delay > 0)
+                    
+                    status = "Upcoming"  # default
+                    
+                    if has_delay:
+                        status = "Delayed"
+                    elif install_finish_dt and current_time >= install_finish_dt:
+                        status = "Completed"
+                    elif fab_start_dt and install_finish_dt:
+                        if current_time >= fab_start_dt and current_time < install_finish_dt:
+                            status = "In Progress"
 
                     rows.append({
                         "Module ID": mod_id,
@@ -1664,7 +1711,7 @@ class MainWindow(QMainWindow):
                         "Transport Duration (h)": trans_dur,
                         "Installation Start Time": idx_to_dt(inst_start_idx),
                         "Installation Duration (h)": inst_dur,
-                        "Status": "Completed",          # for now, status & delays are simple placeholders
+                        "Status": status,
                         "Fab. Delay (h)": 0,
                         "Trans. Delay (h)": 0,
                         "Inst. Delay (h)": 0,
@@ -1679,6 +1726,93 @@ class MainWindow(QMainWindow):
             )
         except Exception as e:
             QMessageBox.critical(self, "Error in Calculate", str(e))
+
+    def on_export_schedule(self):
+        """Export schedule table to Excel file"""
+        if not hasattr(self, "page_schedule") or not isinstance(self.page_schedule, SchedulePage):
+            QMessageBox.warning(self, "No Schedule", "Please go to Schedule page first.")
+            return
+        
+        table = self.page_schedule.table
+        if table.rowCount() == 0:
+            QMessageBox.warning(self, "Empty Table", "Schedule table is empty. Please run Calculate first.")
+            return
+        
+        # Get file path from user
+        default_filename = f"schedule_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Schedule to Excel",
+            default_filename,
+            "Excel Files (*.xlsx);;All Files (*)"
+        )
+        
+        if not file_path:
+            return  # User cancelled
+        
+        try:
+            # Extract data from table
+            data = []
+            for row in range(table.rowCount()):
+                row_data = []
+                for col in range(table.columnCount()):
+                    if col == 7:  # Status column (has widget)
+                        widget = table.cellWidget(row, col)
+                        if widget:
+                            # Try to find QLabel inside StatusCell
+                            labels = widget.findChildren(QLabel)
+                            if labels:
+                                row_data.append(labels[0].text())
+                            else:
+                                row_data.append("")
+                        else:
+                            row_data.append("")
+                    else:
+                        item = table.item(row, col)
+                        row_data.append(item.text() if item else "")
+                data.append(row_data)
+            
+            # Create DataFrame with same column headers as table
+            column_headers = [
+                "Module ID",
+                "Fabrication Start Time",
+                "Fabrication Duration (h)",
+                "Transport Start Time",
+                "Transport Duration (h)",
+                "Installation Start Time",
+                "Installation Duration (h)",
+                "Status",
+                "Fab. Delay (h)",
+                "Trans. Delay (h)",
+                "Inst. Delay (h)"
+            ]
+            
+            df = pd.DataFrame(data, columns=column_headers)
+            
+            # Export to Excel - try openpyxl first, fallback to default engine
+            try:
+                df.to_excel(file_path, index=False, engine='openpyxl')
+            except ImportError:
+                # If openpyxl not available, try default engine
+                df.to_excel(file_path, index=False)
+            
+            QMessageBox.information(
+                self,
+                "Export Successful",
+                f"Schedule has been exported to:\n{file_path}"
+            )
+        except ImportError as e:
+            QMessageBox.critical(
+                self,
+                "Export Failed",
+                f"Excel export requires openpyxl library.\nPlease install it: pip install openpyxl\n\nError: {str(e)}"
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Export Failed",
+                f"Failed to export schedule:\n{str(e)}"
+            )
 
     def switch_page(self, name: str):
         idx = self.page_index.get(name)
