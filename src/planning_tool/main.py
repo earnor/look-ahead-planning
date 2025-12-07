@@ -578,6 +578,7 @@ class SchedulePage(QWidget):
         super().__init__()
         self.setWindowTitle("Schedule")
         self.resize(1240, 760)
+        self._all_rows_data = []  # Store all rows for filtering
         self._apply_style()
         self._build_ui()
 
@@ -675,6 +676,7 @@ class SchedulePage(QWidget):
             ("Status", ["Completed","In Progress","Delayed","Upcoming"]),
         ]
         self._filter_boxes: list[QCheckBox] = []
+        self._status_filter_map = {}  # Map status text to checkbox
         for title, items in sections:
             box = QGroupBox()
             grid = QGridLayout(box); grid.setHorizontalSpacing(8); grid.setVerticalSpacing(6)
@@ -683,6 +685,8 @@ class SchedulePage(QWidget):
             for it in items:
                 cb = QCheckBox(it); cb.setChecked(True)
                 self._filter_boxes.append(cb)
+                self._status_filter_map[it] = cb  # Map status to checkbox
+                cb.stateChanged.connect(self._apply_status_filter)  # Connect to filter function
                 grid.addWidget(cb, r, c)
                 #c= 1 - c
                 r += 1
@@ -696,6 +700,7 @@ class SchedulePage(QWidget):
     def _clear_all_filters(self):
         for cb in self._filter_boxes:
             cb.setChecked(False)
+        self._apply_status_filter()  # Apply filter after clearing
 
     # ----- Main -----
     def _build_main(self) -> QWidget:
@@ -811,9 +816,38 @@ class SchedulePage(QWidget):
         """
         if not hasattr(self, "table"):
             return
+        
+        # Save all rows data for filtering
+        self._all_rows_data = rows.copy()
+        
+        # Apply filter to populate table
+        self._apply_status_filter()
+    
+    def _apply_status_filter(self):
+        """Apply status filter based on checked checkboxes"""
+        if not hasattr(self, "table") or not self._all_rows_data:
+            return
+        
         table = self.table
         table.setRowCount(0)
-        for r, row in enumerate(rows):
+        
+        # Get selected statuses
+        selected_statuses = set()
+        for status, cb in self._status_filter_map.items():
+            if cb.isChecked():
+                selected_statuses.add(status)
+        
+        # If no status is selected, show nothing
+        if not selected_statuses:
+            return
+        
+        # Filter and populate rows
+        filtered_rows = [
+            row for row in self._all_rows_data
+            if row.get("Status", "") in selected_statuses
+        ]
+        
+        for r, row in enumerate(filtered_rows):
             table.insertRow(r)
             values = [
                 row.get("Module ID", ""),
@@ -823,7 +857,7 @@ class SchedulePage(QWidget):
                 row.get("Transport Duration (h)", ""),
                 row.get("Installation Start Time", ""),
                 row.get("Installation Duration (h)", ""),
-                row.get("Status", "upcoming"), # check the status calculation rules
+                row.get("Status", "Upcoming"),
                 row.get("Fab. Delay (h)", "0"),
                 row.get("Trans. Delay (h)", "0"),
                 row.get("Inst. Delay (h)", "0"),
@@ -1715,7 +1749,16 @@ class MainWindow(QMainWindow):
                         "Fab. Delay (h)": 0,
                         "Trans. Delay (h)": 0,
                         "Inst. Delay (h)": 0,
+                        "_sort_key": install_start_dt,  # Store datetime object for sorting
                     })
+
+                # Sort rows by Installation Start Time (earliest first)
+                # Rows with None installation start time will be placed at the end
+                rows.sort(key=lambda x: (x["_sort_key"] is None, x["_sort_key"] or datetime.max))
+                
+                # Remove the temporary sort key
+                for row in rows:
+                    row.pop("_sort_key", None)
 
                 self.page_schedule.populate_rows(rows)
 
