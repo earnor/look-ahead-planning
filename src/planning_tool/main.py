@@ -4,15 +4,17 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton, QLineEdit, QComboBox,
     QHBoxLayout, QVBoxLayout, QGridLayout, QTableWidget, QTableWidgetItem, QHeaderView,
     QSizePolicy, QSpacerItem, QButtonGroup, QStackedWidget, QFileDialog, QMessageBox, QProgressBar,
-    QSplitter, QCheckBox, QGroupBox, QScrollArea, QInputDialog, QDateTimeEdit, QTimeEdit
+    QSplitter, QCheckBox, QGroupBox, QScrollArea, QInputDialog, QDateTimeEdit, QTimeEdit, QDialog,
+    QDialogButtonBox, QSpinBox, QDoubleSpinBox
 )
 from PyQt6.QtCore import QDateTime, QTime, QDate, QLocale
 from pathlib import Path
 import sys
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, inspect
 from planning_tool.datamanager import ScheduleDataManager
 from planning_tool.model import PrefabScheduler, estimate_time_horizon
+from planning_tool.rescheduler import load_delays_from_db, TaskStateIdentifier, DelayApplier, FixedConstraintsBuilder
 from datetime import datetime, time, timedelta
 
 
@@ -544,6 +546,82 @@ class TagCell(QWidget):
         h.addWidget(pill_label(text, bg, fg))
         h.addStretch(1)
 
+class DelayInputDialog(QDialog):
+    """Dialog for inputting delay information"""
+    def __init__(self, module_id: str, phase: str, parent=None):
+        super().__init__(parent)
+        self.module_id = module_id
+        self.phase = phase  # "FABRICATION", "TRANSPORT", "INSTALLATION"
+        self.setWindowTitle(f"Delay Input - {module_id}")
+        self.setMinimumWidth(400)
+        
+        layout = QVBoxLayout(self)
+        
+        # Module ID display
+        module_label = QLabel(f"<b>Module ID:</b> {module_id}")
+        layout.addWidget(module_label)
+        
+        # Phase display
+        phase_label = QLabel(f"<b>Phase:</b> {phase}")
+        layout.addWidget(phase_label)
+        
+        # Delay Type
+        type_layout = QHBoxLayout()
+        type_layout.addWidget(QLabel("Delay Type:"))
+        self.delay_type_combo = QComboBox()
+        self.delay_type_combo.addItems(["DURATION_EXTENSION", "START_POSTPONEMENT"])
+        type_layout.addWidget(self.delay_type_combo)
+        layout.addLayout(type_layout)
+        
+        # Delay Hours
+        hours_layout = QHBoxLayout()
+        hours_layout.addWidget(QLabel("Delay Hours:"))
+        self.delay_hours_spin = QDoubleSpinBox()
+        self.delay_hours_spin.setMinimum(0.0)
+        self.delay_hours_spin.setMaximum(20.0)
+        self.delay_hours_spin.setSingleStep(1.0)
+        self.delay_hours_spin.setValue(0.0)
+        hours_layout.addWidget(self.delay_hours_spin)
+        layout.addLayout(hours_layout)
+        
+        # Detected At Time (τ)
+        tau_layout = QHBoxLayout()
+        tau_layout.addWidget(QLabel("Detected At Time (τ):"))
+        self.tau_datetime = QDateTimeEdit()
+        self.tau_datetime.setCalendarPopup(True)
+        self.tau_datetime.setDateTime(QDateTime.currentDateTime())
+        self.tau_datetime.setDisplayFormat("yyyy-MM-dd HH:mm")
+        self.tau_datetime.setLocale(QLocale(QLocale.Language.English, QLocale.Country.Switzerland))
+        tau_layout.addWidget(self.tau_datetime)
+        layout.addLayout(tau_layout)
+        
+        # Reason (optional)
+        reason_layout = QHBoxLayout()
+        reason_layout.addWidget(QLabel("Reason (optional):"))
+        self.reason_input = QLineEdit()
+        self.reason_input.setPlaceholderText("Enter delay reason...")
+        reason_layout.addWidget(self.reason_input)
+        layout.addLayout(reason_layout)
+        
+        # Buttons
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+    
+    def get_delay_info(self) -> dict:
+        """Return delay information as a dictionary"""
+        return {
+            "module_id": self.module_id,
+            "phase": self.phase,
+            "delay_type": self.delay_type_combo.currentText(),
+            "delay_hours": self.delay_hours_spin.value(),
+            "detected_at_datetime": self.tau_datetime.dateTime().toString("yyyy-MM-dd HH:mm:ss"),
+            "reason": self.reason_input.text() or None
+        }
+
 class StatusCell(QWidget):
     """Status cell with colored background for Module Schedule"""
     def __init__(self, status: str):
@@ -802,9 +880,43 @@ class SchedulePage(QWidget):
         table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
 
+        # Enable double-click editing for Delay columns (columns 8, 9, 10)
+        table.cellDoubleClicked.connect(self._on_delay_cell_double_clicked)
+
         # store for later population
         self.table = table
         return table
+    
+    def _on_delay_cell_double_clicked(self, row: int, col: int):
+        """Handle double-click on Delay columns"""
+        # Delay columns are at indices 8, 9, 10
+        delay_columns = {8: "FABRICATION", 9: "TRANSPORT", 10: "INSTALLATION"}
+        
+        if col not in delay_columns:
+            return
+        
+        # Get module ID from the row
+        module_id_item = self.table.item(row, 0)
+        if not module_id_item:
+            return
+        
+        module_id = module_id_item.text()
+        phase = delay_columns[col]
+        
+        # Show delay input dialog
+        dialog = DelayInputDialog(module_id, phase, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            delay_info = dialog.get_delay_info()
+            # Update the delay cell
+            delay_hours = delay_info["delay_hours"]
+            self.table.setItem(row, col, QTableWidgetItem(str(delay_hours)))
+            
+            # Save delay to database immediately (Phase 5.1)
+            # Call MainWindow method to handle the save
+            if hasattr(self, 'main_window') and self.main_window:
+                self.main_window.save_delay_to_db(delay_info)
+            else:
+                QMessageBox.warning(self, "Error", "Cannot save delay: MainWindow reference not found.")
 
     def populate_rows(self, rows: list[dict]):
         """
@@ -1486,6 +1598,8 @@ class MainWindow(QMainWindow):
             self.page_schedule = page_schedule
             page_schedule.btn_calculate.clicked.connect(self.on_calculate_clicked)
             page_schedule.btn_export.clicked.connect(self.on_export_schedule)
+            # Store reference to MainWindow in SchedulePage for delay saving
+            page_schedule.main_window = self
 
         central = QWidget()
         central_lay = QVBoxLayout(central)
@@ -1502,6 +1616,75 @@ class MainWindow(QMainWindow):
         root_lay.addWidget(central, 6)
 
         self.setCentralWidget(root)
+
+    def save_delay_to_db(self, delay_info: dict):
+        """
+        Phase 5.1: Save delay information to database.
+        Converts detected_at_datetime to time index (τ) using working calendar.
+        Called from SchedulePage when user confirms delay input.
+        """
+        if self.current_project_id is None:
+            QMessageBox.warning(self, "Error", "No project selected.")
+            return
+        
+        try:
+            # Parse detected_at_datetime
+            detected_at_str = delay_info["detected_at_datetime"]
+            detected_at_dt = datetime.strptime(detected_at_str, "%Y-%m-%d %H:%M:%S")
+            
+            # Get settings to build working calendar slots
+            settings = self._get_active_settings() or {}
+            if not settings:
+                QMessageBox.warning(self, "Error", "Settings not available. Please configure settings first.")
+                return
+            
+            # Parse start date from settings
+            fmt = "%m/%d/%Y"
+            start_str = settings.get("start_datetime", "")
+            if not start_str:
+                QMessageBox.warning(self, "Error", "Start date not configured.")
+                return
+            
+            start_date = datetime.strptime(start_str, fmt).date()
+            
+            # Build working calendar slots to find time index
+            # We need to estimate max_slot - use a large number for now
+            # In practice, we should use the current solution's max time index
+            max_slot = 10000  # Large enough for most projects
+            working_calendar_slots = self._build_working_calendar_slots(settings, start_date, max_slot)
+            
+            # Find time index (τ) for detected_at_dt
+            tau = None
+            for idx, slot_dt in enumerate(working_calendar_slots[1:], start=1):  # Skip index 0
+                if slot_dt >= detected_at_dt:
+                    tau = idx
+                    break
+            
+            if tau is None:
+                # If detected_at_dt is after all slots, use the last slot index
+                tau = len(working_calendar_slots) - 1
+            
+            # Save to database
+            delay_table = ScheduleDataManager.delay_updates_table_name(self.current_project_id)
+            with self.engine.begin() as conn:
+                conn.exec_driver_sql(f"""
+                    INSERT INTO "{delay_table}" 
+                    (module_id, delay_type, phase, delay_hours, detected_at_time, detected_at_datetime, reason)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    delay_info["module_id"],
+                    delay_info["delay_type"],
+                    delay_info["phase"],
+                    delay_info["delay_hours"],
+                    tau,
+                    detected_at_str,
+                    delay_info.get("reason")
+                ))
+            
+            QMessageBox.information(self, "Success", f"Delay saved successfully.\nτ = {tau}")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save delay: {str(e)}")
 
     def _get_active_settings(self) -> dict | None:
         """
@@ -1632,11 +1815,250 @@ class MainWindow(QMainWindow):
                         if idx is not None:
                             E.append((idx, i + 1))
 
-            # 3) compute time horizon T from dates
-            T = estimate_time_horizon(start_date, end_date)
+            # 3) compute time horizon T from dates (in working hours)
+            # Simple estimate: calculate average hours per day from working calendar
+            # If not available, default to 8 hours per day
+            hours_per_day = 8.0  # default
+            try:
+                # Try to estimate from working calendar settings
+                working_days = settings.get("working_days", {})
+                if working_days:
+                    # Count working days per week
+                    working_days_per_week = sum(1 for v in working_days.values() if v)
+                    if working_days_per_week > 0:
+                        # Parse work hours (datetime and time are already imported at top of file)
+                        def parse_time(s: str, default: time) -> time:
+                            if not s:
+                                return default
+                            for fmt in ("%I:%M %p", "%H:%M"):
+                                try:
+                                    return datetime.strptime(s, fmt).time()
+                                except ValueError:
+                                    continue
+                            return default
+                        
+                        work_start = parse_time(settings.get("work_start_time", "08:00"), time(8, 0))
+                        work_end = parse_time(settings.get("work_end_time", "17:00"), time(17, 0))
+                        break_start = parse_time(settings.get("break_start_time", "12:00"), time(12, 0))
+                        break_end = parse_time(settings.get("break_end_time", "13:00"), time(13, 0))
+                        
+                        # Calculate hours per working day
+                        ref_date = datetime(2000, 1, 1)
+                        period1 = (datetime.combine(ref_date, break_start) - datetime.combine(ref_date, work_start)).total_seconds() / 3600
+                        period2 = (datetime.combine(ref_date, work_end) - datetime.combine(ref_date, break_end)).total_seconds() / 3600
+                        hours_per_working_day = max(0, period1) + max(0, period2)
+                        
+                        # Average hours per calendar day = (working_days_per_week / 7) * hours_per_working_day
+                        hours_per_day = (working_days_per_week / 7.0) * hours_per_working_day
+            except Exception:
+                pass  # Use default 8.0 if calculation fails
+            
+            T = estimate_time_horizon(start_date, end_date, hours_per_day=hours_per_day)
 
-            # 4) build and solve model
-            scheduler = PrefabScheduler(
+            # Check if we have pending delays (Phase 5.2 & 6: Re-optimization workflow)
+            delay_table = ScheduleDataManager.delay_updates_table_name(self.current_project_id)
+            versions_table = ScheduleDataManager.optimization_versions_table_name(self.current_project_id)
+            
+            # Check for delays without version_id (pending delays)
+            with self.engine.begin() as conn:
+                pending_delays_query = f'SELECT COUNT(*) FROM "{delay_table}" WHERE version_id IS NULL'
+                pending_count = conn.execute(text(pending_delays_query)).scalar()
+            
+            is_reoptimization = pending_count > 0
+            
+            if is_reoptimization:
+                # Phase 6: Re-optimization workflow
+                # 1. Load pending delays
+                delays = load_delays_from_db(self.engine, self.current_project_id, version_id=None)
+                
+                if not delays:
+                    QMessageBox.warning(self, "No Delays", "No pending delays found.")
+                    return
+                
+                # Get the latest solution to use as base
+                solution_table = self.mgr.solution_table_name(self.current_project_id)
+                try:
+                    inspector = inspect(self.engine)
+                    if solution_table in inspector.get_table_names():
+                        columns = [col['name'] for col in inspector.get_columns(solution_table)]
+                        if 'version_id' in columns:
+                            # Get latest version
+                            query = f'''
+                                SELECT * FROM "{solution_table}"
+                                WHERE version_id = (SELECT MAX(version_id) FROM "{solution_table}" WHERE version_id IS NOT NULL)
+                                   OR (version_id IS NULL AND NOT EXISTS (SELECT 1 FROM "{solution_table}" WHERE version_id IS NOT NULL))
+                            '''
+                            df_base_solution = pd.read_sql(query, self.engine)
+                        else:
+                            df_base_solution = pd.read_sql_table(solution_table, self.engine)
+                    else:
+                        QMessageBox.warning(self, "No Base Solution", "No previous solution found. Please run initial optimization first.")
+                        return
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", f"Failed to load base solution: {str(e)}")
+                    return
+                
+                if df_base_solution.empty:
+                    QMessageBox.warning(self, "No Base Solution", "No previous solution found. Please run initial optimization first.")
+                    return
+                
+                # Determine tau (re-optimization start time) - use the minimum detected_at_time from delays
+                tau = min(delay.detected_at_time for delay in delays)
+                
+                # Build working calendar slots
+                max_idx = max(
+                    df_base_solution.get('Installation_Start', pd.Series([T])).max(),
+                    df_base_solution.get('Installation_Finish', pd.Series([T])).max(),
+                    df_base_solution.get('Arrival_Time', pd.Series([T])).max(),
+                    df_base_solution.get('Production_Start', pd.Series([T])).max(),
+                    T
+                )
+                working_calendar_slots = self._build_working_calendar_slots(settings, start_date, int(max_idx))
+                
+                # 2. Identify task states
+                state_identifier = TaskStateIdentifier(df_base_solution, tau, working_calendar_slots)
+                task_states = state_identifier.identify_all_states()
+                
+                # 3. Apply delays
+                delay_applier = DelayApplier(df_base_solution, delays, task_states)
+                modified_solution_df = delay_applier.apply_delays()
+                
+                # 4. Update D, d, L dictionaries with delayed durations
+                # This ensures the optimizer uses the correct durations for tasks with DURATION_EXTENSION
+                # Only COMPLETED tasks keep original durations (they're already finished)
+                for _, row in modified_solution_df.iterrows():
+                    module_id = str(row['Module_ID'])
+                    if module_id in id_to_index:
+                        module_idx = id_to_index[module_id]
+                        module_states = task_states.get(module_id, [])
+                        
+                        # Check each phase and update duration if not COMPLETED
+                        for state in module_states:
+                            if state.phase == "FABRICATION":
+                                # Update if not COMPLETED (IN_PROGRESS or UPCOMING can have duration extensions)
+                                if state.status != "COMPLETED":
+                                    new_duration = row.get('Production_Duration')
+                                    original_duration = df_base_solution[df_base_solution['Module_ID'] == module_id].iloc[0].get('Production_Duration', D[module_idx])
+                                    # Only update if duration was actually changed (delay was applied)
+                                    if pd.notna(new_duration) and new_duration != original_duration:
+                                        D[module_idx] = int(new_duration)
+                            elif state.phase == "TRANSPORT":
+                                if state.status != "COMPLETED":
+                                    new_duration = row.get('Transport_Duration')
+                                    original_duration = df_base_solution[df_base_solution['Module_ID'] == module_id].iloc[0].get('Transport_Duration', L[module_idx])
+                                    if pd.notna(new_duration) and new_duration != original_duration:
+                                        L[module_idx] = int(new_duration)
+                            elif state.phase == "INSTALLATION":
+                                if state.status != "COMPLETED":
+                                    new_duration = row.get('Installation_Duration')
+                                    original_duration = df_base_solution[df_base_solution['Module_ID'] == module_id].iloc[0].get('Installation_Duration', d[module_idx])
+                                    if pd.notna(new_duration) and new_duration != original_duration:
+                                        d[module_idx] = int(new_duration)
+                
+                # 5. Build fixed constraints
+                fixed_builder = FixedConstraintsBuilder(task_states, tau, modified_solution_df, df_base_solution)
+                fixed_constraints = fixed_builder.build_fixed_constraints()
+                
+                # 6. Create new version record (Phase 5.2)
+                # Get latest version number
+                with self.engine.begin() as conn:
+                    latest_version_query = f'SELECT MAX(version_number) FROM "{versions_table}"'
+                    latest_version_result = conn.execute(text(latest_version_query)).scalar()
+                    new_version_number = (latest_version_result or 0) + 1
+                    
+                    # Get base version_id (latest version)
+                    base_version_query = f'''
+                        SELECT version_id FROM "{versions_table}" 
+                        WHERE version_number = (SELECT MAX(version_number) FROM "{versions_table}")
+                        LIMIT 1
+                    '''
+                    base_version_result = conn.execute(text(base_version_query)).scalar()
+                    base_version_id = base_version_result
+                    
+                    # Get delay IDs for pending delays
+                    delay_ids_query = f'SELECT delay_id FROM "{delay_table}" WHERE version_id IS NULL'
+                    delay_ids = [str(row[0]) for row in conn.execute(text(delay_ids_query)).fetchall()]
+                    delay_ids_str = ','.join(delay_ids) if delay_ids else None
+                    
+                    # Insert new version record
+                    insert_version_query = f'''
+                        INSERT INTO "{versions_table}" 
+                        (version_number, base_version_id, reoptimize_from_time, delay_ids)
+                        VALUES (?, ?, ?, ?)
+                    '''
+                    conn.execute(text(insert_version_query), (
+                        new_version_number,
+                        base_version_id,
+                        tau,
+                        delay_ids_str
+                    ))
+                    
+                    # Get the new version_id
+                    new_version_id_query = f'SELECT version_id FROM "{versions_table}" WHERE version_number = ?'
+                    new_version_id = conn.execute(text(new_version_id_query), (new_version_number,)).scalar()
+                    
+                    # Update delay records to link to new version
+                    update_delays_query = f'UPDATE "{delay_table}" SET version_id = ? WHERE version_id IS NULL'
+                    conn.execute(text(update_delays_query), (new_version_id,))
+                
+                # 7. Build and solve model with fixed constraints
+                scheduler = PrefabScheduler(
+                    N=N,
+                    T=T,
+                    d=d,
+                    E=E,
+                    D=D,
+                    L=L,
+                    C_install=C_install,
+                    M_machine=M_machine,
+                    S_site=S_site,
+                    S_fac=S_fac,
+                    OC=OC,
+                    C_I=C_I,
+                    C_F=C_F,
+                    C_O=C_O,
+                )
+                
+                # Set fixed constraints and re-optimization time
+                scheduler.set_fixed_constraints(
+                    fixed_installation_starts=fixed_constraints.get('fixed_installation_starts'),
+                    fixed_production_starts=fixed_constraints.get('fixed_production_starts'),
+                    fixed_arrival_times=fixed_constraints.get('fixed_arrival_times'),
+                    fixed_durations=fixed_constraints.get('fixed_durations'),
+                    reoptimize_from_time=tau
+                )
+                
+                status = scheduler.solve()
+                
+                # 8. Save results with version_id (Phase 6.3)
+                scheduler.save_results_to_db(
+                    self.engine,
+                    self.current_project_id,
+                    module_id_mapping=index_to_id,
+                    version_id=new_version_id
+                )
+                
+                # Update version record with optimization results
+                solution = scheduler.get_solution_dict()
+                if solution:
+                    with self.engine.begin() as conn:
+                        update_version_query = f'''
+                            UPDATE "{versions_table}" 
+                            SET objective_value = ?, status = ?
+                            WHERE version_id = ?
+                        '''
+                        conn.execute(text(update_version_query), (
+                            solution.get('objective'),
+                            solution.get('status'),
+                            new_version_id
+                        ))
+                
+                QMessageBox.information(self, "Re-optimization Complete", 
+                    f"Re-optimization completed successfully.\nVersion: {new_version_number}\nτ = {tau}")
+            else:
+                # Initial optimization (existing logic)
+                # 4) build and solve model
+                scheduler = PrefabScheduler(
                 N=N,
                 T=T,
                 d=d,
@@ -1663,7 +2085,27 @@ class MainWindow(QMainWindow):
 
             # 6) load solution table and map indices to real-world schedule using working calendar
             solution_table = self.mgr.solution_table_name(self.current_project_id)
-            df_sol = pd.read_sql_table(solution_table, self.engine)
+            # If version_id column exists, get the latest version (max version_id) or all if version_id is NULL
+            # Otherwise, just read all data
+            try:
+                inspector = inspect(self.engine)
+                if solution_table in inspector.get_table_names():
+                    columns = [col['name'] for col in inspector.get_columns(solution_table)]
+                    if 'version_id' in columns:
+                        # Get latest version (max version_id) or records with NULL version_id
+                        query = f'''
+                            SELECT * FROM "{solution_table}"
+                            WHERE version_id IS NULL 
+                               OR version_id = (SELECT MAX(version_id) FROM "{solution_table}" WHERE version_id IS NOT NULL)
+                        '''
+                        df_sol = pd.read_sql(query, self.engine)
+                    else:
+                        df_sol = pd.read_sql_table(solution_table, self.engine)
+                else:
+                    df_sol = pd.DataFrame()
+            except Exception:
+                # Fallback: just read all data
+                df_sol = pd.read_sql_table(solution_table, self.engine)
 
             if not df_sol.empty and hasattr(self, "page_schedule") and isinstance(self.page_schedule, SchedulePage):
                 # determine max index needed

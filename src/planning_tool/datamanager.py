@@ -44,6 +44,16 @@ class ScheduleDataManager:
     def site_inventory_table_name(project_id: int) -> str:
         """site_inventory_{project_id}: Site inventory levels over time"""
         return f"site_inventory_{project_id}"
+    
+    @staticmethod
+    def delay_updates_table_name(project_id: int) -> str:
+        """delay_updates_{project_id}: Delay records for re-optimization"""
+        return f"delay_updates_{project_id}"
+    
+    @staticmethod
+    def optimization_versions_table_name(project_id: int) -> str:
+        """optimization_versions_{project_id}: Version history of optimizations"""
+        return f"optimization_versions_{project_id}"
 
 
     # --------- 第一次导入：用 CSV 建 raw 表 + 建该项目的其余表 ---------
@@ -67,7 +77,7 @@ class ScheduleDataManager:
             ), {"n": project_name}).scalar_one()
 
         # 2) 建 raw 表并导入 CSV
-        raw = self.raw_table_name(project_id)
+        raw = ScheduleDataManager.raw_table_name(project_id)
         df = pd.read_csv(csv_path)
         df.to_sql(
             raw,
@@ -88,8 +98,55 @@ class ScheduleDataManager:
                     SELECT RAISE(ABORT, 'raw table is read-only');
                 END;
                 """)
+        
+        # 4) 创建延迟和版本管理表
+        self._ensure_delay_and_version_tables(project_id)
 
         return project_id
+    
+    def _ensure_delay_and_version_tables(self, project_id: int):
+        """Create delay_updates and optimization_versions tables for a project"""
+        delay_table = ScheduleDataManager.delay_updates_table_name(project_id)
+        versions_table = ScheduleDataManager.optimization_versions_table_name(project_id)
+        
+        with self.engine.begin() as conn:
+            # Create delay_updates table
+            conn.exec_driver_sql(f"""
+                CREATE TABLE IF NOT EXISTS "{delay_table}" (
+                    delay_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    module_id TEXT NOT NULL,
+                    delay_type TEXT NOT NULL CHECK(delay_type IN ('DURATION_EXTENSION', 'START_POSTPONEMENT')),
+                    phase TEXT NOT NULL CHECK(phase IN ('FABRICATION', 'TRANSPORT', 'INSTALLATION')),
+                    delay_hours REAL NOT NULL,
+                    detected_at_time INTEGER NOT NULL,
+                    detected_at_datetime TEXT NOT NULL,
+                    reason TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    version_id INTEGER,
+                    FOREIGN KEY (version_id) REFERENCES "{versions_table}"(version_id)
+                );
+            """)
+            
+            # Create optimization_versions table
+            conn.exec_driver_sql(f"""
+                CREATE TABLE IF NOT EXISTS "{versions_table}" (
+                    version_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    version_number INTEGER NOT NULL,
+                    base_version_id INTEGER,
+                    reoptimize_from_time INTEGER,
+                    delay_ids TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    objective_value REAL,
+                    status INTEGER,
+                    FOREIGN KEY (base_version_id) REFERENCES "{versions_table}"(version_id)
+                );
+            """)
+            
+            # Create index on version_number for faster queries
+            conn.exec_driver_sql(f"""
+                CREATE INDEX IF NOT EXISTS idx_version_number_{project_id} 
+                ON "{versions_table}"(version_number);
+            """)
 
     # --------- 查询 / 元数据 ---------
 
@@ -122,11 +179,13 @@ class ScheduleDataManager:
             with self.engine.begin() as conn:
                 # Get all table names for this project
                 tables_to_drop = [
-                    self.raw_table_name(project_id),
-                    self.solution_table_name(project_id),
-                    self.summary_table_name(project_id),
-                    self.factory_inventory_table_name(project_id),
-                    self.site_inventory_table_name(project_id),
+                    ScheduleDataManager.raw_table_name(project_id),
+                    ScheduleDataManager.solution_table_name(project_id),
+                    ScheduleDataManager.summary_table_name(project_id),
+                    ScheduleDataManager.factory_inventory_table_name(project_id),
+                    ScheduleDataManager.site_inventory_table_name(project_id),
+                    ScheduleDataManager.delay_updates_table_name(project_id),
+                    ScheduleDataManager.optimization_versions_table_name(project_id),
                 ]
                 
                 # Drop all project tables (if they exist)
@@ -134,7 +193,7 @@ class ScheduleDataManager:
                     conn.exec_driver_sql(f'DROP TABLE IF EXISTS "{table_name}"')
                 
                 # Delete triggers for raw table (if they exist)
-                raw_table = self.raw_table_name(project_id)
+                raw_table = ScheduleDataManager.raw_table_name(project_id)
                 for op in ("INSERT", "UPDATE", "DELETE"):
                     conn.exec_driver_sql(f'DROP TRIGGER IF EXISTS trg_no_{op.lower()}_{raw_table}')
                 

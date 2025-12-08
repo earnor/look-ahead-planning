@@ -5,25 +5,34 @@ from typing import Optional, Dict, Any
 from datetime import date
 
 
-def estimate_time_horizon(start_date: date, end_date: date, safety_factor: float = 1.2) -> int:
+def estimate_time_horizon(start_date: date, end_date: date, 
+                         hours_per_day: float = 8.0,
+                         safety_factor: float = 1.0) -> int:
     """
-    Estimate time horizon T from project start/end dates.
-
-    For now we ignore working calendar and simply take:
-        base_days = max(1, (end_date - start_date).days + 1)
-        T = ceil(safety_factor * base_days)
-
-    This matches the requirement T ≈ 1.2 * (end_date - start_date).
+    Estimate time horizon T in working hours from project start/end dates.
+    
+    Simple approach: T = (end_date - start_date).days * hours_per_day * safety_factor
+    
+    Args:
+        start_date: Project start date
+        end_date: Project target end date
+        hours_per_day: Average working hours per day (default 8.0)
+        safety_factor: Safety factor to add buffer (default 1.2)
+    
+    Returns:
+        T: Total number of working hours (time slots)
     """
     if end_date <= start_date:
-        base_days = 1
+        total_days = 1
     else:
-        base_days = (end_date - start_date).days + 1
-
-    raw_T = safety_factor * base_days
+        total_days = (end_date - start_date).days + 1
+    
+    # Simple calculation: days * hours_per_day * safety_factor
+    raw_T = total_days * hours_per_day * safety_factor
     T = int(raw_T)
     if raw_T > T:  # ceil for non-integers
         T += 1
+    
     return max(1, T)
 
 
@@ -88,9 +97,43 @@ class PrefabScheduler:
         self.q = {}
         self.z = {}
         self.F = {}
+        
+        # Fixed constraints for re-optimization
+        self.fixed_installation_starts = {}
+        self.fixed_production_starts = {}
+        self.fixed_arrival_times = {} 
+        self.fixed_durations = {} # any problem here?
+        self.reoptimize_from_time = None  # Time τ from which to re-optimize
 
         # preprocessing roots / leaves
         self.roots, self.leaves = self._find_roots_and_leaves()
+    
+    def set_fixed_constraints(self, 
+                             fixed_installation_starts: Optional[Dict[int, int]] = None,
+                             fixed_production_starts: Optional[Dict[int, int]] = None,
+                             fixed_arrival_times: Optional[Dict[int, int]] = None,
+                             fixed_durations: Optional[Dict[int, Dict[str, float]]] = None,
+                             reoptimize_from_time: Optional[int] = None):
+        """
+        Set fixed constraints for re-optimization.
+        
+        Args:
+            fixed_installation_starts: {module_index: start_time}
+            fixed_production_starts: {module_index: start_time}
+            fixed_arrival_times: {module_index: arrival_time}
+            fixed_durations: {module_index: {phase: duration}}
+            reoptimize_from_time: Time index τ from which to re-optimize
+        """
+        if fixed_installation_starts:
+            self.fixed_installation_starts = fixed_installation_starts.copy()
+        if fixed_production_starts:
+            self.fixed_production_starts = fixed_production_starts.copy()
+        if fixed_arrival_times:
+            self.fixed_arrival_times = fixed_arrival_times.copy()
+        if fixed_durations:
+            self.fixed_durations = fixed_durations.copy()
+        if reoptimize_from_time is not None:
+            self.reoptimize_from_time = reoptimize_from_time
 
     def _find_roots_and_leaves(self):
         preds = {i: [] for i in range(1, self.N + 1)}
@@ -164,15 +207,58 @@ class PrefabScheduler:
 
         # ============ 4. constraints ============
 
-        # (1) dummy start fixed at time 1
-        m.addConstr(x[dummy_start, 1] == 1, "dummy_start_fix")
-        for t in range(2, T + 1):
-            m.addConstr(x[dummy_start, t] == 0, f"dummy_start_zero_{t}")
+        # (1) dummy start fixed at time 1 (or reoptimize_from_time if set)
+        start_time = 1
+        if self.reoptimize_from_time is not None:
+            start_time = max(1, self.reoptimize_from_time)
+        
+        m.addConstr(x[dummy_start, start_time] == 1, "dummy_start_fix")
+        for t in range(1, T + 1):
+            if t != start_time:
+                m.addConstr(x[dummy_start, t] == 0, f"dummy_start_zero_{t}")
 
         # (2) each real activity starts once
         for i in range(1, N + 1):
             m.addConstr(quicksum(x[i, t] for t in range(1, T + 1)) == 1,
                         f"start_once_{i}")
+        
+        # (2a) Fixed installation starts (for re-optimization)
+        # Note: Since we have sum(x[i, t]) = 1, fixing x[i, fixed_start] = 1 
+        # automatically forces all other x[i, t] = 0
+        for i, fixed_start in self.fixed_installation_starts.items():
+            if 1 <= i <= N and 1 <= fixed_start <= T:
+                m.addConstr(x[i, fixed_start] == 1, f"fixed_install_start_{i}")
+        
+        # (2b) Fixed production starts
+        # Note: Since we have sum(q[i, t]) = 1, fixing q[i, fixed_start] = 1
+        # automatically forces all other q[i, t] = 0
+        for i, fixed_start in self.fixed_production_starts.items():
+            if 1 <= i <= N and 1 <= fixed_start <= T:
+                m.addConstr(q[i, fixed_start] == 1, f"fixed_prod_start_{i}")
+        
+        # (2c) Fixed arrival times
+        # Note: Since we have sum(p[i, t]) = 1, fixing p[i, fixed_arrival] = 1
+        # automatically forces all other p[i, t] = 0
+        for i, fixed_arrival in self.fixed_arrival_times.items():
+            if 1 <= i <= N and 1 <= fixed_arrival <= T:
+                m.addConstr(p[i, fixed_arrival] == 1, f"fixed_arrival_{i}")
+        
+        # (2d) Fixed durations
+        # Note: Duration extensions are handled by updating self.D, self.d, self.L dictionaries
+        # before creating PrefabScheduler. The fixed_durations here are mainly for documentation
+        # and ensuring consistency. The actual durations used in constraints come from D, d, L.
+        for i, phase_durations in self.fixed_durations.items():
+            if 1 <= i <= N:
+                if 'FABRICATION' in phase_durations:
+                    # Duration is stored in D[i] and used in constraints
+                    # No additional constraint needed - D[i] already reflects the delayed duration
+                    pass
+                if 'TRANSPORT' in phase_durations:
+                    # Transport duration is in L[i] and used in constraints
+                    pass
+                if 'INSTALLATION' in phase_durations:
+                    # Installation duration is in d[i] and used in constraints
+                    pass
 
         # (3) dummy end starts once
         m.addConstr(quicksum(x[dummy_end, t] for t in range(1, T + 1)) == 1,
@@ -395,7 +481,8 @@ class PrefabScheduler:
     def save_results_to_db(self, 
                           engine: Engine, 
                           project_id: int,
-                          module_id_mapping: Optional[Dict[int, str]] = None) -> bool:
+                          module_id_mapping: Optional[Dict[int, str]] = None,
+                          version_id: Optional[int] = None) -> bool:
         """
         Save optimization results to the database.
         
@@ -411,6 +498,7 @@ class PrefabScheduler:
             project_id: Project ID to save results for
             module_id_mapping: Optional mapping from module index (1..N) to module ID string.
                              If None, uses module index as ID.
+            version_id: Optional version ID for version management. If None, uses latest version.
         
         Returns:
             True if successful, False otherwise
@@ -462,27 +550,51 @@ class PrefabScheduler:
                     'Arrival_Time': arrival_time,
                     'Production_Start': prod_start,
                     'Production_Duration': self.D.get(i, 0),
-                    'Transport_Duration': self.L.get(i, 0),
                     'Factory_Wait_Start': factory_wait_start,
                     'Factory_Wait_Duration': factory_wait_duration,
                     'Onsite_Wait_Start': onsite_wait_start,
                     'Onsite_Wait_Duration': onsite_wait_duration,
                     'Transport_Start': transport_start,
-                    'Transport_Duration': transport_duration
+                    'Transport_Duration': transport_duration,
+                    'version_id': version_id
                 })
             
             results_df = pd.DataFrame(results_data)
             
+            # Ensure solution table has version_id column
+            with engine.begin() as conn:
+                from sqlalchemy import inspect
+                inspector = inspect(engine)
+                if solution_table in inspector.get_table_names():
+                    # Check if version_id column exists
+                    columns = [col['name'] for col in inspector.get_columns(solution_table)]
+                    if 'version_id' not in columns:
+                        conn.exec_driver_sql(f'ALTER TABLE "{solution_table}" ADD COLUMN version_id INTEGER')
+            
             # Save solution to dedicated solution table (separate from input data)
             # This is the main solution table that records optimization results
-            results_df.to_sql(
-                solution_table, 
-                engine, 
-                if_exists='replace', 
-                index=False,
-                method='multi',
-                chunksize=1000
-            )
+            # If version_id is None (initial calculation), replace old data
+            # If version_id is set (re-optimization), append for versioning
+            if version_id is None:
+                # Initial calculation: replace old data
+                results_df.to_sql(
+                    solution_table, 
+                    engine, 
+                    if_exists='replace', 
+                    index=False,
+                    method='multi',
+                    chunksize=1000
+                )
+            else:
+                # Re-optimization: append for versioning
+                results_df.to_sql(
+                    solution_table, 
+                    engine, 
+                    if_exists='append', 
+                    index=False,
+                    method='multi',
+                    chunksize=1000
+                )
             
             # Also create a summary table with project-level results
             summary_data = [{
@@ -519,8 +631,8 @@ class PrefabScheduler:
             # Create site inventory table
             if solution['site_inventory']:
                 site_inv_data = [
-                    {'time': t, 'inventory_level': inv}
-                    for t, inv in sorted(solution['site_inventory'].items())
+                    {'module_index': i, 'time': t, 'inventory_level': inv}
+                    for (i, t), inv in sorted(solution['site_inventory'].items())
                 ]
                 site_inv_df = pd.DataFrame(site_inv_data)
                 site_inv_df.to_sql(
