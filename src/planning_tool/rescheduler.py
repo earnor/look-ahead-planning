@@ -19,10 +19,11 @@ class TaskState:
     module_id: str
     module_index: int
     phase: str  # "FABRICATION", "TRANSPORT", "INSTALLATION"
-    status: str  # "COMPLETED", "IN_PROGRESS", "UPCOMING"
-    start_time: Optional[int]  # Time index when phase starts
-    finish_time: Optional[int]  # Time index when phase finishes
+    status: str  # "COMPLETED", "IN_PROGRESS", "NOT_STARTED"
+    start_time: Optional[int]  # Time index when phase starts (planned)
+    finish_time: Optional[int]  # Time index when phase finishes (planned)
     progress: float  # 0.0 to 1.0, how much of the phase is completed
+    actual_start_time: Optional[int] = None  # Actual start time if started (for IN_PROGRESS)
 
 
 @dataclass
@@ -38,22 +39,22 @@ class DelayInfo:
 
 
 class TaskStateIdentifier:
-    """Identifies task states from solution data"""
+    """Identifies task states from solution data based on current_time"""
     
-    def __init__(self, solution_df: pd.DataFrame, tau: int,
+    def __init__(self, solution_df: pd.DataFrame, current_time: int,
                  working_calendar_slots: List[datetime]):
         """
         Args:
             solution_df: DataFrame with columns Module_ID, Installation_Start, 
                         Production_Start, Arrival_Time, etc.
-            tau: Time index when delay was detected (re-optimization starts from here)
+            current_time: Time index representing the actual current time (re-optimization starts from here)
             working_calendar_slots: List of datetime objects mapping time indices to real times
         """
         self.solution_df = solution_df
-        self.tau = tau
+        self.current_time = current_time
         self.working_calendar_slots = working_calendar_slots
-        # Convert tau (time index) to datetime for comparison
-        self.tau_datetime = self._index_to_datetime(tau) if tau > 0 else None
+        # Convert current_time (time index) to datetime for comparison
+        self.current_datetime = self._index_to_datetime(current_time) if current_time > 0 else None
         self._time_to_index_map = self._build_time_map()
     
     def _build_time_map(self) -> Dict[datetime, int]:
@@ -144,56 +145,49 @@ class TaskStateIdentifier:
     def _identify_phase_state(self, module_id: str, module_index: int, 
                               phase: str, start_idx: Optional[int], 
                               finish_idx: Optional[int], duration: int) -> Optional[TaskState]:
-        """Identify state for a single phase"""
-        if start_idx is None:
-            return TaskState(
-                module_id=module_id,
-                module_index=module_index,
-                phase=phase,
-                status="UPCOMING",
-                start_time=None,
-                finish_time=None,
-                progress=0.0
-            )
+        """Identify state for a single phase based on current_time"""
         
         # Convert time indices to datetimes
         start_dt = self._index_to_datetime(start_idx)
         finish_dt = self._index_to_datetime(finish_idx) if finish_idx else None
         
-        if start_dt is None:
-            return None
-        
-        # Determine status based on tau (delay detection time), not current time
-        if self.tau_datetime is None:
-            # If tau_datetime is not available, treat all as upcoming
+        # Determine status based on current_time (actual current time)
+        if self.current_datetime is None:
+            # If current_datetime is not available, treat all as not started
             return TaskState(
                 module_id=module_id,
                 module_index=module_index,
                 phase=phase,
-                status="UPCOMING",
+                status="NOT_STARTED",
                 start_time=start_idx,
                 finish_time=finish_idx,
                 progress=0.0
             )
         
-        # Determine status at time τ
-        if finish_dt and finish_dt < self.tau_datetime:
-            # Completed by time τ
+        # Determine status at current_time
+        if finish_dt and finish_dt < self.current_datetime:
+            # Completed by current_time
             status = "COMPLETED"
             progress = 1.0
-        elif start_dt and start_dt <= self.tau_datetime:
-            # In progress at time τ
+            actual_start = None  # Not needed for completed tasks
+        elif start_dt and start_dt <= self.current_datetime:
+            # In progress at current_time
             status = "IN_PROGRESS"
+            actual_start = start_idx  # Assume started at planned start (could be refined with actual records)
             if finish_dt:
                 total_duration = (finish_dt - start_dt).total_seconds() / 3600
-                elapsed = (self.tau_datetime - start_dt).total_seconds() / 3600
-                progress = min(1.0, max(0.0, elapsed / total_duration))
+                elapsed = (self.current_datetime - start_dt).total_seconds() / 3600
+                if total_duration > 0:
+                    progress = min(1.0, max(0.0, elapsed / total_duration))
+                else:
+                    progress = 0.0  # avoid division by zero when duration invalid
             else:
                 progress = 0.5  # Unknown progress
         else:
-            # Upcoming at time τ
-            status = "UPCOMING"
+            # Not started at current_time
+            status = "NOT_STARTED"
             progress = 0.0
+            actual_start = None
         
         return TaskState(
             module_id=module_id,
@@ -202,7 +196,8 @@ class TaskStateIdentifier:
             status=status,
             start_time=start_idx,
             finish_time=finish_idx,
-            progress=progress
+            progress=progress,
+            actual_start_time=actual_start
         )
 
 
@@ -292,21 +287,22 @@ class DelayApplier:
             if pd.notna(base_start):
                 new_lb = base_start + delay_hours
                 current_lb = df.at[idx, 'Earliest_Production_Start']
-                if pd.isna(current_lb) or new_lb > current_lb:
+                # current_lb can be None/NaN on first delay; only compare when it is a number
+                if pd.isna(current_lb) or current_lb is None or new_lb > current_lb:
                     df.at[idx, 'Earliest_Production_Start'] = new_lb
         elif delay.phase == "TRANSPORT":
             transport_start = df.at[idx, 'Transport_Start']
             if pd.notna(transport_start):
                 new_lb = transport_start + delay_hours
                 current_lb = df.at[idx, 'Earliest_Transport_Start']
-                if pd.isna(current_lb) or new_lb > current_lb:
+                if pd.isna(current_lb) or current_lb is None or new_lb > current_lb:
                     df.at[idx, 'Earliest_Transport_Start'] = new_lb
         elif delay.phase == "INSTALLATION":
             install_start = df.at[idx, 'Installation_Start']
             if pd.notna(install_start):
                 new_lb = install_start + delay_hours
                 current_lb = df.at[idx, 'Earliest_Installation_Start']
-                if pd.isna(current_lb) or new_lb > current_lb:
+                if pd.isna(current_lb) or current_lb is None or new_lb > current_lb:
                     df.at[idx, 'Earliest_Installation_Start'] = new_lb
 
 
@@ -314,32 +310,55 @@ class FixedConstraintsBuilder:
     """Builds fixed constraints for re-optimization"""
     
     def __init__(self, task_states: Dict[str, List[TaskState]], 
-                 tau: int, solution_df: pd.DataFrame, original_solution_df: Optional[pd.DataFrame] = None):
+                 current_time: int, solution_df: pd.DataFrame, 
+                 working_calendar_slots: List[datetime],
+                 original_solution_df: Optional[pd.DataFrame] = None):
         """
         Args:
             task_states: Task states identified by TaskStateIdentifier
-            tau: Time index when delay was detected
+            current_time: Time index representing the actual current time
             solution_df: Solution DataFrame (may contain Earliest_* columns after delays are applied)
+            working_calendar_slots: List of datetime objects mapping time indices to real times
             original_solution_df: Original solution DataFrame before delays are applied (for completed tasks)
         """
         self.task_states = task_states
-        self.tau = tau
+        self.current_time = current_time
         self.solution_df = solution_df
+        self.working_calendar_slots = working_calendar_slots
         # Store original solution for completed tasks (to get original durations)
         self.original_solution_df = original_solution_df if original_solution_df is not None else solution_df
         self._module_id_to_index = {
             str(row['Module_ID']): int(row.get('Module_Index', 0))
             for _, row in self.solution_df.iterrows()
         }
+        
+    def _index_to_datetime(self, idx: int) -> Optional[datetime]:
+        """Convert time index to datetime"""
+        if 1 <= idx <= len(self.working_calendar_slots):
+            return self.working_calendar_slots[idx - 1]
+        return None
+    
+    def _datetime_to_index(self, dt: datetime) -> Optional[int]:
+        """Convert datetime to time index"""
+        for idx, slot in enumerate(self.working_calendar_slots):
+            if slot >= dt:
+                return idx + 1
+        return None
     
     def build_fixed_constraints(self) -> Dict[str, any]:
         """
-        Build fixed constraints for re-optimization.
+        Build fixed constraints for re-optimization based on current_time.
         Returns a dictionary with:
         - fixed_installation_starts: {module_index: start_time}
         - fixed_production_starts: {module_index: start_time}
         - fixed_arrival_times: {module_index: arrival_time}
         - fixed_durations: {module_index: {phase: duration}}
+        
+        Logic:
+        - COMPLETED: Fix start time, duration = original (not used by optimizer)
+        - IN_PROGRESS: Fix start time, duration = remaining duration (considering DURATION_EXTENSION)
+        - NOT_STARTED: No fixed start (may have lower bound from START_POSTPONEMENT), 
+                       duration = modified total duration (considering DURATION_EXTENSION)
         """
         fixed_installation_starts = {}
         fixed_production_starts = {}
@@ -368,70 +387,20 @@ class FixedConstraintsBuilder:
             # Check each phase
             for state in states:
                 if state.phase == "FABRICATION":
-                    # Check if task actually started by time tau (considering delays)
-                    earliest_start = row.get('Earliest_Production_Start')
-                    actual_start_lb = earliest_start if pd.notna(earliest_start) else state.start_time
-                    
-                    # Only fix if: (1) completed, or (2) in progress AND actually started by tau
-                    if state.status == "COMPLETED" or (state.status == "IN_PROGRESS" and actual_start_lb is not None and actual_start_lb <= self.tau):
-                        # Fix production start
-                        prod_start = row.get('Production_Start')
-                        if prod_start:
-                            fixed_production_starts[module_index] = prod_start
-                    
-                    # Fix duration based on status
-                    if state.status == "COMPLETED":
-                        # Already completed - use original duration (task finished before delay was detected)
-                        fixed_durations.setdefault(module_index, {})['FABRICATION'] = original_row.get('Production_Duration', 0)
-                    elif state.status == "IN_PROGRESS" and actual_start_lb is not None and actual_start_lb <= self.tau:
-                        # In progress - use delayed duration if DURATION_EXTENSION was applied
-                        # row contains the modified duration after DelayApplier
-                        fixed_durations.setdefault(module_index, {})['FABRICATION'] = row.get('Production_Duration', 0)
-                
+                    self._handle_fabrication_phase(
+                        state, module_index, row, original_row,
+                        fixed_production_starts, fixed_durations
+                    )
                 elif state.phase == "TRANSPORT":
-                    # Check if transport actually started by time tau (considering delays)
-                    earliest_start = row.get('Earliest_Transport_Start')
-                    actual_start_lb = earliest_start if pd.notna(earliest_start) else state.start_time
-                    
-                    # Only fix if: (1) completed, or (2) in progress AND actually started by tau
-                    if state.status == "COMPLETED" or (state.status == "IN_PROGRESS" and actual_start_lb is not None and actual_start_lb <= self.tau):
-                        # Fix arrival time (calculate from Transport_Start if Arrival_Time doesn't exist)
-                        arrival = row.get('Arrival_Time')
-                        if arrival is None:
-                            transport_start = row.get('Transport_Start')
-                            transport_duration = row.get('Transport_Duration', 0)
-                            if transport_start is not None:
-                                arrival = transport_start + transport_duration #通常不应该执行这一步
-                        if arrival:
-                            fixed_arrival_times[module_index] = arrival
-                    
-                    # Fix duration based on status
-                    if state.status == "COMPLETED":
-                        # Already completed - use original duration (task finished before delay was detected)
-                        fixed_durations.setdefault(module_index, {})['TRANSPORT'] = original_row.get('Transport_Duration', 0)
-                    elif state.status == "IN_PROGRESS" and actual_start_lb is not None and actual_start_lb <= self.tau:
-                        # In progress - use delayed duration if DURATION_EXTENSION was applied
-                        fixed_durations.setdefault(module_index, {})['TRANSPORT'] = row.get('Transport_Duration', 0)
-                
+                    self._handle_transport_phase(
+                        state, module_index, row, original_row,
+                        fixed_arrival_times, fixed_durations
+                    )
                 elif state.phase == "INSTALLATION":
-                    # Check if installation actually started by time tau (considering delays)
-                    earliest_start = row.get('Earliest_Installation_Start')
-                    actual_start_lb = earliest_start if pd.notna(earliest_start) else state.start_time
-                    
-                    # Only fix if: (1) completed, or (2) in progress AND actually started by tau
-                    if state.status == "COMPLETED" or (state.status == "IN_PROGRESS" and actual_start_lb is not None and actual_start_lb <= self.tau):
-                        # Fix installation start
-                        install_start = row.get('Installation_Start')
-                        if install_start:
-                            fixed_installation_starts[module_index] = install_start
-                    
-                    # Fix duration based on status
-                    if state.status == "COMPLETED":
-                        # Already completed - use original duration (task finished before delay was detected)
-                        fixed_durations.setdefault(module_index, {})['INSTALLATION'] = original_row.get('Installation_Duration', 0)
-                    elif state.status == "IN_PROGRESS" and actual_start_lb is not None and actual_start_lb <= self.tau:
-                        # In progress - use delayed duration if DURATION_EXTENSION was applied
-                        fixed_durations.setdefault(module_index, {})['INSTALLATION'] = row.get('Installation_Duration', 0)
+                    self._handle_installation_phase(
+                        state, module_index, row, original_row,
+                        fixed_installation_starts, fixed_durations
+                    )
         
         return {
             'fixed_installation_starts': fixed_installation_starts,
@@ -439,6 +408,106 @@ class FixedConstraintsBuilder:
             'fixed_arrival_times': fixed_arrival_times,
             'fixed_durations': fixed_durations
         }
+    
+    def _handle_fabrication_phase(self, state: TaskState, module_index: int,
+                                  row: pd.Series, original_row: pd.Series,
+                                  fixed_production_starts: Dict[int, int],
+                                  fixed_durations: Dict[int, Dict[str, float]]):
+        """Handle fabrication phase constraints"""
+        if state.status == "COMPLETED":
+            # Fix start time (for historical record)
+            if state.start_time:
+                fixed_production_starts[module_index] = state.start_time
+            # Duration = original (optimizer doesn't need it, but record for completeness)
+            fixed_durations.setdefault(module_index, {})['FABRICATION'] = original_row.get('Production_Duration', 0)
+            
+        elif state.status == "IN_PROGRESS":
+            # Fix start time (task has started)
+            actual_start = state.actual_start_time if state.actual_start_time else state.start_time
+            if actual_start:
+                fixed_production_starts[module_index] = actual_start
+            
+            # Calculate remaining duration
+            # Total duration after DURATION_EXTENSION
+            total_duration = row.get('Production_Duration', 0)
+            # Elapsed time = current_time - actual_start
+            elapsed = max(0, self.current_time - actual_start) if actual_start else 0
+            # Remaining duration = total - elapsed
+            remaining_duration = max(0, total_duration - elapsed)
+            fixed_durations.setdefault(module_index, {})['FABRICATION'] = remaining_duration
+            
+        elif state.status == "NOT_STARTED":
+            # No fixed start time (may have lower bound from START_POSTPONEMENT via Earliest_Production_Start)
+            # Duration = modified total duration (after DURATION_EXTENSION)
+            modified_duration = row.get('Production_Duration', 0)
+            fixed_durations.setdefault(module_index, {})['FABRICATION'] = modified_duration
+    
+    def _handle_transport_phase(self, state: TaskState, module_index: int,
+                               row: pd.Series, original_row: pd.Series,
+                               fixed_arrival_times: Dict[int, int],
+                               fixed_durations: Dict[int, Dict[str, float]]):
+        """Handle transport phase constraints"""
+        if state.status == "COMPLETED":
+            # Fix arrival time (transport completed)
+            arrival = row.get('Arrival_Time')
+            if arrival is None and state.finish_time:
+                arrival = state.finish_time
+            if arrival:
+                fixed_arrival_times[module_index] = arrival
+            # Duration = original (optimizer doesn't need it)
+            fixed_durations.setdefault(module_index, {})['TRANSPORT'] = original_row.get('Transport_Duration', 0)
+            
+        elif state.status == "IN_PROGRESS":
+            # Fix start time indirectly via arrival time calculation
+            # For transport, we fix the start time by ensuring the relationship is maintained
+            # But we use remaining duration
+            actual_start = state.actual_start_time if state.actual_start_time else state.start_time
+            
+            # Calculate remaining duration
+            total_duration = row.get('Transport_Duration', 0)
+            elapsed = max(0, self.current_time - actual_start) if actual_start else 0
+            remaining_duration = max(0, total_duration - elapsed)
+            fixed_durations.setdefault(module_index, {})['TRANSPORT'] = remaining_duration
+            
+            # Note: Transport start is fixed via precedence constraints and production finish
+            # We don't directly fix transport start here, but the remaining duration ensures
+            # the transport completion time is correctly calculated
+            
+        elif state.status == "NOT_STARTED":
+            # No fixed start time
+            # Duration = modified total duration (after DURATION_EXTENSION)
+            modified_duration = row.get('Transport_Duration', 0)
+            fixed_durations.setdefault(module_index, {})['TRANSPORT'] = modified_duration
+    
+    def _handle_installation_phase(self, state: TaskState, module_index: int,
+                                  row: pd.Series, original_row: pd.Series,
+                                  fixed_installation_starts: Dict[int, int],
+                                  fixed_durations: Dict[int, Dict[str, float]]):
+        """Handle installation phase constraints"""
+        if state.status == "COMPLETED":
+            # Fix start time (for historical record)
+            if state.start_time:
+                fixed_installation_starts[module_index] = state.start_time
+            # Duration = original (optimizer doesn't need it)
+            fixed_durations.setdefault(module_index, {})['INSTALLATION'] = original_row.get('Installation_Duration', 0)
+            
+        elif state.status == "IN_PROGRESS":
+            # Fix start time (task has started)
+            actual_start = state.actual_start_time if state.actual_start_time else state.start_time
+            if actual_start:
+                fixed_installation_starts[module_index] = actual_start
+            
+            # Calculate remaining duration
+            total_duration = row.get('Installation_Duration', 0)
+            elapsed = max(0, self.current_time - actual_start) if actual_start else 0
+            remaining_duration = max(0, total_duration - elapsed)
+            fixed_durations.setdefault(module_index, {})['INSTALLATION'] = remaining_duration
+            
+        elif state.status == "NOT_STARTED":
+            # No fixed start time (may have lower bound from START_POSTPONEMENT via Earliest_Installation_Start)
+            # Duration = modified total duration (after DURATION_EXTENSION)
+            modified_duration = row.get('Installation_Duration', 0)
+            fixed_durations.setdefault(module_index, {})['INSTALLATION'] = modified_duration
 
 
 def load_delays_from_db(engine: Engine, project_id: int, version_id: Optional[int] = None) -> List[DelayInfo]:

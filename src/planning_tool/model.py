@@ -103,7 +103,7 @@ class PrefabScheduler:
         self.fixed_production_starts = {}
         self.fixed_arrival_times = {} 
         self.fixed_durations = {} # any problem here?
-        self.reoptimize_from_time = None  # Time τ from which to re-optimize
+        self.reoptimize_from_time = None  # Current time (time index) from which to re-optimize
 
         # preprocessing roots / leaves
         self.roots, self.leaves = self._find_roots_and_leaves()
@@ -122,7 +122,7 @@ class PrefabScheduler:
             fixed_production_starts: {module_index: start_time}
             fixed_arrival_times: {module_index: arrival_time}
             fixed_durations: {module_index: {phase: duration}}
-            reoptimize_from_time: Time index τ from which to re-optimize
+            reoptimize_from_time: Current time (time index) from which to re-optimize
         """
         if fixed_installation_starts:
             self.fixed_installation_starts = fixed_installation_starts.copy()
@@ -207,7 +207,7 @@ class PrefabScheduler:
 
         # ============ 4. constraints ============
 
-        # (1) dummy start fixed at time 1 (or reoptimize_from_time if set)
+        # (1) dummy start fixed at time 1 (or reoptimize_from_time (current_time) if set)
         start_time = 1
         if self.reoptimize_from_time is not None:
             start_time = max(1, self.reoptimize_from_time)
