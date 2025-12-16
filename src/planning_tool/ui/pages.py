@@ -6,6 +6,7 @@ This module contains all main page widgets for the application:
 - SchedulePage: Module schedule display and management
 - UploadPage: File upload interface
 - SettingsPage: Project settings configuration
+- ComparisonPage: Schedule comparison page with Gantt charts and metrics
 """
 from PyQt6.QtCore import Qt, pyqtSignal, QDate
 from PyQt6.QtGui import QColor
@@ -26,28 +27,174 @@ from planning_tool.ui.dialogs import DelayInputDialog
 
 
 class DashboardPage(QWidget):
+    pageRequested = pyqtSignal(str)  # Signal to request page navigation
+    
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._build_ui()
 
-        # 4 KPI cards
-        cards = QGridLayout()
-        cards.setHorizontalSpacing(12)
-        cards.setVerticalSpacing(12)
+    def _build_ui(self):
+        """Build the dashboard UI according to the design"""
+        # Main layout
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(16, 16, 16, 16)
+        main_layout.setSpacing(16)
 
-        cards.addWidget(KpiCard("Planned vs Actual", "92%", "On schedule", "↗ +3%"), 0, 0)
-        cards.addWidget(KpiCard("Critical Tasks", "12", "Requiring attention", "↘ -2"), 0, 1)
-        cards.addWidget(KpiCard("Delay Days", "23", "Total across project", "↗ +5"), 0, 2)
-        cards.addWidget(KpiCard("Forecast Completion", "Dec 15, 2025", "3 days behind baseline", "↘ -3"), 1, 0)
-        cards.addWidget(KpiCard("Open Issues", "8", "Awaiting resolution", "↘ -3"), 1, 1)
-        cards.addItem(QSpacerItem(20, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred), 1, 2)
+        # Title: Project Overview
+        title_label = QLabel("Project Overview")
+        title_label.setStyleSheet("font-size: 24px; font-weight: 600; color: #111827; margin-bottom: 8px;")
+        subtitle_label = QLabel("Key metrics and schedule status")
+        subtitle_label.setStyleSheet("font-size: 14px; color: #6B7280; margin-bottom: 16px;")
+        
+        title_layout = QVBoxLayout()
+        title_layout.setSpacing(4)
+        title_layout.addWidget(title_label)
+        title_layout.addWidget(subtitle_label)
+        main_layout.addLayout(title_layout)
 
-        table = DashboardTable()
+        # Top row: 3 key metrics cards
+        top_row = QHBoxLayout()
+        top_row.setSpacing(12)
+        
+        # Planned vs Actual - Green checkmark icon
+        card1 = KpiCard(
+            "Planned vs Actual",
+            "92%",
+            "On schedule",
+            "↗ +3%",
+            icon="✓"  # Green checkmark
+        )
+        # Apply green styling to icon
+        icon1 = card1.findChild(QLabel, "kpiIcon")
+        if icon1:
+            icon1.setStyleSheet("""
+                QLabel {
+                    color: #10B981;
+                    background: #D1FAE5;
+                    border-radius: 20px;
+                    font-size: 20px;
+                }
+            """)
+        
+        # Critical Tasks - Orange warning icon
+        card2 = KpiCard(
+            "Critical Tasks",
+            "12",
+            "Requiring attention",
+            "↘ -2",
+            icon="⚠"  # Orange warning
+        )
+        # Apply orange styling to icon
+        icon2 = card2.findChild(QLabel, "kpiIcon")
+        if icon2:
+            icon2.setStyleSheet("""
+                QLabel {
+                    color: #F59E0B;
+                    background: #FEF3C7;
+                    border-radius: 20px;
+                    font-size: 20px;
+                }
+            """)
+        
+        # Delay Days - Red clock icon
+        card3 = KpiCard(
+            "Delay Days",
+            "23",
+            "Total across project",
+            "↗ +5",
+            icon="🕐"  # Red clock
+        )
+        # Apply red styling to icon
+        icon3 = card3.findChild(QLabel, "kpiIcon")
+        if icon3:
+            icon3.setStyleSheet("""
+                QLabel {
+                    color: #EF4444;
+                    background: #FEE2E2;
+                    border-radius: 20px;
+                    font-size: 20px;
+                }
+            """)
+        
+        top_row.addWidget(card1)
+        top_row.addWidget(card2)
+        top_row.addWidget(card3)
+        main_layout.addLayout(top_row)
 
-        lay = QVBoxLayout(self)
-        lay.addLayout(cards)
-        lay.addWidget(table)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(12)
+        # Middle row: 3 status cards
+        middle_row = QHBoxLayout()
+        middle_row.setSpacing(12)
+        
+        # Forecast Completion - Blue calendar icon
+        card4 = KpiCard(
+            "Forecast Completion",
+            "Dec 15, 2025",
+            "3 days behind baseline",
+            "",
+            icon="📅"  # Blue calendar
+        )
+        # Apply blue styling to icon
+        icon4 = card4.findChild(QLabel, "kpiIcon")
+        if icon4:
+            icon4.setStyleSheet("""
+                QLabel {
+                    color: #3B82F6;
+                    background: #DBEAFE;
+                    border-radius: 20px;
+                    font-size: 20px;
+                }
+            """)
+        
+        # Factory Storage Modules - Purple cube icon
+        card5 = KpiCard(
+            "Factory Storage Modules",
+            "2",
+            "Ready for transport",
+            "",
+            icon="🏭"  # Purple cube
+        )
+        # Apply purple styling to icon
+        icon5 = card5.findChild(QLabel, "kpiIcon")
+        if icon5:
+            icon5.setStyleSheet("""
+                QLabel {
+                    color: #8B5CF6;
+                    background: #EDE9FE;
+                    border-radius: 20px;
+                    font-size: 20px;
+                }
+            """)
+        
+        # Site Storage Modules - Purple cube icon
+        card6 = KpiCard(
+            "Site Storage Modules",
+            "1",
+            "Awaiting installation",
+            "",
+            icon="📦"  # Purple cube
+        )
+        # Apply purple styling to icon
+        icon6 = card6.findChild(QLabel, "kpiIcon")
+        if icon6:
+            icon6.setStyleSheet("""
+                QLabel {
+                    color: #8B5CF6;
+                    background: #EDE9FE;
+                    border-radius: 20px;
+                    font-size: 20px;
+                }
+            """)
+        
+        middle_row.addWidget(card4)
+        middle_row.addWidget(card5)
+        middle_row.addWidget(card6)
+        main_layout.addLayout(middle_row)
+
+        # Bottom section: What's Late This Week table
+        self.table = DashboardTable()
+        # Connect table's pageRequested signal to this page's signal
+        self.table.pageRequested.connect(self.pageRequested.emit)
+        main_layout.addWidget(self.table, 1)  # Stretch factor for table
 
 
 class UploadPage(QWidget):
@@ -985,10 +1132,10 @@ class SettingsPage(QWidget):
         cost_group.addWidget(cost_label, 0, 0, 1, 2)
         
         cost_params = [
-            ("Order Batch Cost (OC):", "order_cost", "0.5"),
-            ("Penalty Cost per Unit Time (C_I):", "penalty_cost", "1"),
-            ("Factory Inventory Cost (C_F):", "factory_inv_cost", "0.2"),
-            ("Onsite Inventory Cost (C_O):", "onsite_inv_cost", "0.2"),
+            ("Order Batch Cost (OC):", "order_cost", "0.25"),
+            ("Penalty Cost per Unit Time (C_I):", "penalty_cost", "0.5"),
+            ("Factory Inventory Cost (C_F):", "factory_inv_cost", "0.1"),
+            ("Onsite Inventory Cost (C_O):", "onsite_inv_cost", "0.15"),
         ]
         
         self.cost_inputs = {}
@@ -1040,4 +1187,275 @@ class SettingsPage(QWidget):
 
     def get_working_days_map(self) -> dict[str, bool]:
         return {day: btn.isChecked() for day, btn in self.working_days.items()}
+
+
+class ComparisonPage(QWidget):
+    """Schedule comparison page with Gantt charts and metrics comparison"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._build_ui()
+
+    def _build_ui(self):
+        """Build the comparison page UI"""
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(16, 16, 16, 16)
+        main_layout.setSpacing(16)
+
+        # Left section: Gantt Chart Comparison
+        left_section = self._build_gantt_section()
+        main_layout.addWidget(left_section, 3)  # Takes 3/4 of the space
+
+        # Right section: Metrics Comparison Sidebar
+        right_section = self._build_metrics_section()
+        main_layout.addWidget(right_section, 1)  # Takes 1/4 of the space
+
+    def _build_gantt_section(self) -> QWidget:
+        """Build the left section with Gantt chart comparison"""
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+
+        # Title
+        title = QLabel("Schedule Gantt Comparison")
+        title.setStyleSheet("font-size: 24px; font-weight: 600; color: #111827;")
+        layout.addWidget(title)
+
+        # Version selection
+        version_layout = QHBoxLayout()
+        version_layout.setSpacing(16)
+
+        upper_version_layout = QVBoxLayout()
+        upper_version_label = QLabel("Upper Version:")
+        upper_version_label.setStyleSheet("font-size: 13px; font-weight: 500; color: #374151;")
+        self.upper_version_combo = QComboBox()
+        self.upper_version_combo.addItems(["Version 1 (Baseline)", "Version 2 (Current)"])
+        self.upper_version_combo.setStyleSheet("""
+            QComboBox {
+                border: 1px solid #D1D5DB;
+                border-radius: 6px;
+                padding: 6px 12px;
+                font-size: 13px;
+                background: #FFFFFF;
+                min-width: 200px;
+            }
+        """)
+        upper_version_layout.addWidget(upper_version_label)
+        upper_version_layout.addWidget(self.upper_version_combo)
+
+        lower_version_layout = QVBoxLayout()
+        lower_version_label = QLabel("Lower Version:")
+        lower_version_label.setStyleSheet("font-size: 13px; font-weight: 500; color: #374151;")
+        self.lower_version_combo = QComboBox()
+        self.lower_version_combo.addItems(["Version 1 (Baseline)", "Version 2 (Current)"])
+        self.lower_version_combo.setCurrentIndex(1)
+        self.lower_version_combo.setStyleSheet("""
+            QComboBox {
+                border: 1px solid #D1D5DB;
+                border-radius: 6px;
+                padding: 6px 12px;
+                font-size: 13px;
+                background: #FFFFFF;
+                min-width: 200px;
+            }
+        """)
+        lower_version_layout.addWidget(lower_version_label)
+        lower_version_layout.addWidget(self.lower_version_combo)
+
+        version_layout.addLayout(upper_version_layout)
+        version_layout.addStretch(1)
+        version_layout.addLayout(lower_version_layout)
+        layout.addLayout(version_layout)
+
+        # Legend
+        legend_layout = QHBoxLayout()
+        legend_layout.setSpacing(16)
+        
+        legend_items = [
+            ("Fabrication", "#3B82F6"),  # Blue
+            ("Transport", "#F59E0B"),    # Orange
+            ("Installation", "#10B981")  # Green
+        ]
+        
+        for label, color in legend_items:
+            legend_item = QHBoxLayout()
+            legend_item.setSpacing(8)
+            
+            color_box = QLabel()
+            color_box.setFixedSize(20, 20)
+            color_box.setStyleSheet(f"background: {color}; border-radius: 4px;")
+            
+            legend_label = QLabel(label)
+            legend_label.setStyleSheet("font-size: 12px; color: #374151;")
+            
+            legend_item.addWidget(color_box)
+            legend_item.addWidget(legend_label)
+            legend_layout.addLayout(legend_item)
+        
+        legend_layout.addStretch(1)
+        layout.addLayout(legend_layout)
+
+        # Gantt chart placeholder (blank area)
+        gantt_container = QFrame()
+        gantt_container.setObjectName("GanttContainer")
+        gantt_container.setStyleSheet("""
+            QFrame#GanttContainer {
+                background: #F9FAFB;
+                border: 2px dashed #D1D5DB;
+                border-radius: 8px;
+                min-height: 500px;
+            }
+        """)
+        gantt_layout = QVBoxLayout(gantt_container)
+        gantt_layout.setContentsMargins(20, 20, 20, 20)
+        
+        # Placeholder text
+        placeholder_text = QLabel("Gantt Chart Area\n(To be implemented)")
+        placeholder_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        placeholder_text.setStyleSheet("""
+            QLabel {
+                font-size: 16px;
+                color: #9CA3AF;
+                background: transparent;
+            }
+        """)
+        gantt_layout.addWidget(placeholder_text)
+        gantt_layout.addStretch(1)
+        
+        layout.addWidget(gantt_container, 1)
+
+        return container
+
+    def _build_metrics_section(self) -> QWidget:
+        """Build the right sidebar with metrics comparison"""
+        container = QFrame()
+        container.setObjectName("MetricsSidebar")
+        container.setStyleSheet("""
+            QFrame#MetricsSidebar {
+                background: #FFFFFF;
+                border: 1px solid #E5E7EB;
+                border-radius: 12px;
+            }
+        """)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(20)
+
+        # Title
+        title = QLabel("Metrics Comparison")
+        title.setStyleSheet("font-size: 20px; font-weight: 600; color: #111827;")
+        subtitle = QLabel("Comparing key metrics between selected versions")
+        subtitle.setStyleSheet("font-size: 13px; color: #6B7280; margin-bottom: 8px;")
+        
+        title_layout = QVBoxLayout()
+        title_layout.setSpacing(4)
+        title_layout.addWidget(title)
+        title_layout.addWidget(subtitle)
+        layout.addLayout(title_layout)
+
+        # KPI Comparison Cards
+        metrics = [
+            {
+                "name": "Construction Days",
+                "v1_value": "45 days",
+                "v2_value": "48 days",
+                "change": "+3",
+                "change_percent": "6.7%",
+                "trend": "up"
+            },
+            {
+                "name": "Factory Storage Module Days",
+                "v1_value": "8 days",
+                "v2_value": "10 days",
+                "change": "+2",
+                "change_percent": "25.0%",
+                "trend": "up"
+            },
+            {
+                "name": "Site Storage Module Days",
+                "v1_value": "4 days",
+                "v2_value": "5 days",
+                "change": "+1",
+                "change_percent": "25.0%",
+                "trend": "up"
+            },
+            {
+                "name": "Transport Bunch Number",
+                "v1_value": "12 bunches",
+                "v2_value": "13 bunches",
+                "change": "+1",
+                "change_percent": "8.3%",
+                "trend": "up"
+            }
+        ]
+
+        for metric in metrics:
+            metric_card = self._create_metric_card(metric)
+            layout.addWidget(metric_card)
+
+        layout.addStretch(1)
+
+        return container
+
+    def _create_metric_card(self, metric: dict) -> QFrame:
+        """Create a metric comparison card"""
+        card = QFrame()
+        card.setObjectName("MetricCard")
+        card.setStyleSheet("""
+            QFrame#MetricCard {
+                background: #F9FAFB;
+                border: 1px solid #E5E7EB;
+                border-radius: 8px;
+                padding: 12px;
+            }
+        """)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        # Metric name
+        name_label = QLabel(metric["name"])
+        name_label.setStyleSheet("font-size: 13px; font-weight: 500; color: #374151;")
+        layout.addWidget(name_label)
+
+        # Values row
+        values_layout = QHBoxLayout()
+        values_layout.setSpacing(12)
+
+        v1_layout = QVBoxLayout()
+        v1_label = QLabel("Version 1:")
+        v1_label.setStyleSheet("font-size: 11px; color: #6B7280;")
+        v1_value = QLabel(metric["v1_value"])
+        v1_value.setStyleSheet("font-size: 14px; font-weight: 600; color: #111827;")
+        v1_layout.addWidget(v1_label)
+        v1_layout.addWidget(v1_value)
+
+        v2_layout = QVBoxLayout()
+        v2_label = QLabel("Version 2:")
+        v2_label.setStyleSheet("font-size: 11px; color: #6B7280;")
+        v2_value = QLabel(metric["v2_value"])
+        v2_value.setStyleSheet("font-size: 14px; font-weight: 600; color: #111827;")
+        v2_layout.addWidget(v2_label)
+        v2_layout.addWidget(v2_value)
+
+        values_layout.addLayout(v1_layout)
+        values_layout.addLayout(v2_layout)
+        values_layout.addStretch(1)
+        layout.addLayout(values_layout)
+
+        # Change row
+        change_layout = QHBoxLayout()
+        change_label = QLabel(f"Change: {metric['change']} ({metric['change_percent']})")
+        change_label.setStyleSheet("font-size: 12px; color: #DC2626; font-weight: 500;")
+        
+        # Trend icon (red upward arrow)
+        trend_icon = QLabel("↗")
+        trend_icon.setStyleSheet("font-size: 14px; color: #DC2626;")
+        
+        change_layout.addWidget(change_label)
+        change_layout.addWidget(trend_icon)
+        change_layout.addStretch(1)
+        layout.addLayout(change_layout)
+
+        return card
 

@@ -18,7 +18,7 @@ from planning_tool.rescheduler import load_delays_from_db, TaskStateIdentifier, 
 from datetime import datetime, time, timedelta
 import traceback
 from planning_tool.ui import (
-    DashboardPage, SchedulePage, UploadPage, SettingsPage,
+    DashboardPage, SchedulePage, UploadPage, SettingsPage, ComparisonPage,
     TopBar, Sidebar, DashboardTable, StatusCell,
     DelayInputDialog, Card, FileDropArea, Chip
 )
@@ -52,6 +52,9 @@ class MainWindow(QMainWindow):
 
         try:
             page_dashboard = DashboardPage()
+            # Connect dashboard page's pageRequested signal to switch_page
+            if isinstance(page_dashboard, DashboardPage):
+                page_dashboard.pageRequested.connect(self.switch_page)
         except NameError:
             page_dashboard = QLabel("Dashboard"); page_dashboard.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
@@ -72,9 +75,15 @@ class MainWindow(QMainWindow):
         except NameError:
             page_settings = QLabel("Settings"); page_settings.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+        try:
+            page_comparison = ComparisonPage()
+        except NameError:
+            page_comparison = QLabel("Comparison"); page_comparison.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
         self.page_index = {
             "dashboard": self.stack.addWidget(page_dashboard),
             "schedule":  self.stack.addWidget(page_schedule),
+            "comparison": self.stack.addWidget(page_comparison),
             "upload":    self.stack.addWidget(page_upload),
             "settings":  self.stack.addWidget(page_settings),
         }
@@ -847,6 +856,29 @@ class MainWindow(QMainWindow):
         idx = self.page_index.get(name)
         if idx is not None:
             self.stack.setCurrentIndex(idx)
+            # Update sidebar button states
+            self._update_sidebar_selection(name)
+    
+    def _update_sidebar_selection(self, page_name: str):
+        """Update sidebar button selection based on current page"""
+        # Uncheck all buttons first
+        self.sidebar.btn_dash.setChecked(False)
+        self.sidebar.btn_sched.setChecked(False)
+        self.sidebar.btn_comparison.setChecked(False)
+        self.sidebar.btn_upload.setChecked(False)
+        self.sidebar.btn_settings.setChecked(False)
+        
+        # Check the corresponding button
+        if page_name == "dashboard":
+            self.sidebar.btn_dash.setChecked(True)
+        elif page_name == "schedule":
+            self.sidebar.btn_sched.setChecked(True)
+        elif page_name == "comparison":
+            self.sidebar.btn_comparison.setChecked(True)
+        elif page_name == "upload":
+            self.sidebar.btn_upload.setChecked(True)
+        elif page_name == "settings":
+            self.sidebar.btn_settings.setChecked(True)
     
     def _populate_project_combo(self):
         """Load existing projects from DB into the combo box."""

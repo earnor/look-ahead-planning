@@ -25,12 +25,57 @@ class SidebarButton(QPushButton):
 
 class KpiCard(QFrame):
     """KPI card widget for displaying key performance indicators"""
-    def __init__(self, title: str, value: str, subtitle: str = "", trend: str = "", parent=None):
+    def __init__(self, title: str, value: str, subtitle: str = "", trend: str = "", icon: str = "", parent=None):
         super().__init__(parent)
         from PyQt6.QtWidgets import QSizePolicy
         self.setObjectName("KpiCard")
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        
+        # Set card styling
+        self.setStyleSheet("""
+            QFrame#KpiCard {
+                background: #FFFFFF;
+                border: 1px solid #E5E7EB;
+                border-radius: 12px;
+            }
+            QLabel#kpiTitle {
+                font-size: 13px;
+                font-weight: 500;
+                color: #6B7280;
+            }
+            QLabel#kpiValue {
+                font-size: 28px;
+                font-weight: 600;
+                color: #111827;
+            }
+            QLabel#kpiSubtitle {
+                font-size: 12px;
+                color: #6B7280;
+            }
+            QLabel#kpiTrend {
+                font-size: 12px;
+                font-weight: 500;
+                color: #6B7280;
+            }
+            QLabel#kpiIcon {
+                font-size: 24px;
+            }
+        """)
+
+        # Icon label (if provided)
+        icon_lbl = None
+        if icon:
+            icon_lbl = QLabel(icon)
+            icon_lbl.setObjectName("kpiIcon")
+            icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            icon_lbl.setFixedSize(40, 40)
+            icon_lbl.setStyleSheet("""
+                QLabel#kpiIcon {
+                    border-radius: 20px;
+                    font-size: 20px;
+                }
+            """)
 
         title_lbl = QLabel(title)
         title_lbl.setObjectName("kpiTitle")
@@ -45,7 +90,11 @@ class KpiCard(QFrame):
         trend_lbl.setObjectName("kpiTrend")
         trend_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
+        # Top row: icon (if exists) + title + trend
         top = QHBoxLayout()
+        if icon_lbl:
+            top.addWidget(icon_lbl)
+            top.addSpacing(12)
         top.addWidget(title_lbl)
         top.addStretch(1)
         top.addWidget(trend_lbl)

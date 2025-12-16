@@ -70,7 +70,7 @@ class PrefabScheduler:
         """
         self.N = N
         self.T = T
-        self.d = d.copy()
+        self.d = d
         self.E = E
         self.D = D
         self.L = L

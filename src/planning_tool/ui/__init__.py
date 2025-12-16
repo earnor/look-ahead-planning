@@ -35,7 +35,8 @@ from .pages import (
     DashboardPage,
     SchedulePage,
     UploadPage,
-    SettingsPage
+    SettingsPage,
+    ComparisonPage
 )
 
 __all__ = [
@@ -61,5 +62,6 @@ __all__ = [
     'SchedulePage',
     'UploadPage',
     'SettingsPage',
+    'ComparisonPage',
 ]
 
