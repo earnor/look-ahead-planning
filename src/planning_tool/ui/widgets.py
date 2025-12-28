@@ -25,24 +25,24 @@ class SidebarButton(QPushButton):
 
 class KpiCard(QFrame):
     """KPI card widget for displaying key performance indicators"""
-    def __init__(self, title: str, value: str, subtitle: str = "", trend: str = "", icon: str = "", parent=None):
+    def __init__(self, title: str, value: str, subtitle: str = "", trend: str = "", accent_color: str = "", parent=None):
         super().__init__(parent)
         from PyQt6.QtWidgets import QSizePolicy
         self.setObjectName("KpiCard")
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         
-        # Set card styling
+        # Simplified card styling with smaller border radius
         self.setStyleSheet("""
             QFrame#KpiCard {
                 background: #FFFFFF;
                 border: 1px solid #E5E7EB;
-                border-radius: 12px;
+                border-radius: 6px;
             }
             QLabel#kpiTitle {
                 font-size: 13px;
                 font-weight: 500;
-                color: #6B7280;
+                color: #374151;
             }
             QLabel#kpiValue {
                 font-size: 28px;
@@ -58,24 +58,19 @@ class KpiCard(QFrame):
                 font-weight: 500;
                 color: #6B7280;
             }
-            QLabel#kpiIcon {
-                font-size: 24px;
+            QLabel#kpiAccentBar {
+                background: transparent;
+                border: none;
             }
         """)
 
-        # Icon label (if provided)
-        icon_lbl = None
-        if icon:
-            icon_lbl = QLabel(icon)
-            icon_lbl.setObjectName("kpiIcon")
-            icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            icon_lbl.setFixedSize(40, 40)
-            icon_lbl.setStyleSheet("""
-                QLabel#kpiIcon {
-                    border-radius: 20px;
-                    font-size: 20px;
-                }
-            """)
+        # Create accent color bar (left border indicator)
+        accent_bar = None
+        if accent_color:
+            accent_bar = QLabel()
+            accent_bar.setObjectName("kpiAccentBar")
+            accent_bar.setFixedWidth(3)
+            accent_bar.setStyleSheet(f"background: {accent_color};")
 
         title_lbl = QLabel(title)
         title_lbl.setObjectName("kpiTitle")
@@ -90,22 +85,34 @@ class KpiCard(QFrame):
         trend_lbl.setObjectName("kpiTrend")
         trend_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
-        # Top row: icon (if exists) + title + trend
+        # Main horizontal layout: accent bar + content
+        main_layout = QHBoxLayout()
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        
+        # Add accent bar if provided
+        if accent_bar:
+            main_layout.addWidget(accent_bar)
+        
+        # Content area
+        content_layout = QVBoxLayout()
+        content_layout.setContentsMargins(16, 14, 16, 14)
+        content_layout.setSpacing(6)
+        
+        # Top row: title + trend (no icons)
         top = QHBoxLayout()
-        if icon_lbl:
-            top.addWidget(icon_lbl)
-            top.addSpacing(12)
+        top.setContentsMargins(0, 0, 0, 0)
         top.addWidget(title_lbl)
         top.addStretch(1)
         top.addWidget(trend_lbl)
-
-        lay = QVBoxLayout(self)
-        lay.addLayout(top)
-        lay.addWidget(value_lbl)
-        lay.addWidget(sub_lbl)
-        lay.addStretch(1)
-        lay.setContentsMargins(16, 14, 16, 14)
-        lay.setSpacing(6)
+        
+        content_layout.addLayout(top)
+        content_layout.addWidget(value_lbl)
+        content_layout.addWidget(sub_lbl)
+        content_layout.addStretch(1)
+        
+        main_layout.addLayout(content_layout)
+        self.setLayout(main_layout)
 
 
 class AspectRatioPixmapLabel(QLabel):

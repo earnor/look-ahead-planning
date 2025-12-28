@@ -256,9 +256,34 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No Project", "Please select or create a project before running Calculate.")
             return
 
-        # 1) get settings
-        settings = self._get_active_settings() or {}  # return a dict of settings
+        # Get calculate button reference
+        calculate_btn = None
+        original_btn_text = ""
+        if hasattr(self, "page_schedule") and hasattr(self.page_schedule, "btn_calculate"):
+            calculate_btn = self.page_schedule.btn_calculate
+            original_btn_text = calculate_btn.text()
+            calculate_btn.setEnabled(False)
+            calculate_btn.setText("Calculating...")
+            QApplication.processEvents()  # Update UI immediately
+
+        # Create and show simple calculating dialog
+        calc_dialog = QDialog(self)
+        calc_dialog.setWindowTitle("Calculating...")
+        calc_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        calc_dialog.setModal(True)
+        calc_dialog.setFixedSize(200, 100)
+        
+        layout = QVBoxLayout(calc_dialog)
+        label = QLabel("Calculating...")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(label)
+        
+        calc_dialog.show()
+        QApplication.processEvents()  # Ensure dialog is displayed
+
         try:
+            # 1) get settings
+            settings = self._get_active_settings() or {}  # return a dict of settings
             
             # parse dates (we use only date part for T)
             fmt = "%m/%d/%Y"
@@ -278,6 +303,7 @@ class MainWindow(QMainWindow):
             C_O = float(settings.get("onsite_inv_cost", "0") or 0)
 
             # 2) load raw schedule for current project
+            QApplication.processEvents()
             raw_table = self.mgr.raw_table_name(self.current_project_id)
             df = pd.read_sql_table(raw_table, self.engine)
 
@@ -352,9 +378,11 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass  # Use default 8.0 if calculation fails
             
+            QApplication.processEvents()
             T = estimate_time_horizon(start_date, end_date, hours_per_day=hours_per_day)
 
             # Check if we have pending delays (Phase 5.2 & 6: Re-optimization workflow)
+            QApplication.processEvents()
             delay_table = ScheduleDataManager.delay_updates_table_name(self.current_project_id)
             versions_table = ScheduleDataManager.optimization_versions_table_name(self.current_project_id)
             
@@ -366,13 +394,19 @@ class MainWindow(QMainWindow):
             is_reoptimization = pending_count > 0
             
             if is_reoptimization:
+                QApplication.processEvents()
                 pending_delay_map = {}
                 modules_with_delay = set()
                 # Phase 6: Re-optimization workflow
                 # 1. Load pending delays
+                QApplication.processEvents()
                 delays = load_delays_from_db(self.engine, self.current_project_id, version_id=None)
                 
                 if not delays:
+                    calc_dialog.close()
+                    if calculate_btn:
+                        calculate_btn.setEnabled(True)
+                        calculate_btn.setText(original_btn_text)
                     QMessageBox.warning(self, "No Delays", "No pending delays found.")
                     return
                 
@@ -383,6 +417,7 @@ class MainWindow(QMainWindow):
                     modules_with_delay.add(str(d.module_id))
                 
                 # Get the latest solution to use as base
+                QApplication.processEvents()
                 solution_table = self.mgr.solution_table_name(self.current_project_id)
                 try:
                     inspector = inspect(self.engine)
@@ -399,17 +434,33 @@ class MainWindow(QMainWindow):
                         else:
                             df_base_solution = pd.read_sql_table(solution_table, self.engine)
                     else:
+                        calc_dialog.close()
+                        if calculate_btn:
+                            calculate_btn.setEnabled(True)
+                            calculate_btn.setText(original_btn_text)
                         QMessageBox.warning(self, "No Base Solution", "No previous solution found. Please run initial optimization first.")
                         return
                     # Safety: ensure we actually got a DataFrame
                     if not isinstance(df_base_solution, pd.DataFrame):
+                        calc_dialog.close()
+                        if calculate_btn:
+                            calculate_btn.setEnabled(True)
+                            calculate_btn.setText(original_btn_text)
                         QMessageBox.critical(self, "Error", "Base solution is invalid (not a DataFrame).")
                         return
                 except Exception as e:
+                    calc_dialog.close()
+                    if calculate_btn:
+                        calculate_btn.setEnabled(True)
+                        calculate_btn.setText(original_btn_text)
                     QMessageBox.critical(self, "Error", f"Failed to load base solution: {str(e)}")
                     return
                 
                 if df_base_solution.empty:
+                    calc_dialog.close()
+                    if calculate_btn:
+                        calculate_btn.setEnabled(True)
+                        calculate_btn.setText(original_btn_text)
                     QMessageBox.warning(self, "No Base Solution", "No previous solution found. Please run initial optimization first.")
                     return
                 
@@ -446,10 +497,12 @@ class MainWindow(QMainWindow):
                         current_time = len(working_calendar_slots) - 1
                 
                 # 2. Identify task states (based on current_time)
+                QApplication.processEvents()
                 state_identifier = TaskStateIdentifier(df_base_solution, current_time, working_calendar_slots)
                 task_states = state_identifier.identify_all_states()
                 
                 # 3. Apply delays
+                QApplication.processEvents()
                 delay_applier = DelayApplier(df_base_solution, delays, task_states)
                 modified_solution_df = delay_applier.apply_delays()
                 
@@ -496,6 +549,7 @@ class MainWindow(QMainWindow):
                                         I_d[module_idx] = int(new_duration)
                 
                 # 5. Build fixed constraints (using current_time, not tau)
+                QApplication.processEvents()
                 fixed_builder = FixedConstraintsBuilder(
                     task_states, 
                     current_time, 
@@ -506,6 +560,7 @@ class MainWindow(QMainWindow):
                 fixed_constraints = fixed_builder.build_fixed_constraints()
                 
                 # 6. Create new version record (Phase 5.2)
+                QApplication.processEvents()
                 # Get latest version number
                 with self.engine.begin() as conn:
                     latest_version_query = f'SELECT MAX(version_number) FROM "{versions_table}"'
@@ -548,6 +603,7 @@ class MainWindow(QMainWindow):
                     conn.execute(update_delays_query, {"version_id": new_version_id})
                 
                 # 7. Build and solve model with fixed constraints
+                QApplication.processEvents()
                 scheduler = PrefabScheduler(
                     N=N,
                     T=T,
@@ -574,9 +630,11 @@ class MainWindow(QMainWindow):
                     reoptimize_from_time=current_time
                 )
                 
+                QApplication.processEvents()
                 status = scheduler.solve()
                 
                 # 8. Save results with version_id (Phase 6.3)
+                QApplication.processEvents()
                 scheduler.save_results_to_db(
                     self.engine,
                     self.current_project_id,
@@ -599,11 +657,18 @@ class MainWindow(QMainWindow):
                             "version_id": new_version_id
                         })
                 
+                # Close dialog and restore button state
+                calc_dialog.close()
+                if calculate_btn:
+                    calculate_btn.setEnabled(True)
+                    calculate_btn.setText(original_btn_text)
+                
                 QMessageBox.information(self, "Re-optimization Complete", 
                     f"Re-optimization completed successfully.\nVersion: {new_version_number}\nCurrent time: {current_time}")
             else:
                 # Initial optimization (existing logic)
                 # 4) build and solve model
+                QApplication.processEvents()
                 scheduler = PrefabScheduler(
                 N=N,
                 T=T,
@@ -620,9 +685,11 @@ class MainWindow(QMainWindow):
                 C_F=C_F,
                 C_O=C_O,
             )
-            status = scheduler.solve()
+                QApplication.processEvents()
+                status = scheduler.solve()
 
             # 5) save results to DB for later post-processing, preserving real Module IDs
+            QApplication.processEvents()
             scheduler.save_results_to_db(
                 self.engine,
                 self.current_project_id,
@@ -630,6 +697,7 @@ class MainWindow(QMainWindow):
             )
 
             # 6) load solution table and map indices to real-world schedule using working calendar
+            QApplication.processEvents()
             solution_table = self.mgr.solution_table_name(self.current_project_id)
             # If version_id column exists, get the latest version (max version_id) or all if version_id is NULL
             # Otherwise, just read all data
@@ -753,7 +821,14 @@ class MainWindow(QMainWindow):
                 for row in rows:
                     row.pop("_sort_key", None)
 
+                QApplication.processEvents()
                 self.page_schedule.populate_rows(rows)
+
+            # Close dialog and restore button state
+            calc_dialog.close()
+            if calculate_btn:
+                calculate_btn.setEnabled(True)
+                calculate_btn.setText(original_btn_text)
 
             QMessageBox.information(
                 self,
@@ -761,6 +836,12 @@ class MainWindow(QMainWindow):
                 f"Model solved with status {status}. Results have been saved and schedule table updated."
             )
         except Exception as e:
+            # Close dialog and restore button state on error
+            calc_dialog.close()
+            if calculate_btn:
+                calculate_btn.setEnabled(True)
+                calculate_btn.setText(original_btn_text)
+            
             tb = traceback.format_exc()
             print(tb)
             QMessageBox.critical(self, "Error in Calculate", f"{e}\n\n{tb}")
@@ -776,8 +857,44 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Empty Table", "Schedule table is empty. Please run Calculate first.")
             return
         
-        # Get file path from user
-        default_filename = f"schedule_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        # Get project name
+        project_name = self.topbar.project_combo.currentText() if self.current_project_id else "Unknown"
+        # Sanitize project name for filename (remove invalid characters)
+        safe_project_name = "".join(c for c in project_name if c.isalnum() or c in (' ', '-', '_')).strip()
+        safe_project_name = safe_project_name.replace(' ', '_') if safe_project_name else "project"
+        
+        # Get version number from database
+        version_number = None
+        if self.current_project_id:
+            try:
+                solution_table = self.mgr.solution_table_name(self.current_project_id)
+                versions_table = self.mgr.optimization_versions_table_name(self.current_project_id)
+                inspector = inspect(self.engine)
+                
+                if solution_table in inspector.get_table_names():
+                    columns = [col['name'] for col in inspector.get_columns(solution_table)]
+                    if 'version_id' in columns:
+                        # Get the latest version_id from solution table
+                        with self.engine.begin() as conn:
+                            max_version_id_query = f'SELECT MAX(version_id) FROM "{solution_table}" WHERE version_id IS NOT NULL'
+                            max_version_id = conn.execute(text(max_version_id_query)).scalar()
+                            
+                            if max_version_id and versions_table in inspector.get_table_names():
+                                # Get version_number from versions table
+                                version_query = f'SELECT version_number FROM "{versions_table}" WHERE version_id = :version_id'
+                                version_result = conn.execute(text(version_query), {"version_id": max_version_id}).scalar()
+                                if version_result is not None:
+                                    version_number = version_result
+            except Exception as e:
+                print(f"Warning: Could not retrieve version number: {e}")
+        
+        # Build filename
+        if version_number is not None:
+            default_filename = f"{safe_project_name}_v{version_number}.xlsx"
+        else:
+            # Fallback to project name only if version not available
+            default_filename = f"{safe_project_name}.xlsx"
+        
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "Export Schedule to Excel",

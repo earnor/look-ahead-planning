@@ -56,65 +56,32 @@ class DashboardPage(QWidget):
         top_row = QHBoxLayout()
         top_row.setSpacing(12)
         
-        # Planned vs Actual - Green checkmark icon
+        # Planned vs Actual - neutral styling
         card1 = KpiCard(
             "Planned vs Actual",
             "92%",
             "On schedule",
-            "↗ +3%",
-            icon="✓"  # Green checkmark
+            "+3%",
+            accent_color=""  # No accent color for neutral metric
         )
-        # Apply green styling to icon
-        icon1 = card1.findChild(QLabel, "kpiIcon")
-        if icon1:
-            icon1.setStyleSheet("""
-                QLabel {
-                    color: #10B981;
-                    background: #D1FAE5;
-                    border-radius: 20px;
-                    font-size: 20px;
-                }
-            """)
         
-        # Critical Tasks - Orange warning icon
+        # Critical Tasks - orange accent for warning
         card2 = KpiCard(
             "Critical Tasks",
             "12",
             "Requiring attention",
-            "↘ -2",
-            icon="⚠"  # Orange warning
+            "-2",
+            accent_color="#F59E0B"  # Orange accent
         )
-        # Apply orange styling to icon
-        icon2 = card2.findChild(QLabel, "kpiIcon")
-        if icon2:
-            icon2.setStyleSheet("""
-                QLabel {
-                    color: #F59E0B;
-                    background: #FEF3C7;
-                    border-radius: 20px;
-                    font-size: 20px;
-                }
-            """)
         
-        # Delay Days - Red clock icon
+        # Delay Days - red accent for critical
         card3 = KpiCard(
             "Delay Days",
             "23",
             "Total across project",
-            "↗ +5",
-            icon="🕐"  # Red clock
+            "+5",
+            accent_color="#DC2626"  # Red accent
         )
-        # Apply red styling to icon
-        icon3 = card3.findChild(QLabel, "kpiIcon")
-        if icon3:
-            icon3.setStyleSheet("""
-                QLabel {
-                    color: #EF4444;
-                    background: #FEE2E2;
-                    border-radius: 20px;
-                    font-size: 20px;
-                }
-            """)
         
         top_row.addWidget(card1)
         top_row.addWidget(card2)
@@ -125,65 +92,32 @@ class DashboardPage(QWidget):
         middle_row = QHBoxLayout()
         middle_row.setSpacing(12)
         
-        # Forecast Completion - Blue calendar icon
+        # Forecast Completion - neutral styling
         card4 = KpiCard(
             "Forecast Completion",
             "Dec 15, 2025",
             "3 days behind baseline",
             "",
-            icon="📅"  # Blue calendar
+            accent_color=""
         )
-        # Apply blue styling to icon
-        icon4 = card4.findChild(QLabel, "kpiIcon")
-        if icon4:
-            icon4.setStyleSheet("""
-                QLabel {
-                    color: #3B82F6;
-                    background: #DBEAFE;
-                    border-radius: 20px;
-                    font-size: 20px;
-                }
-            """)
         
-        # Factory Storage Modules - Purple cube icon
+        # Factory Storage Modules - neutral styling
         card5 = KpiCard(
             "Factory Storage Modules",
             "2",
             "Ready for transport",
             "",
-            icon="🏭"  # Purple cube
+            accent_color=""
         )
-        # Apply purple styling to icon
-        icon5 = card5.findChild(QLabel, "kpiIcon")
-        if icon5:
-            icon5.setStyleSheet("""
-                QLabel {
-                    color: #8B5CF6;
-                    background: #EDE9FE;
-                    border-radius: 20px;
-                    font-size: 20px;
-                }
-            """)
         
-        # Site Storage Modules - Purple cube icon
+        # Site Storage Modules - neutral styling
         card6 = KpiCard(
             "Site Storage Modules",
             "1",
             "Awaiting installation",
             "",
-            icon="📦"  # Purple cube
+            accent_color=""
         )
-        # Apply purple styling to icon
-        icon6 = card6.findChild(QLabel, "kpiIcon")
-        if icon6:
-            icon6.setStyleSheet("""
-                QLabel {
-                    color: #8B5CF6;
-                    background: #EDE9FE;
-                    border-radius: 20px;
-                    font-size: 20px;
-                }
-            """)
         
         middle_row.addWidget(card4)
         middle_row.addWidget(card5)
