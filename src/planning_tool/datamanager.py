@@ -131,7 +131,7 @@ class ScheduleDataManager:
             conn.exec_driver_sql(f"""
                 CREATE TABLE IF NOT EXISTS "{versions_table}" (
                     version_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    version_number INTEGER NOT NULL,
+                    version_number INTEGER NOT NULL UNIQUE,
                     base_version_id INTEGER,
                     reoptimize_from_time INTEGER,
                     delay_ids TEXT,
@@ -142,9 +142,9 @@ class ScheduleDataManager:
                 );
             """)
             
-            # Create index on version_number for faster queries
+            # Create index on version_number for faster queries (UNIQUE constraint already creates an index, but keep this for clarity)
             conn.exec_driver_sql(f"""
-                CREATE INDEX IF NOT EXISTS idx_version_number_{project_id} 
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_version_number_{project_id} 
                 ON "{versions_table}"(version_number);
             """)
 

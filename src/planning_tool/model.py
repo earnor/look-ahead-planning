@@ -561,40 +561,37 @@ class PrefabScheduler:
             
             results_df = pd.DataFrame(results_data)
             
-            # Ensure solution table has version_id column
+            # Ensure solution table has version_id column and delete old data for this version if table exists
             with engine.begin() as conn:
                 from sqlalchemy import inspect
                 inspector = inspect(engine)
                 if solution_table in inspector.get_table_names():
-                    # Check if version_id column exists
+                    # Table exists: check if version_id column exists and add if needed
                     columns = [col['name'] for col in inspector.get_columns(solution_table)]
                     if 'version_id' not in columns:
                         conn.exec_driver_sql(f'ALTER TABLE "{solution_table}" ADD COLUMN version_id INTEGER')
+                    
+                    # Delete old data for this version before appending new data
+                    if version_id is not None:
+                        # Delete old data for this specific version
+                        delete_query = text(f'DELETE FROM "{solution_table}" WHERE version_id = :version_id')
+                        conn.execute(delete_query, {"version_id": version_id})
+                    else:
+                        # For backward compatibility: delete NULL version_id data if version_id is None
+                        # (This should not happen in new architecture, but kept for safety)
+                        delete_query = text(f'DELETE FROM "{solution_table}" WHERE version_id IS NULL')
+                        conn.execute(delete_query)
+                # If table doesn't exist, it will be created by to_sql with append mode
             
-            # Save solution to dedicated solution table (separate from input data)
-            # This is the main solution table that records optimization results
-            # If version_id is None (initial calculation), replace old data
-            # If version_id is set (re-optimization), append for versioning
-            if version_id is None:
-                # Initial calculation: replace old data
-                results_df.to_sql(
-                    solution_table, 
-                    engine, 
-                    if_exists='replace', 
-                    index=False,
-                    method='multi',
-                    chunksize=1000
-                )
-            else:
-                # Re-optimization: append for versioning
-                results_df.to_sql(
-                    solution_table, 
-                    engine, 
-                    if_exists='append', 
-                    index=False,
-                    method='multi',
-                    chunksize=1000
-                )
+            # Append new data (table will be created automatically if it doesn't exist)
+            results_df.to_sql(
+                solution_table, 
+                engine, 
+                if_exists='append', 
+                index=False,
+                method='multi',
+                chunksize=1000
+            )
             
             # Also create a summary table with project-level results
             summary_data = [{

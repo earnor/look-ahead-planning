@@ -96,7 +96,7 @@ class MainWindow(QMainWindow):
             self.page_schedule = page_schedule
             page_schedule.btn_calculate.clicked.connect(self.on_calculate_clicked)
             page_schedule.btn_export.clicked.connect(self.on_export_schedule)
-            # Store reference to MainWindow in SchedulePage for delay saving
+            # Store reference to MainWindow in SchedulePage for delay saving and version loading
             page_schedule.main_window = self
 
         central = QWidget()
@@ -690,13 +690,55 @@ class MainWindow(QMainWindow):
                 QApplication.processEvents()
                 status = scheduler.solve()
 
-            # 5) save results to DB for later post-processing, preserving real Module IDs
-            QApplication.processEvents()
-            scheduler.save_results_to_db(
-                self.engine,
-                self.current_project_id,
-                module_id_mapping=index_to_id
-            )
+                # 5) Create or get version 0 record for initial optimization (before saving results)
+                QApplication.processEvents()
+                versions_table = self.mgr.optimization_versions_table_name(self.current_project_id)
+                version_0_id = None
+                
+                with self.engine.begin() as conn:
+                    # Get or create version 0 record (use INSERT OR IGNORE to prevent duplicates)
+                    check_version_query = text(f'SELECT version_id FROM "{versions_table}" WHERE version_number = 0')
+                    version_0_id = conn.execute(check_version_query).scalar()
+                    
+                    if version_0_id is None:
+                        # Version 0 doesn't exist, create it (INSERT OR IGNORE ensures no duplicates even in concurrent scenarios)
+                        insert_version_query = text(f'''
+                            INSERT OR IGNORE INTO "{versions_table}" 
+                            (version_number, base_version_id, reoptimize_from_time)
+                            VALUES (0, NULL, :reoptimize_from_time)
+                        ''')
+                        conn.execute(insert_version_query, {
+                            "reoptimize_from_time": datetime.now()
+                        })
+                        
+                        # Get the version_id for version 0 (after insert or if it was created concurrently)
+                        get_version_id_query = text(f'SELECT version_id FROM "{versions_table}" WHERE version_number = 0')
+                        version_0_id = conn.execute(get_version_id_query).scalar()
+
+                # 5.5) Save results to DB with version_0_id (preserving real Module IDs)
+                QApplication.processEvents()
+                scheduler.save_results_to_db(
+                    self.engine,
+                    self.current_project_id,
+                    module_id_mapping=index_to_id,
+                    version_id=version_0_id
+                )
+
+                # 5.6) Update version record with optimization results
+                QApplication.processEvents()
+                solution = scheduler.get_solution_dict()
+                if solution and version_0_id:
+                    with self.engine.begin() as conn:
+                        update_version_query = text(f'''
+                            UPDATE "{versions_table}" 
+                            SET objective_value = :objective_value, status = :status
+                            WHERE version_id = :version_id
+                        ''')
+                        conn.execute(update_version_query, {
+                            "objective_value": solution.get('objective'),
+                            "status": solution.get('status'),
+                            "version_id": version_0_id
+                        })
 
             # 6) load solution table and map indices to real-world schedule using working calendar
             QApplication.processEvents()
@@ -825,6 +867,11 @@ class MainWindow(QMainWindow):
 
                 QApplication.processEvents()
                 self.page_schedule.populate_rows(rows)
+                
+                # Refresh version list in schedule page to include newly created version (without auto-loading)
+                # Data is already loaded above, we just need to refresh the combobox list
+                if hasattr(self, "page_schedule") and isinstance(self.page_schedule, SchedulePage):
+                    self.page_schedule.load_version_list(self.engine, self.current_project_id, auto_load=False)
 
             # Close dialog and restore button state
             calc_dialog.close()
@@ -847,6 +894,193 @@ class MainWindow(QMainWindow):
             tb = traceback.format_exc()
             print(tb)
             QMessageBox.critical(self, "Error in Calculate", f"{e}\n\n{tb}")
+
+    def load_schedule_by_version(self, project_id: int, version_id: int):
+        """
+        Load schedule data for a specific version and populate the schedule table.
+        Called from SchedulePage when user selects a version from the combobox.
+        """
+        print(f"[DEBUG MainWindow] load_schedule_by_version called: project_id={project_id}, version_id={version_id}")
+        
+        if not hasattr(self, "page_schedule") or not isinstance(self.page_schedule, SchedulePage):
+            print(f"[DEBUG MainWindow] page_schedule not available")
+            return
+        
+        try:
+            solution_table = self.mgr.solution_table_name(project_id)
+            print(f"[DEBUG MainWindow] solution_table: {solution_table}")
+            inspector = inspect(self.engine)
+            
+            table_names = inspector.get_table_names()
+            print(f"[DEBUG MainWindow] Available tables: {table_names}")
+            
+            if solution_table not in table_names:
+                print(f"[DEBUG MainWindow] Solution table {solution_table} does not exist - no optimization results yet")
+                # Clear the schedule table to show empty state
+                if hasattr(self, "page_schedule") and isinstance(self.page_schedule, SchedulePage):
+                    self.page_schedule.populate_rows([])
+                return
+            
+            # Check what version_ids exist in the solution table
+            check_versions_query = f'SELECT DISTINCT version_id, COUNT(*) as count FROM "{solution_table}" GROUP BY version_id'
+            versions_in_table = pd.read_sql(text(check_versions_query), self.engine)
+            print(f"[DEBUG MainWindow] Version IDs in solution table:\n{versions_in_table}")
+            
+            # Load data for the specific version
+            query = f'SELECT * FROM "{solution_table}" WHERE version_id = :version_id ORDER BY Installation_Start ASC'
+            print(f"[DEBUG MainWindow] Executing query: {query} with version_id={version_id}")
+            df_sol = pd.read_sql(text(query), self.engine, params={"version_id": version_id})
+            print(f"[DEBUG MainWindow] Loaded {len(df_sol)} rows for version_id={version_id}")
+            
+            # If no data found, check if this version corresponds to version_number = 0
+            # and if so, try loading NULL version_id data (legacy data)
+            if df_sol.empty:
+                print(f"[DEBUG MainWindow] No data found for version_id={version_id}, checking if this is version 0")
+                versions_table = self.mgr.optimization_versions_table_name(project_id)
+                if versions_table in table_names:
+                    # Check if the requested version_id corresponds to version_number = 0
+                    check_version_0_query = f'SELECT version_number FROM "{versions_table}" WHERE version_id = :version_id'
+                    version_number_result = pd.read_sql(text(check_version_0_query), self.engine, params={"version_id": version_id})
+                    if not version_number_result.empty:
+                        version_number = version_number_result.iloc[0]['version_number']
+                        if version_number == 0:
+                            print(f"[DEBUG MainWindow] This is version 0, trying to load NULL version_id data")
+                            # Try loading data where version_id IS NULL (legacy data)
+                            legacy_query = f'SELECT * FROM "{solution_table}" WHERE version_id IS NULL ORDER BY Installation_Start ASC'
+                            df_sol = pd.read_sql(text(legacy_query), self.engine)
+                            print(f"[DEBUG MainWindow] Loaded {len(df_sol)} rows from legacy NULL version_id data")
+                        else:
+                            print(f"[DEBUG MainWindow] version_id={version_id} corresponds to version_number={version_number}, but no data found")
+            
+            if df_sol.empty:
+                print(f"[DEBUG MainWindow] No data found for version_id={version_id} (including legacy data)")
+                # Clear the schedule table to show empty state
+                if hasattr(self, "page_schedule") and isinstance(self.page_schedule, SchedulePage):
+                    self.page_schedule.populate_rows([])
+                return
+            
+            # Get settings for working calendar
+            settings = self._get_active_settings() or {}
+            if not settings:
+                return
+            
+            # Parse start date
+            fmt = "%m/%d/%Y"
+            start_str = settings.get("start_datetime", "")
+            if not start_str:
+                return
+            start_date = datetime.strptime(start_str, fmt).date()
+            
+            # Determine max index needed
+            idx_cols = ["Installation_Start", "Installation_Finish", "Arrival_Time", "Production_Start", "Transport_Start"]
+            max_idx = 0
+            for col in idx_cols:
+                if col in df_sol.columns:
+                    max_idx = max(max_idx, int(df_sol[col].max()))
+            if max_idx <= 0:
+                max_idx = 1000  # Default fallback
+            
+            slots = self._build_working_calendar_slots(settings, start_date, max_idx)
+            
+            def idx_to_dt(idx: int) -> str:
+                if idx is None or idx <= 0 or idx >= len(slots):
+                    return ""
+                return slots[idx].strftime("%Y-%m-%d %H:%M")
+            
+            def idx_to_dt_obj(idx: int) -> datetime | None:
+                """Convert index to datetime object for comparison"""
+                if idx is None or idx <= 0 or idx >= len(slots):
+                    return None
+                return slots[idx]
+            
+            # Get current simulation time
+            idx_settings = self.page_index.get("settings")
+            use_system_time = True
+            if idx_settings is not None:
+                settings_widget = self.stack.widget(idx_settings)
+                if isinstance(settings_widget, SettingsPage):
+                    use_system_time = settings_widget.use_system_time.isChecked()
+            
+            current_time = datetime.now() if use_system_time else datetime.now()
+            
+            # Load delays for this version (if any)
+            delay_table = ScheduleDataManager.delay_updates_table_name(project_id)
+            pending_delay_map = {}
+            modules_with_delay = set()
+            try:
+                if delay_table in inspector.get_table_names():
+                    delays_query = f'SELECT module_id, phase, delay_hours FROM "{delay_table}" WHERE version_id = :version_id'
+                    delays_df = pd.read_sql(text(delays_query), self.engine, params={"version_id": version_id})
+                    for _, delay_row in delays_df.iterrows():
+                        module_id = str(delay_row['module_id'])
+                        phase = str(delay_row['phase']).upper()
+                        delay_hours = float(delay_row['delay_hours'] or 0)
+                        if delay_hours > 0:
+                            pending_delay_map[(module_id, phase)] = delay_hours
+                            modules_with_delay.add(module_id)
+            except Exception as e:
+                print(f"Warning: Could not load delays for version {version_id}: {e}")
+            
+            rows = []
+            for _, row in df_sol.iterrows():
+                mod_id = row.get("Module_ID", "")
+                fab_start_idx = int(row["Production_Start"]) if not pd.isna(row.get("Production_Start")) else None
+                fab_dur = int(row.get("Production_Duration", 0))
+                trans_start_idx = int(row["Transport_Start"]) if not pd.isna(row.get("Transport_Start")) else None
+                trans_dur = int(row.get("Transport_Duration", 0))
+                inst_start_idx = int(row["Installation_Start"]) if not pd.isna(row.get("Installation_Start")) else None
+                inst_dur = int(row.get("Installation_Duration", 0))
+                install_finish_idx = int(row["Installation_Finish"]) if not pd.isna(row.get("Installation_Finish")) else None
+                
+                # Calculate status based on current time
+                install_start_dt = idx_to_dt_obj(inst_start_idx) if inst_start_idx else None
+                install_finish_dt = idx_to_dt_obj(install_finish_idx) if install_finish_idx else None
+                fab_start_dt = idx_to_dt_obj(fab_start_idx) if fab_start_idx else None
+                
+                # Get delay values per phase for this version
+                fab_delay = pending_delay_map.get((str(mod_id), "FABRICATION"), 0)
+                trans_delay = pending_delay_map.get((str(mod_id), "TRANSPORT"), 0)
+                inst_delay = pending_delay_map.get((str(mod_id), "INSTALLATION"), 0)
+                has_delay = (fab_delay > 0) or (trans_delay > 0) or (inst_delay > 0)
+                
+                status = "Upcoming"  # default
+                if has_delay:
+                    status = "Delayed"
+                elif install_finish_dt and current_time >= install_finish_dt:
+                    status = "Completed"
+                elif fab_start_dt and install_finish_dt:
+                    if current_time >= fab_start_dt and current_time < install_finish_dt:
+                        status = "In Progress"
+                
+                rows.append({
+                    "Module ID": mod_id,
+                    "Fabrication Start Time": idx_to_dt(fab_start_idx),
+                    "Fabrication Duration (h)": fab_dur,
+                    "Transport Start Time": idx_to_dt(trans_start_idx),
+                    "Transport Duration (h)": trans_dur,
+                    "Installation Start Time": idx_to_dt(inst_start_idx),
+                    "Installation Duration (h)": inst_dur,
+                    "Status": status,
+                    "Fab. Delay (h)": fab_delay,
+                    "Trans. Delay (h)": trans_delay,
+                    "Inst. Delay (h)": inst_delay,
+                    "_has_delay": has_delay or (str(mod_id) in modules_with_delay),
+                    "_sort_key": install_start_dt,
+                })
+            
+            # Sort rows by Installation Start Time
+            rows.sort(key=lambda x: (x["_sort_key"] is None, x["_sort_key"] or datetime.max))
+            
+            # Remove the temporary sort key
+            for row in rows:
+                row.pop("_sort_key", None)
+            
+            self.page_schedule.populate_rows(rows)
+            
+        except Exception as e:
+            print(f"Error loading schedule by version: {e}")
+            import traceback
+            traceback.print_exc()
 
     def on_export_schedule(self):
         """Export schedule table to Excel file"""
@@ -981,6 +1215,10 @@ class MainWindow(QMainWindow):
             if name == "comparison" and hasattr(self, "page_comparison") and self.page_comparison:
                 if self.current_project_id is not None:
                     self.page_comparison.load_version_list(self.engine, self.current_project_id)
+            # Load version list for schedule page when it's shown
+            elif name == "schedule" and hasattr(self, "page_schedule") and self.page_schedule:
+                if self.current_project_id is not None:
+                    self.page_schedule.load_version_list(self.engine, self.current_project_id)
     
     def _update_sidebar_selection(self, page_name: str):
         """Update sidebar button selection based on current page"""
@@ -1035,6 +1273,11 @@ class MainWindow(QMainWindow):
                 current_idx = self.stack.currentIndex()
                 if current_idx == self.page_index.get("comparison"):
                     self.page_comparison.load_version_list(self.engine, self.current_project_id)
+            # Refresh schedule page version list if currently viewing it
+            if hasattr(self, "page_schedule") and self.page_schedule:
+                current_idx = self.stack.currentIndex()
+                if current_idx == self.page_index.get("schedule"):
+                    self.page_schedule.load_version_list(self.engine, self.current_project_id)
         else:
             self.current_project_id = None
             self.topbar.delete_project_btn.hide()  # Hide delete button when no project selected
@@ -1043,6 +1286,11 @@ class MainWindow(QMainWindow):
                 current_idx = self.stack.currentIndex()
                 if current_idx == self.page_index.get("comparison"):
                     self.page_comparison.load_version_list(self.engine, None)
+            # Clear schedule page if currently viewing it
+            if hasattr(self, "page_schedule") and self.page_schedule:
+                current_idx = self.stack.currentIndex()
+                if current_idx == self.page_index.get("schedule"):
+                    self.page_schedule.load_version_list(self.engine, None)
 
     def _on_project_created(self, project_id: int, project_name: str):
         """Handler for when a new project is created - updates the project combo"""

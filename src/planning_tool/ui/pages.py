@@ -238,6 +238,10 @@ class SchedulePage(QWidget):
         self.setWindowTitle("Schedule")
         self.resize(1240, 760)
         self._all_rows_data = []  # Store all rows for filtering
+        self.engine = None  # Database engine (set by MainWindow)
+        self.project_id = None  # Current project ID (set by MainWindow)
+        self.version_id_map = {}  # Map combobox index to version_id
+        self.main_window = None  # Reference to MainWindow (set by MainWindow)
         self._apply_style()
         self._build_ui()
 
@@ -388,6 +392,34 @@ class SchedulePage(QWidget):
         h = QHBoxLayout(bar)
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(10)
+        
+        # Version selection combobox
+        version_label = QLabel("Version:")
+        version_label.setStyleSheet("font-size: 13px; font-weight: 500; color: #374151;")
+        h.addWidget(version_label)
+        
+        self.version_combo = QComboBox()
+        self.version_combo.setMinimumWidth(150)
+        self.version_combo.setStyleSheet("""
+            QComboBox {
+                border: 1px solid #E5E7EB;
+                border-radius: 8px;
+                padding: 8px 12px;
+                font-size: 13px;
+                background: #FFFFFF;
+                color: #374151;
+            }
+            QComboBox:hover {
+                border-color: #D1D5DB;
+            }
+            QComboBox::drop-down {
+                border: none;
+                padding-right: 8px;
+            }
+        """)
+        self.version_combo.currentIndexChanged.connect(self._on_version_changed)
+        h.addWidget(self.version_combo)
+        
         h.addStretch(1)
         
         # Action buttons with icons (using emoji as placeholders)
@@ -571,6 +603,150 @@ class SchedulePage(QWidget):
                 status_widget = table.cellWidget(r, 7)
                 if status_widget:
                     status_widget.setStyleSheet(status_widget.styleSheet() + "background: #FEF3C7; border-radius: 4px;")
+
+    def load_version_list(self, engine, project_id: int, auto_load: bool = True):
+        """
+        Load version list from database and populate combobox.
+        This method should be called from MainWindow when SchedulePage is shown or project changes.
+        
+        Args:
+            engine: Database engine
+            project_id: Project ID
+            auto_load: If True, automatically load the latest version after populating the list
+        """
+        print(f"[DEBUG SchedulePage] load_version_list called: project_id={project_id}, auto_load={auto_load}")
+        from sqlalchemy import inspect, text
+        from planning_tool.datamanager import ScheduleDataManager
+        
+        self.engine = engine
+        self.project_id = project_id
+        
+        print(f"[DEBUG SchedulePage] engine: {engine}, project_id: {project_id}")
+        
+        if project_id is None:
+            print(f"[DEBUG SchedulePage] project_id is None, clearing combobox")
+            self.version_combo.clear()
+            return
+        
+        mgr = ScheduleDataManager(engine)
+        versions_table = mgr.optimization_versions_table_name(project_id)
+        print(f"[DEBUG SchedulePage] versions_table: {versions_table}")
+        
+        inspector = inspect(engine)
+        table_names = inspector.get_table_names()
+        print(f"[DEBUG SchedulePage] Available tables: {table_names}")
+        
+        if versions_table not in table_names:
+            print(f"[DEBUG SchedulePage] versions_table {versions_table} not found in database")
+            self.version_combo.clear()
+            return
+        
+        try:
+            # Disconnect signal temporarily to avoid triggering load during population
+            self.version_combo.blockSignals(True)
+            
+            # Load versions from database
+            query = f'SELECT version_id, version_number FROM "{versions_table}" ORDER BY version_id DESC'
+            print(f"[DEBUG SchedulePage] Executing query: {query}")
+            versions_df = pd.read_sql(text(query), engine)
+            print(f"[DEBUG SchedulePage] Loaded versions:\n{versions_df}")
+            
+            # Check if version 0 exists
+            has_version_0 = False
+            version_0_id = None
+            if not versions_df.empty:
+                version_0_rows = versions_df[versions_df['version_number'] == 0]
+                if not version_0_rows.empty:
+                    has_version_0 = True
+                    version_0_id = int(version_0_rows.iloc[0]['version_id'])
+                    print(f"[DEBUG SchedulePage] Found version 0 with version_id={version_0_id}")
+            
+            # Check if there are NULL version_id records in solution table
+            solution_table = mgr.solution_table_name(project_id)
+            has_null_data = False
+            if solution_table in table_names:
+                null_count_query = f'SELECT COUNT(*) as count FROM "{solution_table}" WHERE version_id IS NULL'
+                null_count_df = pd.read_sql(text(null_count_query), engine)
+                null_count = null_count_df.iloc[0]['count'] if not null_count_df.empty else 0
+                has_null_data = (null_count > 0)
+                print(f"[DEBUG SchedulePage] NULL version_id records in solution table: {null_count}")
+            
+            # Store current selection before clearing
+            current_selected_version_id = None
+            if self.version_combo.currentIndex() >= 0:
+                current_selected_version_id = self.version_id_map.get(self.version_combo.currentIndex())
+            
+            # Clear and populate combobox
+            self.version_combo.clear()
+            self.version_id_map = {}
+            
+            if not versions_df.empty:
+                for _, row in versions_df.iterrows():
+                    version_id = int(row['version_id'])
+                    version_number = row['version_number']
+                    display_text = f"Version {version_number}"
+                    
+                    index = self.version_combo.count()
+                    self.version_combo.addItem(display_text)
+                    self.version_id_map[index] = version_id
+                
+                # Try to restore previous selection, otherwise select latest version
+                if current_selected_version_id is not None:
+                    # Find the index of the previously selected version
+                    found_index = None
+                    for idx, vid in self.version_id_map.items():
+                        if vid == current_selected_version_id:
+                            found_index = idx
+                            break
+                    if found_index is not None:
+                        self.version_combo.setCurrentIndex(found_index)
+                    elif len(versions_df) >= 1:
+                        self.version_combo.setCurrentIndex(0)
+                elif len(versions_df) >= 1:
+                    self.version_combo.setCurrentIndex(0)
+            
+            self.version_combo.blockSignals(False)
+            
+            # Trigger load for the selected version after signals are unblocked (if auto_load is True)
+            if auto_load and not versions_df.empty and len(versions_df) >= 1:
+                self._on_version_changed()
+            
+        except Exception as e:
+            print(f"Error loading version list: {e}")
+            self.version_combo.clear()
+            self.version_combo.blockSignals(False)
+    
+    def _on_version_changed(self):
+        """Handle version selection change and load schedule data for selected version"""
+        print(f"[DEBUG SchedulePage] _on_version_changed called")
+        print(f"[DEBUG SchedulePage] engine: {self.engine}, project_id: {self.project_id}")
+        
+        if self.engine is None or self.project_id is None:
+            print(f"[DEBUG SchedulePage] Engine or project_id is None, returning")
+            return
+        
+        # Get selected version_id
+        current_index = self.version_combo.currentIndex()
+        print(f"[DEBUG SchedulePage] current_index: {current_index}")
+        print(f"[DEBUG SchedulePage] version_id_map: {self.version_id_map}")
+        
+        if current_index < 0:
+            print(f"[DEBUG SchedulePage] Invalid current_index, returning")
+            return
+        
+        version_id = self.version_id_map.get(current_index)
+        print(f"[DEBUG SchedulePage] version_id: {version_id}")
+        
+        if version_id is None:
+            print(f"[DEBUG SchedulePage] version_id is None, returning")
+            return
+        
+        # Load schedule data for this version
+        if self.main_window:
+            print(f"[DEBUG SchedulePage] Calling main_window.load_schedule_by_version({self.project_id}, {version_id})")
+            self.main_window.load_schedule_by_version(self.project_id, version_id)
+        else:
+            print(f"[DEBUG SchedulePage] main_window is None, cannot load schedule")
 
     def _build_info_section(self) -> QWidget:
         """Build the bottom info section with rules"""
