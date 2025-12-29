@@ -77,8 +77,10 @@ class MainWindow(QMainWindow):
 
         try:
             page_comparison = ComparisonPage()
+            self.page_comparison = page_comparison
         except NameError:
             page_comparison = QLabel("Comparison"); page_comparison.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.page_comparison = None
 
         self.page_index = {
             "dashboard": self.stack.addWidget(page_dashboard),
@@ -975,6 +977,10 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentIndex(idx)
             # Update sidebar button states
             self._update_sidebar_selection(name)
+            # Load data for comparison page when it's shown
+            if name == "comparison" and hasattr(self, "page_comparison") and self.page_comparison:
+                if self.current_project_id is not None:
+                    self.page_comparison.load_version_list(self.engine, self.current_project_id)
     
     def _update_sidebar_selection(self, page_name: str):
         """Update sidebar button selection based on current page"""
@@ -1024,10 +1030,19 @@ class MainWindow(QMainWindow):
         if project_name and project_name in self.project_lookup:
             self.current_project_id = self.project_lookup[project_name]
             self.topbar.delete_project_btn.show()  # Show delete button when project is selected
-            # Future: refresh views based on selected project tables
+            # Refresh comparison page version list if currently viewing it
+            if hasattr(self, "page_comparison") and self.page_comparison:
+                current_idx = self.stack.currentIndex()
+                if current_idx == self.page_index.get("comparison"):
+                    self.page_comparison.load_version_list(self.engine, self.current_project_id)
         else:
             self.current_project_id = None
             self.topbar.delete_project_btn.hide()  # Hide delete button when no project selected
+            # Clear comparison page if currently viewing it
+            if hasattr(self, "page_comparison") and self.page_comparison:
+                current_idx = self.stack.currentIndex()
+                if current_idx == self.page_index.get("comparison"):
+                    self.page_comparison.load_version_list(self.engine, None)
 
     def _on_project_created(self, project_id: int, project_name: str):
         """Handler for when a new project is created - updates the project combo"""

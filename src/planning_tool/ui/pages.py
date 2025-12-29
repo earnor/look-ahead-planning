@@ -24,6 +24,12 @@ from planning_tool.datamanager import ScheduleDataManager
 from planning_tool.ui.widgets import KpiCard, Card, FileDropArea, Chip
 from planning_tool.ui.components import DashboardTable, StatusCell
 from planning_tool.ui.dialogs import DelayInputDialog
+import pandas as pd
+import matplotlib
+matplotlib.use('Qt5Agg')  # Use Qt5Agg backend for PyQt6
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+import numpy as np
 
 
 class DashboardPage(QWidget):
@@ -1163,7 +1169,6 @@ class ComparisonPage(QWidget):
         upper_version_label = QLabel("Upper Version:")
         upper_version_label.setStyleSheet("font-size: 13px; font-weight: 500; color: #374151;")
         self.upper_version_combo = QComboBox()
-        self.upper_version_combo.addItems(["Version 1 (Baseline)", "Version 2 (Current)"])
         self.upper_version_combo.setStyleSheet("""
             QComboBox {
                 border: 1px solid #D1D5DB;
@@ -1174,6 +1179,7 @@ class ComparisonPage(QWidget):
                 min-width: 200px;
             }
         """)
+        # Don't auto-trigger on combobox change, user will click Compare button
         upper_version_layout.addWidget(upper_version_label)
         upper_version_layout.addWidget(self.upper_version_combo)
 
@@ -1181,8 +1187,6 @@ class ComparisonPage(QWidget):
         lower_version_label = QLabel("Lower Version:")
         lower_version_label.setStyleSheet("font-size: 13px; font-weight: 500; color: #374151;")
         self.lower_version_combo = QComboBox()
-        self.lower_version_combo.addItems(["Version 1 (Baseline)", "Version 2 (Current)"])
-        self.lower_version_combo.setCurrentIndex(1)
         self.lower_version_combo.setStyleSheet("""
             QComboBox {
                 border: 1px solid #D1D5DB;
@@ -1193,12 +1197,47 @@ class ComparisonPage(QWidget):
                 min-width: 200px;
             }
         """)
+        # Don't auto-trigger on combobox change, user will click Compare button
         lower_version_layout.addWidget(lower_version_label)
         lower_version_layout.addWidget(self.lower_version_combo)
+        
+        # Store engine and project_id for data loading
+        self.engine = None
+        self.project_id = None
+        # Store version_id mapping (combo index -> version_id)
+        self.version_id_map = {}
 
         version_layout.addLayout(upper_version_layout)
         version_layout.addStretch(1)
         version_layout.addLayout(lower_version_layout)
+        
+        # Compare button
+        self.compare_btn = QPushButton("Compare")
+        self.compare_btn.setStyleSheet("""
+            QPushButton {
+                background: #3B82F6;
+                color: #FFFFFF;
+                border: none;
+                border-radius: 6px;
+                padding: 8px 24px;
+                font-size: 13px;
+                font-weight: 500;
+                min-width: 100px;
+            }
+            QPushButton:hover {
+                background: #2563EB;
+            }
+            QPushButton:pressed {
+                background: #1D4ED8;
+            }
+            QPushButton:disabled {
+                background: #D1D5DB;
+                color: #9CA3AF;
+            }
+        """)
+        self.compare_btn.clicked.connect(self._on_version_changed)
+        version_layout.addWidget(self.compare_btn)
+        
         layout.addLayout(version_layout)
 
         # Legend
@@ -1206,9 +1245,11 @@ class ComparisonPage(QWidget):
         legend_layout.setSpacing(16)
         
         legend_items = [
-            ("Fabrication", "#3B82F6"),  # Blue
-            ("Transport", "#F59E0B"),    # Orange
-            ("Installation", "#10B981")  # Green
+            ("Production", "#3B82F6"),        # Blue
+            ("Factory Storage", "#9CA3AF"),   # Gray
+            ("Transport", "#F59E0B"),         # Orange
+            ("Site Storage", "#E5E7EB"),      # Light Gray
+            ("Installation", "#10B981")       # Green
         ]
         
         for label, color in legend_items:
@@ -1229,32 +1270,49 @@ class ComparisonPage(QWidget):
         legend_layout.addStretch(1)
         layout.addLayout(legend_layout)
 
-        # Gantt chart placeholder (blank area)
+        # Gantt charts container (two separate charts)
         gantt_container = QFrame()
         gantt_container.setObjectName("GanttContainer")
         gantt_container.setStyleSheet("""
             QFrame#GanttContainer {
-                background: #F9FAFB;
-                border: 2px dashed #D1D5DB;
+                background: #FFFFFF;
+                border: 1px solid #E5E7EB;
                 border-radius: 8px;
-                min-height: 500px;
             }
         """)
         gantt_layout = QVBoxLayout(gantt_container)
-        gantt_layout.setContentsMargins(20, 20, 20, 20)
+        gantt_layout.setContentsMargins(16, 16, 16, 16)
+        gantt_layout.setSpacing(16)
         
-        # Placeholder text
-        placeholder_text = QLabel("Gantt Chart Area\n(To be implemented)")
-        placeholder_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        placeholder_text.setStyleSheet("""
-            QLabel {
-                font-size: 16px;
-                color: #9CA3AF;
-                background: transparent;
-            }
-        """)
-        gantt_layout.addWidget(placeholder_text)
-        gantt_layout.addStretch(1)
+        # Upper Gantt chart
+        upper_gantt_frame = QFrame()
+        upper_gantt_frame.setFrameShape(QFrame.Shape.Box)
+        upper_gantt_frame.setStyleSheet("border: 1px solid #E5E7EB; border-radius: 4px;")
+        upper_gantt_layout = QVBoxLayout(upper_gantt_frame)
+        upper_gantt_layout.setContentsMargins(8, 8, 8, 8)
+        upper_label = QLabel("Upper Version")
+        upper_label.setStyleSheet("font-size: 14px; font-weight: 500; color: #374151; margin-bottom: 4px;")
+        upper_gantt_layout.addWidget(upper_label)
+        self.upper_gantt_canvas = self._create_gantt_canvas()
+        # Initialize with empty state
+        self._draw_gantt_chart(self.upper_gantt_canvas, pd.DataFrame(), "Upper Version")
+        upper_gantt_layout.addWidget(self.upper_gantt_canvas)
+        gantt_layout.addWidget(upper_gantt_frame, 1)
+        
+        # Lower Gantt chart
+        lower_gantt_frame = QFrame()
+        lower_gantt_frame.setFrameShape(QFrame.Shape.Box)
+        lower_gantt_frame.setStyleSheet("border: 1px solid #E5E7EB; border-radius: 4px;")
+        lower_gantt_layout = QVBoxLayout(lower_gantt_frame)
+        lower_gantt_layout.setContentsMargins(8, 8, 8, 8)
+        lower_label = QLabel("Lower Version")
+        lower_label.setStyleSheet("font-size: 14px; font-weight: 500; color: #374151; margin-bottom: 4px;")
+        lower_gantt_layout.addWidget(lower_label)
+        self.lower_gantt_canvas = self._create_gantt_canvas()
+        # Initialize with empty state
+        self._draw_gantt_chart(self.lower_gantt_canvas, pd.DataFrame(), "Lower Version")
+        lower_gantt_layout.addWidget(self.lower_gantt_canvas)
+        gantt_layout.addWidget(lower_gantt_frame, 1)
         
         layout.addWidget(gantt_container, 1)
 
@@ -1392,4 +1450,352 @@ class ComparisonPage(QWidget):
         layout.addLayout(change_layout)
 
         return card
+    
+    def _create_gantt_canvas(self) -> FigureCanvas:
+        """Create a matplotlib canvas for Gantt chart"""
+        fig = Figure(figsize=(12, 6), facecolor='white')
+        canvas = FigureCanvas(fig)
+        canvas.setMinimumHeight(300)
+        return canvas
+    
+    def _draw_gantt_chart(self, canvas: FigureCanvas, solution_df: pd.DataFrame, version_label: str = ""):
+        """
+        Draw Gantt chart with 5 phases:
+        1. Production (from Production_Start, duration Production_Duration)
+        2. Factory Storage (from Production end to Transport_Start)
+        3. Transport (from Transport_Start, duration Transport_Duration, to Arrival_Time)
+        4. Site Storage (from Arrival_Time to Installation_Start)
+        5. Installation (from Installation_Start, duration Installation_Duration, to Installation_Finish)
+        """
+        if solution_df.empty:
+            # Clear and show empty message
+            canvas.figure.clear()
+            ax = canvas.figure.add_subplot(111)
+            ax.text(0.5, 0.5, 'No data available', ha='center', va='center', 
+                   transform=ax.transAxes, fontsize=14, color='#9CA3AF')
+            ax.axis('off')
+            canvas.draw()
+            canvas.update()
+            return
+        
+        # Clear previous plot
+        canvas.figure.clear()
+        ax = canvas.figure.add_subplot(111)
+        
+        # Color mapping for phases
+        colors = {
+            'production': '#3B82F6',      # Blue
+            'factory_storage': '#9CA3AF', # Gray
+            'transport': '#F59E0B',       # Orange
+            'site_storage': '#E5E7EB',    # Light Gray
+            'installation': '#10B981'     # Green
+        }
+        
+        # Data is already sorted by Installation_Start when saved to database
+        num_modules = len(solution_df)
+        
+        if num_modules == 0:
+            ax.text(0.5, 0.5, 'No modules to display', ha='center', va='center',
+                   transform=ax.transAxes, fontsize=14, color='#9CA3AF')
+            ax.axis('off')
+            canvas.draw()
+            canvas.update()
+            return
+        
+        # Calculate y positions (one row per module)
+        y_positions = np.arange(num_modules)
+        
+        # Find overall time range
+        min_time = float('inf')
+        max_time = float('-inf')
+        
+        for _, row in solution_df.iterrows():
+            prod_start = row.get('Production_Start')
+            if pd.notna(prod_start):
+                min_time = min(min_time, float(prod_start))
+            
+            inst_finish = row.get('Installation_Finish')
+            if pd.notna(inst_finish):
+                max_time = max(max_time, float(inst_finish))
+        
+        if min_time == float('inf'):
+            min_time = 0
+        if max_time == float('-inf'):
+            max_time = 100
+        
+        time_range = max_time - min_time
+        if time_range == 0:
+            time_range = 1
+        padding = time_range * 0.1
+        ax.set_xlim(min_time - padding, max_time + padding)
+        
+        # Draw bars for each module
+        bar_height = 0.6
+        for idx, (_, row) in enumerate(solution_df.iterrows()):
+            y_pos = y_positions[idx]
+            module_id = str(row.get('Module_ID', ''))
+            
+            # Initialize variables
+            prod_start = None
+            prod_dur = 0
+            prod_end = None
+            transport_start = None
+            transport_dur = 0
+            arrival_time = None
+            install_start = None
+            install_dur = 0
+            
+            # 1. Production
+            prod_start_val = row.get('Production_Start')
+            prod_dur_val = row.get('Production_Duration', 0)
+            if pd.notna(prod_start_val) and pd.notna(prod_dur_val) and prod_dur_val > 0:
+                prod_start = float(prod_start_val)
+                prod_dur = float(prod_dur_val)
+                ax.barh(y_pos, prod_dur, left=prod_start, height=bar_height,
+                       color=colors['production'], edgecolor='white', linewidth=0.5)
+                prod_end = prod_start + prod_dur
+            
+            # 2. Factory Storage (from Production end to Transport_Start)
+            transport_start_val = row.get('Transport_Start')
+            if pd.notna(transport_start_val):
+                transport_start = float(transport_start_val)
+                if prod_end is not None and transport_start > prod_end:
+                    factory_storage_dur = transport_start - prod_end
+                    if factory_storage_dur > 0:
+                        ax.barh(y_pos, factory_storage_dur, left=prod_end, height=bar_height,
+                               color=colors['factory_storage'], edgecolor='white', linewidth=0.5)
+            
+            # 3. Transport
+            if transport_start is not None:
+                transport_dur_val = row.get('Transport_Duration', 0)
+                if pd.notna(transport_dur_val) and transport_dur_val > 0:
+                    transport_dur = float(transport_dur_val)
+                    ax.barh(y_pos, transport_dur, left=transport_start, height=bar_height,
+                           color=colors['transport'], edgecolor='white', linewidth=0.5)
+            
+            # 4. Site Storage (from Arrival_Time to Installation_Start)
+            arrival_time_val = row.get('Arrival_Time')
+            install_start_val = row.get('Installation_Start')
+            if pd.notna(arrival_time_val):
+                arrival_time = float(arrival_time_val)
+                if pd.notna(install_start_val):
+                    install_start = float(install_start_val)
+                    if install_start > arrival_time:
+                        site_storage_dur = install_start - arrival_time
+                        if site_storage_dur > 0:
+                            ax.barh(y_pos, site_storage_dur, left=arrival_time, height=bar_height,
+                                   color=colors['site_storage'], edgecolor='white', linewidth=0.5)
+            
+            # 5. Installation
+            if install_start is None and pd.notna(install_start_val):
+                install_start = float(install_start_val)
+            if install_start is not None:
+                install_dur_val = row.get('Installation_Duration', 0)
+                if pd.notna(install_dur_val) and install_dur_val > 0:
+                    install_dur = float(install_dur_val)
+                    ax.barh(y_pos, install_dur, left=install_start, height=bar_height,
+                           color=colors['installation'], edgecolor='white', linewidth=0.5)
+        
+        # Set y-axis labels
+        ax.set_yticks(y_positions)
+        ax.set_yticklabels([str(row.get('Module_ID', '')) for _, row in solution_df.iterrows()])
+        ax.set_ylim(-0.5, num_modules - 0.5)
+        
+        # Labels and styling
+        ax.set_xlabel('Time Index', fontsize=11, color='#374151')
+        ax.set_ylabel('Module ID', fontsize=11, color='#374151')
+        if version_label:
+            ax.set_title(version_label, fontsize=12, fontweight=500, color='#111827', pad=10)
+        
+        # Style the axes
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_color('#E5E7EB')
+        ax.spines['bottom'].set_color('#E5E7EB')
+        ax.tick_params(colors='#6B7280', labelsize=10)
+        ax.grid(True, axis='x', linestyle='--', alpha=0.3, color='#D1D5DB')
+        
+        canvas.figure.tight_layout()
+        canvas.draw()
+        # Force update to ensure the canvas is refreshed
+        canvas.update()
+    
+    def load_version_list(self, engine, project_id: int):
+        """
+        Load version list from database and populate comboboxes.
+        This method should be called from MainWindow when ComparisonPage is shown.
+        """
+        from sqlalchemy import inspect, text
+        from planning_tool.datamanager import ScheduleDataManager
+        
+        self.engine = engine
+        self.project_id = project_id
+        
+        if project_id is None:
+            self.upper_version_combo.clear()
+            self.lower_version_combo.clear()
+            return
+        
+        mgr = ScheduleDataManager(engine)
+        versions_table = mgr.optimization_versions_table_name(project_id)
+        
+        inspector = inspect(engine)
+        if versions_table not in inspector.get_table_names():
+            self.upper_version_combo.clear()
+            self.lower_version_combo.clear()
+            return
+        
+        try:
+            # Load versions from database
+            query = f'SELECT version_id, version_number FROM "{versions_table}" ORDER BY version_id DESC'
+            versions_df = pd.read_sql(text(query), engine)
+            
+            # Disconnect signals if they were connected (they shouldn't be, but just in case)
+            try:
+                self.upper_version_combo.currentIndexChanged.disconnect()
+                self.lower_version_combo.currentIndexChanged.disconnect()
+            except TypeError:
+                pass  # Signals weren't connected, that's fine
+            
+            # Clear and populate comboboxes
+            self.upper_version_combo.clear()
+            self.lower_version_combo.clear()
+            self.version_id_map = {}
+            
+            if not versions_df.empty:
+                for _, row in versions_df.iterrows():
+                    version_id = int(row['version_id'])
+                    version_number = row['version_number']
+                    display_text = f"Version {version_number}"
+                    
+                    index = self.upper_version_combo.count()
+                    self.upper_version_combo.addItem(display_text)
+                    self.lower_version_combo.addItem(display_text)
+                    self.version_id_map[index] = version_id
+                
+                # Set default selections (latest version for upper, second latest for lower if available)
+                if len(versions_df) >= 1:
+                    self.upper_version_combo.setCurrentIndex(0)  # Latest version
+                if len(versions_df) >= 2:
+                    self.lower_version_combo.setCurrentIndex(1)  # Second latest version
+                elif len(versions_df) >= 1:
+                    self.lower_version_combo.setCurrentIndex(0)  # Same as upper if only one version
+            
+            # Don't auto-trigger chart loading, user will click Compare button
+            # Charts will be empty until user clicks Compare button
+            
+        except Exception as e:
+            print(f"Error loading version list: {e}")
+            self.upper_version_combo.clear()
+            self.lower_version_combo.clear()
+    
+    def _on_version_changed(self):
+        """Handle Compare button click and update Gantt charts"""
+        print(f"[DEBUG] Compare button clicked")
+        print(f"[DEBUG] engine: {self.engine}, project_id: {self.project_id}")
+        
+        if self.engine is None or self.project_id is None:
+            print("[DEBUG] Engine or project_id is None, returning")
+            # Show empty charts
+            self._draw_gantt_chart(self.upper_gantt_canvas, pd.DataFrame(), "Upper Version (No project selected)")
+            self._draw_gantt_chart(self.lower_gantt_canvas, pd.DataFrame(), "Lower Version (No project selected)")
+            return
+        
+        from sqlalchemy import inspect, text
+        from planning_tool.datamanager import ScheduleDataManager
+        
+        mgr = ScheduleDataManager(self.engine)
+        solution_table = mgr.solution_table_name(self.project_id)
+        versions_table = mgr.optimization_versions_table_name(self.project_id)
+        
+        inspector = inspect(self.engine)
+        if solution_table not in inspector.get_table_names():
+            print(f"[DEBUG] Solution table {solution_table} does not exist")
+            # Show empty charts with message
+            self._draw_gantt_chart(self.upper_gantt_canvas, pd.DataFrame(), "Upper Version (No data)")
+            self._draw_gantt_chart(self.lower_gantt_canvas, pd.DataFrame(), "Lower Version (No data)")
+            return
+        
+        try:
+            # Get selected version IDs
+            upper_index = self.upper_version_combo.currentIndex()
+            lower_index = self.lower_version_combo.currentIndex()
+            
+            print(f"[DEBUG] Selected indices: upper={upper_index}, lower={lower_index}")
+            print(f"[DEBUG] version_id_map: {self.version_id_map}")
+            
+            upper_version_id = self.version_id_map.get(upper_index)
+            lower_version_id = self.version_id_map.get(lower_index)
+            
+            print(f"[DEBUG] Version IDs: upper={upper_version_id}, lower={lower_version_id}")
+            
+            
+            # Check which version_ids actually have data in solution table
+            available_version_ids = set()
+            try:
+                check_query = f'SELECT DISTINCT version_id FROM "{solution_table}" WHERE version_id IS NOT NULL'
+                available_df = pd.read_sql(text(check_query), self.engine)
+                available_version_ids = set(available_df['version_id'].dropna().astype(int).tolist())
+                print(f"[DEBUG] Available version_ids in solution table: {available_version_ids}")
+            except Exception as e:
+                print(f"[DEBUG] Error checking available versions: {e}")
+            
+            # Load upper version data
+            upper_df = pd.DataFrame()
+            upper_label = "Upper Version"
+            if upper_version_id is not None:
+                # Check if this version has data
+                if upper_version_id in available_version_ids:
+                    # Load data for the specific version_id
+                    query = f'SELECT * FROM "{solution_table}" WHERE version_id = :version_id ORDER BY Installation_Start ASC'
+                    upper_df = pd.read_sql(text(query), self.engine, params={"version_id": upper_version_id})
+                    # Get version label
+                    if versions_table in inspector.get_table_names():
+                        v_query = f'SELECT version_number FROM "{versions_table}" WHERE version_id = :version_id'
+                        v_result = pd.read_sql(text(v_query), self.engine, params={"version_id": upper_version_id})
+                        if not v_result.empty:
+                            upper_label = f"Version {v_result.iloc[0]['version_number']}"
+                else:
+                    # This version has no data, show empty state
+                    upper_label = f"Version {upper_version_id} (No data)"
+            elif self.upper_version_combo.count() > 0:
+                # No version selected but combobox has items - show empty state
+                upper_label = "Upper Version (Please select)"
+            
+            # Load lower version data
+            lower_df = pd.DataFrame()
+            lower_label = "Lower Version"
+            if lower_version_id is not None:
+                # Check if this version has data
+                if lower_version_id in available_version_ids:
+                    # Load data for the specific version_id
+                    query = f'SELECT * FROM "{solution_table}" WHERE version_id = :version_id ORDER BY Installation_Start ASC'
+                    lower_df = pd.read_sql(text(query), self.engine, params={"version_id": lower_version_id})
+                    # Get version label
+                    if versions_table in inspector.get_table_names():
+                        v_query = f'SELECT version_number FROM "{versions_table}" WHERE version_id = :version_id'
+                        v_result = pd.read_sql(text(v_query), self.engine, params={"version_id": lower_version_id})
+                        if not v_result.empty:
+                            lower_label = f"Version {v_result.iloc[0]['version_number']}"
+                else:
+                    # This version has no data, show empty state
+                    lower_label = f"Version {lower_version_id} (No data)"
+            elif self.lower_version_combo.count() > 0:
+                # No version selected but combobox has items - show empty state
+                lower_label = "Lower Version (Please select)"
+            
+            # Draw charts
+            print(f"[DEBUG] Drawing charts...")
+            self._draw_gantt_chart(self.upper_gantt_canvas, upper_df, upper_label)
+            self._draw_gantt_chart(self.lower_gantt_canvas, lower_df, lower_label)
+            # Force UI update
+            from PyQt6.QtWidgets import QApplication
+            QApplication.processEvents()
+            print(f"[DEBUG] Charts drawn")
+            
+        except Exception as e:
+            print(f"Error loading Gantt data: {e}")
+            # Draw empty charts on error
+            self._draw_gantt_chart(self.upper_gantt_canvas, pd.DataFrame(), "Upper Version")
+            self._draw_gantt_chart(self.lower_gantt_canvas, pd.DataFrame(), "Lower Version")
 
