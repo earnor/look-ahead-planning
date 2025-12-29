@@ -1772,9 +1772,10 @@ class ComparisonPage(QWidget):
                     ax.barh(y_pos, install_dur, left=install_start, height=bar_height,
                            color=colors['installation'], edgecolor='white', linewidth=0.5)
         
-        # Set y-axis labels
+        # Set y-axis labels with smaller font size for better readability
         ax.set_yticks(y_positions)
-        ax.set_yticklabels([str(row.get('Module_ID', '')) for _, row in solution_df.iterrows()])
+        module_labels = [str(row.get('Module_ID', '')) for _, row in solution_df.iterrows()]
+        ax.set_yticklabels(module_labels)
         ax.set_ylim(-0.5, num_modules - 0.5)
         
         # Labels and styling
@@ -1788,7 +1789,9 @@ class ComparisonPage(QWidget):
         ax.spines['right'].set_visible(False)
         ax.spines['left'].set_color('#E5E7EB')
         ax.spines['bottom'].set_color('#E5E7EB')
-        ax.tick_params(colors='#6B7280', labelsize=10)
+        # Use smaller font size for y-axis labels (module IDs) for better readability
+        ax.tick_params(axis='x', colors='#6B7280', labelsize=10)
+        ax.tick_params(axis='y', colors='#6B7280', labelsize=8)  # Smaller font for module IDs
         ax.grid(True, axis='x', linestyle='--', alpha=0.3, color='#D1D5DB')
         
         canvas.figure.tight_layout()

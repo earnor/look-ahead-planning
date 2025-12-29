@@ -967,9 +967,17 @@ class MainWindow(QMainWindow):
             # Parse start date
             fmt = "%m/%d/%Y"
             start_str = settings.get("start_datetime", "")
-            if not start_str:
-                return
-            start_date = datetime.strptime(start_str, fmt).date()
+            if not start_str or start_str.lower() == "mm/dd/yyyy":
+                # Handle placeholder text - use a default date or skip
+                print(f"[DEBUG MainWindow] Invalid start_datetime value: '{start_str}', skipping date-dependent processing")
+                # Use a default date for now - this shouldn't happen if settings are properly saved
+                start_date = datetime.today().date()
+            else:
+                try:
+                    start_date = datetime.strptime(start_str, fmt).date()
+                except ValueError:
+                    print(f"[DEBUG MainWindow] Failed to parse start_datetime '{start_str}', using default date")
+                    start_date = datetime.today().date()
             
             # Determine max index needed
             idx_cols = ["Installation_Start", "Installation_Finish", "Arrival_Time", "Production_Start", "Transport_Start"]
