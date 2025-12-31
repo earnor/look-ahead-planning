@@ -1188,12 +1188,30 @@ class MainWindow(QMainWindow):
             
             df = pd.DataFrame(data, columns=column_headers)
             
-            # Export to Excel - try openpyxl first, fallback to default engine
+            # Get settings for weight values
+            settings = self._get_active_settings() or {}
+            weight_settings_data = [
+                {"Setting": "Factory Inventory Cost (C_F)", "Value": settings.get("factory_inv_cost", "")},
+                {"Setting": "Onsite Inventory Cost (C_O)", "Value": settings.get("onsite_inv_cost", "")},
+                {"Setting": "Penalty Cost per Unit Time (C_I)", "Value": settings.get("penalty_cost", "")},
+                {"Setting": "Order Batch Cost (OC)", "Value": settings.get("order_cost", "")}
+            ]
+            weight_settings_df = pd.DataFrame(weight_settings_data)
+            
+            # Export to Excel with multiple sheets - try openpyxl first, fallback to default engine
             try:
-                df.to_excel(file_path, index=False, engine='openpyxl')
+                with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+                    df.to_excel(writer, sheet_name='Schedule', index=False)
+                    weight_settings_df.to_excel(writer, sheet_name='Settings', index=False)
             except ImportError:
-                # If openpyxl not available, try default engine
-                df.to_excel(file_path, index=False)
+                # If openpyxl not available, try default engine (may not support multiple sheets)
+                try:
+                    with pd.ExcelWriter(file_path, engine='xlsxwriter') as writer:
+                        df.to_excel(writer, sheet_name='Schedule', index=False)
+                        weight_settings_df.to_excel(writer, sheet_name='Settings', index=False)
+                except ImportError:
+                    # Last resort: single sheet with default engine
+                    df.to_excel(file_path, index=False)
             
             QMessageBox.information(
                 self,
