@@ -1521,44 +1521,27 @@ class ComparisonPage(QWidget):
         title_layout.addWidget(subtitle)
         layout.addLayout(title_layout)
 
-        # KPI Comparison Cards
-        metrics = [
-            {
-                "name": "Construction Days",
-                "v1_value": "45 days",
-                "v2_value": "48 days",
-                "change": "+3",
-                "change_percent": "6.7%",
-                "trend": "up"
-            },
-            {
-                "name": "Factory Storage Module Days",
-                "v1_value": "8 days",
-                "v2_value": "10 days",
-                "change": "+2",
-                "change_percent": "25.0%",
-                "trend": "up"
-            },
-            {
-                "name": "Site Storage Module Days",
-                "v1_value": "4 days",
-                "v2_value": "5 days",
-                "change": "+1",
-                "change_percent": "25.0%",
-                "trend": "up"
-            },
-            {
-                "name": "Transport Bunch Number",
-                "v1_value": "12 bunches",
-                "v2_value": "13 bunches",
-                "change": "+1",
-                "change_percent": "8.3%",
-                "trend": "up"
-            }
+        # KPI Comparison Cards - store references for later updates
+        metric_names = [
+            "Construction Hours",
+            "Factory Storage Module Hours",
+            "Site Storage Module Hours",
+            "Transport Bunch Number"
         ]
-
-        for metric in metrics:
+        
+        self.metric_cards = {}  # Store metric cards by name for later updates
+        for metric_name in metric_names:
+            # Initialize with empty/default values
+            metric = {
+                "name": metric_name,
+                "v1_value": "N/A",
+                "v2_value": "N/A",
+                "change": "N/A",
+                "change_percent": "N/A",
+                "trend": "neutral"
+            }
             metric_card = self._create_metric_card(metric)
+            self.metric_cards[metric_name] = metric_card
             layout.addWidget(metric_card)
 
         layout.addStretch(1)
@@ -1566,7 +1549,7 @@ class ComparisonPage(QWidget):
         return container
 
     def _create_metric_card(self, metric: dict) -> QFrame:
-        """Create a metric comparison card"""
+        """Create a metric comparison card with updatable labels"""
         card = QFrame()
         card.setObjectName("MetricCard")
         card.setStyleSheet("""
@@ -1591,18 +1574,20 @@ class ComparisonPage(QWidget):
         values_layout.setSpacing(12)
 
         v1_layout = QVBoxLayout()
-        v1_label = QLabel("Version 1:")
+        v1_label = QLabel("Upper:")
         v1_label.setStyleSheet("font-size: 11px; color: #6B7280;")
         v1_value = QLabel(metric["v1_value"])
         v1_value.setStyleSheet("font-size: 14px; font-weight: 600; color: #111827;")
+        v1_value.setObjectName("v1_value")  # Set object name for later access
         v1_layout.addWidget(v1_label)
         v1_layout.addWidget(v1_value)
 
         v2_layout = QVBoxLayout()
-        v2_label = QLabel("Version 2:")
+        v2_label = QLabel("Lower:")
         v2_label.setStyleSheet("font-size: 11px; color: #6B7280;")
         v2_value = QLabel(metric["v2_value"])
         v2_value.setStyleSheet("font-size: 14px; font-weight: 600; color: #111827;")
+        v2_value.setObjectName("v2_value")  # Set object name for later access
         v2_layout.addWidget(v2_label)
         v2_layout.addWidget(v2_value)
 
@@ -1615,17 +1600,134 @@ class ComparisonPage(QWidget):
         change_layout = QHBoxLayout()
         change_label = QLabel(f"Change: {metric['change']} ({metric['change_percent']})")
         change_label.setStyleSheet("font-size: 12px; color: #DC2626; font-weight: 500;")
+        change_label.setObjectName("change_label")  # Set object name for later access
         
-        # Trend icon (red upward arrow)
+        # Trend icon
         trend_icon = QLabel("↗")
         trend_icon.setStyleSheet("font-size: 14px; color: #DC2626;")
+        trend_icon.setObjectName("trend_icon")  # Set object name for later access
         
         change_layout.addWidget(change_label)
         change_layout.addWidget(trend_icon)
         change_layout.addStretch(1)
         layout.addLayout(change_layout)
 
+        # Store references to updatable widgets in the card
+        card.v1_value_label = v1_value
+        card.v2_value_label = v2_value
+        card.change_label = change_label
+        card.trend_icon = trend_icon
+
         return card
+    
+    def _calculate_metrics(self, solution_df: pd.DataFrame) -> dict:
+        """
+        Calculate metrics from solution dataframe.
+        
+        Returns a dictionary with:
+        - construction_days: Total construction duration (days)
+        - factory_storage_module_days: Sum of Factory_Wait_Duration
+        - site_storage_module_days: Sum of Onsite_Wait_Duration  
+        - transport_bunch_number: Number of unique Transport_Start times
+        """
+        if solution_df.empty:
+            return {
+                "construction_days": 0,
+                "factory_storage_module_days": 0,
+                "site_storage_module_days": 0,
+                "transport_bunch_number": 0
+            }
+        
+        # Construction Days: from earliest Production_Start to latest Installation_Finish
+        prod_start_col = solution_df.get('Production_Start')
+        inst_finish_col = solution_df.get('Installation_Finish')
+        
+        construction_days = 0
+        if prod_start_col is not None and inst_finish_col is not None:
+            valid_prod_starts = prod_start_col.dropna()
+            valid_finishes = inst_finish_col.dropna()
+            if len(valid_prod_starts) > 0 and len(valid_finishes) > 0:
+                earliest_prod_start = float(valid_prod_starts.min())
+                latest_finish = float(valid_finishes.max())
+                construction_days = max(0, latest_finish - earliest_prod_start + 1)
+                # Convert from time index to days (assuming 1 time index = 1 hour, 8 hours per day)
+                #construction_days = construction_days / 8.0
+        
+        # Factory Storage Module Days: sum of Factory_Wait_Duration
+        factory_wait_col = solution_df.get('Factory_Wait_Duration', pd.Series())
+        factory_storage_module_days = 0
+        if len(factory_wait_col) > 0:
+            factory_storage_module_days = float(factory_wait_col.fillna(0).sum())  # Convert to days
+        
+        # Site Storage Module Days: sum of Onsite_Wait_Duration
+        onsite_wait_col = solution_df.get('Onsite_Wait_Duration', pd.Series())
+        site_storage_module_days = 0
+        if len(onsite_wait_col) > 0:
+            site_storage_module_days = float(onsite_wait_col.fillna(0).sum()) # Convert to days
+        
+        # Transport Bunch Number: number of unique Transport_Start times
+        transport_start_col = solution_df.get('Transport_Start')
+        transport_bunch_number = 0
+        if transport_start_col is not None:
+            unique_transport_starts = transport_start_col.dropna().unique()
+            transport_bunch_number = len(unique_transport_starts)
+        
+        return {
+            "construction_days": round(construction_days, 1),
+            "factory_storage_module_days": round(factory_storage_module_days, 1),
+            "site_storage_module_days": round(site_storage_module_days, 1),
+            "transport_bunch_number": transport_bunch_number
+        }
+    
+    def _update_metric_card(self, card: QFrame, metric_name: str, v1_value: float, v2_value: float):
+        """Update a metric card with calculated values"""
+        # Format values based on metric type
+        if "Hours" in metric_name:
+            v1_str = f"{v1_value:.1f} hours" if v1_value > 0 else "0 hours"
+            v2_str = f"{v2_value:.1f} hours" if v2_value > 0 else "0 hours"
+        elif "Number" in metric_name:
+            v1_str = f"{int(v1_value)} bunches" if v1_value > 0 else "0 bunches"
+            v2_str = f"{int(v2_value)} bunches" if v2_value > 0 else "0 bunches"
+        else:
+            v1_str = str(v1_value) if v1_value > 0 else "0"
+            v2_str = str(v2_value) if v2_value > 0 else "0"
+        
+        # Calculate change
+        change = v1_value - v2_value
+        if v2_value != 0:
+            change_percent = abs(change / v2_value * 100)
+        else:
+            change_percent = 0 if change == 0 else 100
+        
+        # Determine trend and color
+        if change > 0:
+            trend = "up"
+            color = "#DC2626"  # Red for increase (usually bad for most metrics)
+        elif change < 0:
+            trend = "down"
+            color = "#10B981"  # Green for decrease (usually good for most metrics)
+        else:
+            trend = "neutral"
+            color = "#6B7280"  # Gray for no change
+        
+        # Format change string
+        change_str = f"{change:+.1f}" if isinstance(change, float) else f"{change:+d}"
+        change_percent_str = f"{change_percent:.1f}%"
+        
+        # Update labels
+        card.v1_value_label.setText(v1_str)
+        card.v2_value_label.setText(v2_str)
+        card.change_label.setText(f"Change: {change_str} ({change_percent_str})")
+        card.change_label.setStyleSheet(f"font-size: 12px; color: {color}; font-weight: 500;")
+        
+        # Update trend icon
+        if trend == "up":
+            card.trend_icon.setText("↗")
+        elif trend == "down":
+            card.trend_icon.setText("↘")
+        else:
+            card.trend_icon.setText("→")
+        card.trend_icon.setStyleSheet(f"font-size: 14px; color: {color};")
     
     def _create_gantt_canvas(self) -> FigureCanvas:
         """Create a matplotlib canvas for Gantt chart"""
@@ -1962,6 +2064,37 @@ class ComparisonPage(QWidget):
             elif self.lower_version_combo.count() > 0:
                 # No version selected but combobox has items - show empty state
                 lower_label = "Lower Version (Please select)"
+            
+            # Calculate metrics for both versions
+            upper_metrics = self._calculate_metrics(upper_df)
+            lower_metrics = self._calculate_metrics(lower_df)
+            
+            # Update metric cards
+            if hasattr(self, 'metric_cards'):
+                self._update_metric_card(
+                    self.metric_cards["Construction Hours"],
+                    "Construction Hours",
+                    upper_metrics["construction_days"],
+                    lower_metrics["construction_days"]
+                )
+                self._update_metric_card(
+                    self.metric_cards["Factory Storage Module Hours"],
+                    "Factory Storage Module Hours",
+                    upper_metrics["factory_storage_module_days"],
+                    lower_metrics["factory_storage_module_days"]
+                )
+                self._update_metric_card(
+                    self.metric_cards["Site Storage Module Hours"],
+                    "Site Storage Module Hours",
+                    upper_metrics["site_storage_module_days"],
+                    lower_metrics["site_storage_module_days"]
+                )
+                self._update_metric_card(
+                    self.metric_cards["Transport Bunch Number"],
+                    "Transport Bunch Number",
+                    upper_metrics["transport_bunch_number"],
+                    lower_metrics["transport_bunch_number"]
+                )
             
             # Draw charts
             print(f"[DEBUG] Drawing charts...")

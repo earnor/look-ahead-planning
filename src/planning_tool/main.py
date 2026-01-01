@@ -54,9 +54,11 @@ class MainWindow(QMainWindow):
             page_dashboard = DashboardPage()
             # Connect dashboard page's pageRequested signal to switch_page
             if isinstance(page_dashboard, DashboardPage):
+                self.page_dashboard = page_dashboard
                 page_dashboard.pageRequested.connect(self.switch_page)
         except NameError:
             page_dashboard = QLabel("Dashboard"); page_dashboard.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.page_dashboard = None
 
         try:
             page_schedule = SchedulePage()
@@ -114,6 +116,10 @@ class MainWindow(QMainWindow):
         root_lay.addWidget(central, 6)
 
         self.setCentralWidget(root)
+        
+        # Load dashboard data if dashboard is the initial page and we have a project
+        if self.current_project_id is not None and hasattr(self, "page_dashboard") and self.page_dashboard:
+            self.load_dashboard_data()
 
     def save_delay_to_db(self, delay_info: dict):
         """
@@ -578,22 +584,36 @@ class MainWindow(QMainWindow):
                     base_version_result = conn.execute(text(base_version_query)).scalar()
                     base_version_id = base_version_result
                     
+                    # Get project_start_datetime from base version (re-optimization should use the same start date)
+                    base_start_datetime = None
+                    if base_version_id:
+                        base_start_query = text(f'SELECT project_start_datetime FROM "{versions_table}" WHERE version_id = :version_id')
+                        base_start_result = conn.execute(base_start_query, {"version_id": base_version_id}).scalar()
+                        if base_start_result:
+                            base_start_datetime = base_start_result
+                            print(f"[DEBUG] Using base version {base_version_id} project_start_datetime: '{base_start_datetime}'")
+                    
+                    # Use base version's start_datetime if available, otherwise fallback to current settings
+                    reopt_start_datetime = base_start_datetime if base_start_datetime else (start_str if start_str and start_str.lower() != "mm/dd/yyyy" else None)
+                    
                     # Get delay IDs for pending delays
                     delay_ids_query = f'SELECT delay_id FROM "{delay_table}" WHERE version_id IS NULL'
                     delay_ids = [str(row[0]) for row in conn.execute(text(delay_ids_query)).fetchall()]
                     delay_ids_str = ','.join(delay_ids) if delay_ids else None
                     
                     # Insert new version record (use current_time as reoptimize_from_time)
+                    # Inherit project_start_datetime from base version (re-optimization should use same start date)
                     insert_version_query = text(f'''
                         INSERT INTO "{versions_table}" 
-                        (version_number, base_version_id, reoptimize_from_time, delay_ids)
-                        VALUES (:version_number, :base_version_id, :reoptimize_from_time, :delay_ids)
+                        (version_number, base_version_id, reoptimize_from_time, delay_ids, project_start_datetime)
+                        VALUES (:version_number, :base_version_id, :reoptimize_from_time, :delay_ids, :project_start_datetime)
                     ''')
                     conn.execute(insert_version_query, {
                         "version_number": new_version_number,
                         "base_version_id": base_version_id,
                         "reoptimize_from_time": current_time,
-                        "delay_ids": delay_ids_str
+                        "delay_ids": delay_ids_str,
+                        "project_start_datetime": reopt_start_datetime
                     })
                     
                     # Get the new version_id
@@ -648,14 +668,26 @@ class MainWindow(QMainWindow):
                 solution = scheduler.get_solution_dict()
                 if solution:
                     with self.engine.begin() as conn:
+                        # Get base version's start_datetime again (for consistency)
+                        base_start_datetime = None
+                        if base_version_id:
+                            base_start_query = text(f'SELECT project_start_datetime FROM "{versions_table}" WHERE version_id = :version_id')
+                            base_start_result = conn.execute(base_start_query, {"version_id": base_version_id}).scalar()
+                            if base_start_result:
+                                base_start_datetime = base_start_result
+                        
+                        reopt_start_datetime = base_start_datetime if base_start_datetime else (start_str if start_str and start_str.lower() != "mm/dd/yyyy" else None)
+                        
                         update_version_query = text(f'''
                             UPDATE "{versions_table}" 
-                            SET objective_value = :objective_value, status = :status
+                            SET objective_value = :objective_value, status = :status,
+                                project_start_datetime = COALESCE(project_start_datetime, :project_start_datetime)
                             WHERE version_id = :version_id
                         ''')
                         conn.execute(update_version_query, {
                             "objective_value": solution.get('objective'),
                             "status": solution.get('status'),
+                            "project_start_datetime": reopt_start_datetime,
                             "version_id": new_version_id
                         })
                 
@@ -702,18 +734,32 @@ class MainWindow(QMainWindow):
                     
                     if version_0_id is None:
                         # Version 0 doesn't exist, create it (INSERT OR IGNORE ensures no duplicates even in concurrent scenarios)
+                        # Save the start_datetime used for this optimization
                         insert_version_query = text(f'''
                             INSERT OR IGNORE INTO "{versions_table}" 
-                            (version_number, base_version_id, reoptimize_from_time)
-                            VALUES (0, NULL, :reoptimize_from_time)
+                            (version_number, base_version_id, reoptimize_from_time, project_start_datetime)
+                            VALUES (0, NULL, :reoptimize_from_time, :project_start_datetime)
                         ''')
                         conn.execute(insert_version_query, {
-                            "reoptimize_from_time": datetime.now()
+                            "reoptimize_from_time": datetime.now(),
+                            "project_start_datetime": start_str if start_str and start_str.lower() != "mm/dd/yyyy" else None
                         })
                         
                         # Get the version_id for version 0 (after insert or if it was created concurrently)
                         get_version_id_query = text(f'SELECT version_id FROM "{versions_table}" WHERE version_number = 0')
                         version_0_id = conn.execute(get_version_id_query).scalar()
+                    
+                    # Update project_start_datetime if it's missing (for existing records)
+                    if version_0_id is not None:
+                        update_start_date_query = text(f'''
+                            UPDATE "{versions_table}" 
+                            SET project_start_datetime = :project_start_datetime
+                            WHERE version_id = :version_id AND (project_start_datetime IS NULL OR project_start_datetime = '')
+                        ''')
+                        conn.execute(update_start_date_query, {
+                            "project_start_datetime": start_str if start_str and start_str.lower() != "mm/dd/yyyy" else None,
+                            "version_id": version_0_id
+                        })
 
                 # 5.5) Save results to DB with version_0_id (preserving real Module IDs)
                 QApplication.processEvents()
@@ -731,12 +777,14 @@ class MainWindow(QMainWindow):
                     with self.engine.begin() as conn:
                         update_version_query = text(f'''
                             UPDATE "{versions_table}" 
-                            SET objective_value = :objective_value, status = :status
+                            SET objective_value = :objective_value, status = :status,
+                                project_start_datetime = COALESCE(project_start_datetime, :project_start_datetime)
                             WHERE version_id = :version_id
                         ''')
                         conn.execute(update_version_query, {
                             "objective_value": solution.get('objective'),
                             "status": solution.get('status'),
+                            "project_start_datetime": start_str if start_str and start_str.lower() != "mm/dd/yyyy" else None,
                             "version_id": version_0_id
                         })
 
@@ -854,11 +902,11 @@ class MainWindow(QMainWindow):
                         "Trans. Delay (h)": trans_delay,
                         "Inst. Delay (h)": inst_delay,
                         "_has_delay": has_delay or (str(mod_id) in modules_with_delay),
-                        "_sort_key": install_start_dt,  # Store datetime object for sorting
+                        "_sort_key": fab_start_dt,  # Store datetime object for sorting
                     })
 
-                # Sort rows by Installation Start Time (earliest first)
-                # Rows with None installation start time will be placed at the end
+                # Sort rows by Fabrication Start Time (earliest first)
+                # Rows with None fabrication start time will be placed at the end
                 rows.sort(key=lambda x: (x["_sort_key"] is None, x["_sort_key"] or datetime.max))
                 
                 # Remove the temporary sort key
@@ -927,7 +975,7 @@ class MainWindow(QMainWindow):
             print(f"[DEBUG MainWindow] Version IDs in solution table:\n{versions_in_table}")
             
             # Load data for the specific version
-            query = f'SELECT * FROM "{solution_table}" WHERE version_id = :version_id ORDER BY Installation_Start ASC'
+            query = f'SELECT * FROM "{solution_table}" WHERE version_id = :version_id ORDER BY Production_Start ASC'
             print(f"[DEBUG MainWindow] Executing query: {query} with version_id={version_id}")
             df_sol = pd.read_sql(text(query), self.engine, params={"version_id": version_id})
             print(f"[DEBUG MainWindow] Loaded {len(df_sol)} rows for version_id={version_id}")
@@ -946,7 +994,7 @@ class MainWindow(QMainWindow):
                         if version_number == 0:
                             print(f"[DEBUG MainWindow] This is version 0, trying to load NULL version_id data")
                             # Try loading data where version_id IS NULL (legacy data)
-                            legacy_query = f'SELECT * FROM "{solution_table}" WHERE version_id IS NULL ORDER BY Installation_Start ASC'
+                            legacy_query = f'SELECT * FROM "{solution_table}" WHERE version_id IS NULL ORDER BY Production_Start ASC'
                             df_sol = pd.read_sql(text(legacy_query), self.engine)
                             print(f"[DEBUG MainWindow] Loaded {len(df_sol)} rows from legacy NULL version_id data")
                         else:
@@ -959,24 +1007,36 @@ class MainWindow(QMainWindow):
                     self.page_schedule.populate_rows([])
                 return
             
-            # Get settings for working calendar
+            # Get settings for working calendar (still needed for other settings like work hours, working days, etc.)
             settings = self._get_active_settings() or {}
             if not settings:
                 return
             
-            # Parse start date
+            # Get saved start_datetime from version record (preferred)
+            versions_table = self.mgr.optimization_versions_table_name(project_id)
+            saved_start_str = None
+            if versions_table in table_names:
+                try:
+                    version_info_query = f'SELECT project_start_datetime FROM "{versions_table}" WHERE version_id = :version_id'
+                    version_info_result = pd.read_sql(text(version_info_query), self.engine, params={"version_id": version_id})
+                    if not version_info_result.empty and pd.notna(version_info_result.iloc[0]['project_start_datetime']):
+                        saved_start_str = version_info_result.iloc[0]['project_start_datetime']
+                        print(f"[DEBUG MainWindow] Found saved project_start_datetime for version {version_id}: '{saved_start_str}'")
+                except Exception as e:
+                    print(f"[DEBUG MainWindow] Could not retrieve saved start_datetime: {e}")
+            
+            # Parse start date - use saved value if available, otherwise fallback to current settings
             fmt = "%m/%d/%Y"
-            start_str = settings.get("start_datetime", "")
+            start_str = saved_start_str if saved_start_str else settings.get("start_datetime", "")
             if not start_str or start_str.lower() == "mm/dd/yyyy":
                 # Handle placeholder text - use a default date or skip
-                print(f"[DEBUG MainWindow] Invalid start_datetime value: '{start_str}', skipping date-dependent processing")
-                # Use a default date for now - this shouldn't happen if settings are properly saved
+                print(f"[DEBUG MainWindow] Invalid start_datetime value: '{start_str}', using today's date as fallback")
                 start_date = datetime.today().date()
             else:
                 try:
                     start_date = datetime.strptime(start_str, fmt).date()
                 except ValueError:
-                    print(f"[DEBUG MainWindow] Failed to parse start_datetime '{start_str}', using default date")
+                    print(f"[DEBUG MainWindow] Failed to parse start_datetime '{start_str}', using today's date as fallback")
                     start_date = datetime.today().date()
             
             # Determine max index needed
@@ -1073,10 +1133,10 @@ class MainWindow(QMainWindow):
                     "Trans. Delay (h)": trans_delay,
                     "Inst. Delay (h)": inst_delay,
                     "_has_delay": has_delay or (str(mod_id) in modules_with_delay),
-                    "_sort_key": install_start_dt,
+                    "_sort_key": fab_start_dt,
                 })
             
-            # Sort rows by Installation Start Time
+            # Sort rows by Fabrication Start Time
             rows.sort(key=lambda x: (x["_sort_key"] is None, x["_sort_key"] or datetime.max))
             
             # Remove the temporary sort key
@@ -1245,6 +1305,10 @@ class MainWindow(QMainWindow):
             elif name == "schedule" and hasattr(self, "page_schedule") and self.page_schedule:
                 if self.current_project_id is not None:
                     self.page_schedule.load_version_list(self.engine, self.current_project_id)
+            # Load data for dashboard page when it's shown
+            elif name == "dashboard" and hasattr(self, "page_dashboard") and self.page_dashboard:
+                if self.current_project_id is not None:
+                    self.load_dashboard_data()
     
     def _update_sidebar_selection(self, page_name: str):
         """Update sidebar button selection based on current page"""
@@ -1328,6 +1392,167 @@ class MainWindow(QMainWindow):
         combo.setCurrentText(project_name)
         self.current_project_id = project_id
         self.topbar.delete_project_btn.show()  # Show delete button when project exists
+    
+    def load_dashboard_data(self):
+        """Load data for dashboard page, specifically today's fabrication modules"""
+        if not hasattr(self, "page_dashboard") or not isinstance(self.page_dashboard, DashboardPage):
+            return
+        
+        if self.current_project_id is None:
+            # Clear table if no project selected
+            if hasattr(self.page_dashboard, "table"):
+                self.page_dashboard.table.load_tomorrow_fabrication_modules([])
+            return
+        
+        try:
+            from sqlalchemy import inspect, text
+            from datetime import timedelta
+            
+            solution_table = self.mgr.solution_table_name(self.current_project_id)
+            versions_table = self.mgr.optimization_versions_table_name(self.current_project_id)
+            inspector = inspect(self.engine)
+            
+            # Check if solution table exists
+            if solution_table not in inspector.get_table_names():
+                if hasattr(self.page_dashboard, "table"):
+                    self.page_dashboard.table.load_tomorrow_fabrication_modules([])
+                return
+            
+            # Get max version_id from optimization_versions table (not from solution_table)
+            max_version_id = None
+            if versions_table in inspector.get_table_names():
+                max_version_query = f'SELECT MAX(version_id) FROM "{versions_table}"'
+                max_version_result = pd.read_sql(text(max_version_query), self.engine)
+                max_version_id = max_version_result.iloc[0, 0] if not max_version_result.empty else None
+            else:
+                # Fallback: try to get from solution_table if versions_table doesn't exist
+                max_version_query = f'SELECT MAX(version_id) FROM "{solution_table}" WHERE version_id IS NOT NULL'
+                max_version_result = pd.read_sql(text(max_version_query), self.engine)
+                max_version_id = max_version_result.iloc[0, 0] if not max_version_result.empty else None
+            
+            if max_version_id is None or pd.isna(max_version_id):
+                # No version data, clear table
+                if hasattr(self.page_dashboard, "table"):
+                    self.page_dashboard.table.load_tomorrow_fabrication_modules([])
+                return
+            
+            # Ensure version_id is an integer
+            max_version_id = int(max_version_id)
+            
+            # Get saved start_datetime from version record
+            saved_start_str = None
+            if versions_table in inspector.get_table_names():
+                try:
+                    version_info_query = f'SELECT project_start_datetime FROM "{versions_table}" WHERE version_id = :version_id'
+                    version_info_result = pd.read_sql(text(version_info_query), self.engine, params={"version_id": max_version_id})
+                    if not version_info_result.empty and pd.notna(version_info_result.iloc[0]['project_start_datetime']):
+                        saved_start_str = version_info_result.iloc[0]['project_start_datetime']
+                except Exception:
+                    pass
+            
+            # Get settings for working calendar
+            settings = self._get_active_settings() or {}
+            if not settings:
+                if hasattr(self.page_dashboard, "table"):
+                    self.page_dashboard.table.load_tomorrow_fabrication_modules([])
+                return
+            
+            # Parse start date - use saved value if available, otherwise fallback to current settings
+            fmt = "%m/%d/%Y"
+            start_str = saved_start_str if saved_start_str else settings.get("start_datetime", "")
+            if not start_str or start_str.lower() == "mm/dd/yyyy":
+                start_date = datetime.today().date()
+            else:
+                try:
+                    start_date = datetime.strptime(start_str, fmt).date()
+                except ValueError:
+                    start_date = datetime.today().date()
+            
+            # Calculate today's date
+            today_date = datetime.now().date()
+            
+            # Load solution data for max version
+            query = f'SELECT * FROM "{solution_table}" WHERE version_id = :version_id'
+            df_sol = pd.read_sql(text(query), self.engine, params={"version_id": max_version_id})
+            
+            if df_sol.empty:
+                if hasattr(self.page_dashboard, "table"):
+                    self.page_dashboard.table.load_tomorrow_fabrication_modules([])
+                return
+            
+            # Determine max index needed
+            idx_cols = ["Production_Start", "Installation_Finish"]
+            max_idx = 0
+            for col in idx_cols:
+                if col in df_sol.columns:
+                    max_idx = max(max_idx, int(df_sol[col].max()) if not df_sol[col].isna().all() else 0)
+            if max_idx <= 0:
+                max_idx = 1000  # Default fallback
+            
+            # Build working calendar slots
+            slots = self._build_working_calendar_slots(settings, start_date, max_idx)
+            
+            # Find time indices that correspond to today's date
+            today_indices = set()
+            for idx in range(1, len(slots)):
+                if slots[idx] is not None:
+                    slot_date = slots[idx].date()
+                    if slot_date == today_date:
+                        today_indices.add(idx)
+            
+            if not today_indices:
+                # No working slots today, show empty
+                if hasattr(self.page_dashboard, "table"):
+                    self.page_dashboard.table.load_tomorrow_fabrication_modules([])
+                return
+            
+            # Query modules with Production_Start in today's time indices
+            df_today = df_sol[df_sol['Production_Start'].isin(today_indices)].copy()
+            
+            if df_today.empty:
+                if hasattr(self.page_dashboard, "table"):
+                    self.page_dashboard.table.load_tomorrow_fabrication_modules([])
+                return
+            
+            # Convert Production_Start to datetime string
+            def idx_to_dt_str(idx: int) -> str:
+                if idx is None or idx <= 0 or idx >= len(slots):
+                    return ""
+                dt = slots[idx]
+                return dt.strftime("%Y-%m-%d %H:%M")
+            
+            # Prepare data for table
+            table_data = []
+            for _, row in df_today.iterrows():
+                module_id = str(row.get('Module_ID', ''))
+                prod_start_idx = int(row.get('Production_Start', 0))
+                prod_duration = int(row.get('Production_Duration', 0))
+                start_datetime_str = idx_to_dt_str(prod_start_idx)
+                
+                table_data.append({
+                    "Module_ID": module_id,
+                    "Fabrication_Start_Time": start_datetime_str,
+                    "Production_Duration": str(prod_duration),
+                    "Production_Start": str(prod_start_idx),
+                    "_sort_key": prod_start_idx  # For sorting
+                })
+            
+            # Sort by Production_Start (time index) in ascending order
+            table_data.sort(key=lambda x: x["_sort_key"])
+            # Remove sort key before passing to table
+            for item in table_data:
+                item.pop("_sort_key", None)
+            
+            # Load data into table
+            if hasattr(self.page_dashboard, "table"):
+                self.page_dashboard.table.load_tomorrow_fabrication_modules(table_data)
+                
+        except Exception as e:
+            print(f"Error loading dashboard data: {e}")
+            import traceback
+            traceback.print_exc()
+            if hasattr(self.page_dashboard, "table"):
+                self.page_dashboard.table.load_tomorrow_fabrication_modules([])
     
     def _on_delete_project_clicked(self):
         """Handler for delete project button click"""

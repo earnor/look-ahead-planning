@@ -138,9 +138,17 @@ class ScheduleDataManager:
                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
                     objective_value REAL,
                     status INTEGER,
+                    project_start_datetime TEXT,
                     FOREIGN KEY (base_version_id) REFERENCES "{versions_table}"(version_id)
                 );
             """)
+            
+            # Add project_start_datetime column if it doesn't exist (for existing tables)
+            try:
+                conn.exec_driver_sql(f'ALTER TABLE "{versions_table}" ADD COLUMN project_start_datetime TEXT')
+            except Exception:
+                # Column already exists, ignore
+                pass
             
             # Create index on version_number for faster queries (UNIQUE constraint already creates an index, but keep this for clarity)
             conn.exec_driver_sql(f"""

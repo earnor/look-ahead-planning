@@ -183,48 +183,23 @@ class DashboardTable(QFrame):
             }
         """)
 
-        title = QLabel("What's Late This Week")
-        title.setObjectName("sectionTitle")
-        subtitle = QLabel("Tasks behind schedule or at risk")
-        subtitle.setObjectName("sectionSubtitle")
+        self.title = QLabel("What Start to Fabricate Today")
+        self.title.setObjectName("sectionTitle")
+        self.subtitle = QLabel("Modules scheduled to start fabrication today")
+        self.subtitle.setObjectName("sectionSubtitle")
 
-        table = QTableWidget(3, 6)
-        table.setHorizontalHeaderLabels(["ID", "Task", "Planned Start Time", "Actual Start Time", "Duration", "Δ Hours"])
-        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        table.verticalHeader().setVisible(False)
-        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        table.setAlternatingRowColors(True)
-        table.setShowGrid(True)
-        table.setMinimumHeight(200)
-
-        # Sample data with datetime format: yyyy-mm-dd, h:m:s
-        data = [
-            ("VS-02-22", "Offsite Fabrication", "2025-10-05, 08:00:00", "2025-10-12, 14:30:00", "3h", "16h"),
-            ("VS-02-92", "Onsite Installation", "2025-10-08, 09:00:00", "2025-10-13, 16:00:00", "2h", "12h"),
-            ("VS-01-21", "Transportation", "2025-10-10, 10:00:00", "—", "—", "+72"),
-        ]
-        for r, row in enumerate(data):
-            for c, val in enumerate(row):
-                item = QTableWidgetItem(val)
-                if c == 0:  # ID column
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-                elif c == 1:  # Task column
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-                else:  # Planned, Actual, Duration, Δ Hours columns
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter)
-                
-                # Color Δ Hours column in red
-                if c == 5:
-                    item.setForeground(QColor("#DC2626"))
-                    item.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
-                
-                table.setItem(r, c, item)
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Module ID", "Fabrication Start Time", "Fabrication Duration (h)", "Production Start Index"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(True)
+        self.table.setMinimumHeight(200)
 
         btn = QPushButton("Go to Schedule")
         btn.clicked.connect(lambda: self.pageRequested.emit("schedule"))
@@ -235,17 +210,76 @@ class DashboardTable(QFrame):
         top = QHBoxLayout()
         txt = QVBoxLayout()
         txt.setSpacing(4)
-        txt.addWidget(title)
-        txt.addWidget(subtitle)
+        txt.addWidget(self.title)
+        txt.addWidget(self.subtitle)
         top.addLayout(txt)
         top.addStretch(1)
         top.addWidget(btn)
 
         lay = QVBoxLayout(self)
         lay.addLayout(top)
-        lay.addWidget(table)
+        lay.addWidget(self.table)
         lay.setContentsMargins(16, 16, 16, 16)
         lay.setSpacing(12)
+    
+    def load_tomorrow_fabrication_modules(self, data: list):
+        """
+        Load modules that start fabrication tomorrow into the table.
+        
+        Args:
+            data: List of tuples/dicts with (module_id, start_datetime_str, duration, production_start_index)
+                  or list of dicts with keys: Module_ID, Fabrication_Start_Time, Production_Duration, Production_Start
+        """
+        self.table.setRowCount(0)  # Clear existing rows
+        
+        if not data:
+            # Show empty state message
+            self.table.setRowCount(1)
+            item = QTableWidgetItem("No modules scheduled for today")
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            item.setFlags(Qt.ItemFlag.NoItemFlags)  # Make it non-selectable
+            self.table.setItem(0, 0, item)
+            self.table.setSpan(0, 0, 1, 4)  # Span across all columns
+            return
+        
+        self.table.setRowCount(len(data))
+        
+        for r, row_data in enumerate(data):
+            # Handle both tuple and dict formats
+            if isinstance(row_data, dict):
+                module_id = str(row_data.get("Module_ID", ""))
+                start_time = str(row_data.get("Fabrication_Start_Time", ""))
+                duration = str(row_data.get("Production_Duration", ""))
+                prod_start_idx = str(row_data.get("Production_Start", ""))
+            else:
+                # Tuple format: (module_id, start_time, duration, prod_start_idx)
+                module_id = str(row_data[0]) if len(row_data) > 0 else ""
+                start_time = str(row_data[1]) if len(row_data) > 1 else ""
+                duration = str(row_data[2]) if len(row_data) > 2 else ""
+                prod_start_idx = str(row_data[3]) if len(row_data) > 3 else ""
+            
+            # Module ID
+            item_id = QTableWidgetItem(module_id)
+            item_id.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+            self.table.setItem(r, 0, item_id)
+            
+            # Fabrication Start Time
+            item_time = QTableWidgetItem(start_time)
+            item_time.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(r, 1, item_time)
+            
+            # Fabrication Duration
+            item_dur = QTableWidgetItem(duration)
+            item_dur.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(r, 2, item_dur)
+            
+            # Production Start Index (hidden column, for reference - hide this column from display)
+            item_idx = QTableWidgetItem(prod_start_idx)
+            item_idx.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(r, 3, item_idx)
+        
+        # Hide the Production Start Index column (column 3) as it's for internal reference only
+        self.table.setColumnHidden(3, True)
 
 
 class StatusCell(QWidget):
