@@ -531,15 +531,24 @@ class PrefabScheduler:
                 install_start = solution['installation_start'].get(i)
                 arrival_time = solution['arrival_time'].get(i)
                 prod_start = solution['production_start'].get(i)
-                prod_finish = prod_start + self.D.get(i, 0) - 1 if prod_start else None
+                prod_duration = self.D.get(i, 0)
+                prod_finish = prod_start + prod_duration if prod_start else None  # No -1: prod_finish is the time index when production ends
                 factory_wait_start = prod_finish
                 onsite_wait_start = arrival_time
-                onsite_wait_duration = install_start - onsite_wait_start
+                onsite_wait_duration = install_start - onsite_wait_start  # Duration is the difference between time indices
                 transport_duration = self.L.get(i, 0)
                 transport_start = arrival_time - transport_duration if arrival_time else None
-                factory_wait_duration = transport_start - factory_wait_start
+                factory_wait_duration = transport_start - factory_wait_start  # Duration is the difference between time indices
                 install_duration = self.d.get(i, 0)
-                install_finish = install_start + install_duration - 1 if install_start else None
+                install_finish = install_start + install_duration if install_start else None  # No -1: install_finish is the time index when installation ends
+                
+                # Debug: Print when factory_wait_duration is 1 to understand why
+                if factory_wait_duration == 1 and prod_start is not None and arrival_time is not None:
+                    print(f"[DEBUG Factory Wait] Module {module_id} (index {i}):")
+                    print(f"  - prod_start: {prod_start}, prod_duration: {prod_duration}, prod_finish: {prod_finish}")
+                    print(f"  - arrival_time: {arrival_time}, transport_duration: {transport_duration}, transport_start: {transport_start}")
+                    print(f"  - factory_wait_start: {factory_wait_start}, factory_wait_duration: {factory_wait_duration}")
+                    print(f"  - Check: transport_start ({transport_start}) - factory_wait_start ({factory_wait_start}) = {factory_wait_duration}")
                 
                 results_data.append({
                     'Module_ID': module_id,

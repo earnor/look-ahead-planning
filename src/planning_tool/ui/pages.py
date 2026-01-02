@@ -1662,6 +1662,11 @@ class ComparisonPage(QWidget):
         factory_storage_module_days = 0
         if len(factory_wait_col) > 0:
             factory_storage_module_days = float(factory_wait_col.fillna(0).sum())  # Convert to days
+            print(f"[DEBUG] Factory Storage Module Days calculation:")
+            print(f"  - factory_wait_col length: {len(factory_wait_col)}")
+            print(f"  - factory_wait_col values: {factory_wait_col.tolist()}")
+            print(f"  - factory_wait_col sum (after fillna): {factory_wait_col.fillna(0).sum()}")
+            print(f"  - factory_storage_module_days: {factory_storage_module_days}")
         
         # Site Storage Module Days: sum of Onsite_Wait_Duration
         onsite_wait_col = solution_df.get('Onsite_Wait_Duration', pd.Series())
