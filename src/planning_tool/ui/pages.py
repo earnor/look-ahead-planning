@@ -30,8 +30,11 @@ import matplotlib
 matplotlib.use('Qt5Agg')  # Use Qt5Agg backend for PyQt6
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
 import numpy as np
 from datetime import datetime, date, time, timedelta
+from typing import Optional, Union, List
 
 
 class DashboardPage(QWidget):
@@ -1798,28 +1801,28 @@ class ComparisonPage(QWidget):
         y_positions = np.arange(num_modules)
         
         # Find time range (time index mode)
-        min_time = float('inf')
-        max_time = float('-inf')
+        min_time_num = float('inf')
+        max_time_num = float('-inf')
         
         for _, row in solution_df.iterrows():
             prod_start = row.get('Production_Start')
             if pd.notna(prod_start):
-                min_time = min(min_time, float(prod_start))
+                min_time_num = min(min_time_num, float(prod_start))
             
             inst_finish = row.get('Installation_Finish')
             if pd.notna(inst_finish):
-                max_time = max(max_time, float(inst_finish))
+                max_time_num = max(max_time_num, float(inst_finish))
         
-        if min_time == float('inf'):
-            min_time = 0
-        if max_time == float('-inf'):
-            max_time = 100
+        if min_time_num == float('inf'):
+            min_time_num = 0
+        if max_time_num == float('-inf'):
+            max_time_num = 100
         
-        time_range = max_time - min_time
+        time_range = max_time_num - min_time_num
         if time_range == 0:
             time_range = 1
         padding = time_range * 0.1
-        ax.set_xlim(min_time - padding, max_time + padding)
+        ax.set_xlim(min_time_num - padding, max_time_num + padding)
         
         # Draw bars for each module
         bar_height = 0.6
@@ -1836,64 +1839,47 @@ class ComparisonPage(QWidget):
             install_start_val = row.get('Installation_Start')
             install_dur_val = row.get('Installation_Duration', 0)
             
-            # Convert to numeric values (simple time index)
+            # Calculate finish times (time indices)
+            prod_finish_idx = None
+            if pd.notna(prod_start_val) and pd.notna(prod_dur_val) and prod_dur_val > 0:
+                prod_finish_idx = int(prod_start_val) + int(prod_dur_val)
+            
+            install_finish_idx = None
+            if pd.notna(install_start_val) and pd.notna(install_dur_val) and install_dur_val > 0:
+                install_finish_idx = int(install_start_val) + int(install_dur_val)
+            
+            # Helper function to draw bar from start to end (time index mode)
+            def draw_bar_from_to_num(start_num: Optional[float], end_num: Optional[float], color: str):
+                """Draw a horizontal bar from start_num to end_num (time index)"""
+                if start_num is not None and end_num is not None:
+                    duration_num = end_num - start_num
+                    if duration_num > 0:
+                        ax.barh(y_pos, duration_num, left=start_num, height=bar_height,
+                               color=color, edgecolor='white', linewidth=0.5)
+            
+            # Convert to numeric values (time index mode)
             prod_start_num = float(prod_start_val) if pd.notna(prod_start_val) else None
+            prod_finish_num = float(prod_finish_idx) if prod_finish_idx else None
             transport_start_num = float(transport_start_val) if pd.notna(transport_start_val) else None
             arrival_time_num = float(arrival_time_val) if pd.notna(arrival_time_val) else None
             install_start_num = float(install_start_val) if pd.notna(install_start_val) else None
+            install_finish_num = float(install_finish_idx) if install_finish_idx else None
             
-            # Calculate end times
-            # In model.py: prod_finish = prod_start + Production_Duration - 1
-            prod_end_num = None
-            if pd.notna(prod_start_val) and pd.notna(prod_dur_val) and prod_dur_val > 0:
-                prod_end_num = float(int(prod_start_val) + int(prod_dur_val) - 1)
+            # Draw all bars using time index (directly from start to end)
+            # 1. Production (from prod_start to prod_finish)
+            draw_bar_from_to_num(prod_start_num, prod_finish_num, colors['production'])
             
-            install_end_num = None
-            if pd.notna(install_start_val) and pd.notna(install_dur_val) and install_dur_val > 0:
-                install_end_num = float(int(install_start_val) + int(install_dur_val) - 1)
+            # 2. Factory Storage (from prod_finish to transport_start)
+            draw_bar_from_to_num(prod_finish_num, transport_start_num, colors['factory_storage'])
             
-            # Draw all bars in order
-            # 1. Production
-            if prod_start_num is not None and prod_end_num is not None:
-                prod_dur_num = prod_end_num - prod_start_num + 1  # +1 because both start and end are inclusive
-                if prod_dur_num > 0:
-                    ax.barh(y_pos, prod_dur_num, left=prod_start_num, height=bar_height,
-                           color=colors['production'], edgecolor='white', linewidth=0.5)
+            # 3. Transport (from transport_start to arrival_time)
+            draw_bar_from_to_num(transport_start_num, arrival_time_num, colors['transport'])
             
-            # 2. Factory Storage (from Production end + 1 to Transport_Start - 1)
-            if prod_end_num is not None and transport_start_num is not None:
-                factory_storage_start_num = prod_end_num + 1
-                factory_storage_end_num = transport_start_num - 1
-                if factory_storage_end_num >= factory_storage_start_num:
-                    factory_storage_dur_num = factory_storage_end_num - factory_storage_start_num + 1
-                    if factory_storage_dur_num > 0:
-                        ax.barh(y_pos, factory_storage_dur_num, left=factory_storage_start_num, height=bar_height,
-                               color=colors['factory_storage'], edgecolor='white', linewidth=0.5)
+            # 4. Site Storage (from arrival_time to install_start)
+            draw_bar_from_to_num(arrival_time_num, install_start_num, colors['site_storage'])
             
-            # 3. Transport (from Transport_Start to Arrival_Time - 1)
-            if transport_start_num is not None and arrival_time_num is not None:
-                transport_end_num = arrival_time_num - 1
-                if transport_end_num >= transport_start_num:
-                    transport_dur_num = transport_end_num - transport_start_num + 1
-                    if transport_dur_num > 0:
-                        ax.barh(y_pos, transport_dur_num, left=transport_start_num, height=bar_height,
-                               color=colors['transport'], edgecolor='white', linewidth=0.5)
-            
-            # 4. Site Storage (from Arrival_Time to Installation_Start - 1)
-            if arrival_time_num is not None and install_start_num is not None:
-                site_storage_end_num = install_start_num - 1
-                if site_storage_end_num >= arrival_time_num:
-                    site_storage_dur_num = site_storage_end_num - arrival_time_num + 1
-                    if site_storage_dur_num > 0:
-                        ax.barh(y_pos, site_storage_dur_num, left=arrival_time_num, height=bar_height,
-                               color=colors['site_storage'], edgecolor='white', linewidth=0.5)
-            
-            # 5. Installation
-            if install_start_num is not None and install_end_num is not None:
-                install_dur_num = install_end_num - install_start_num + 1  # +1 because both start and end are inclusive
-                if install_dur_num > 0:
-                    ax.barh(y_pos, install_dur_num, left=install_start_num, height=bar_height,
-                           color=colors['installation'], edgecolor='white', linewidth=0.5)
+            # 5. Installation (from install_start to install_finish)
+            draw_bar_from_to_num(install_start_num, install_finish_num, colors['installation'])
         
         # Set y-axis labels with smaller font size for better readability
         ax.set_yticks(y_positions)
