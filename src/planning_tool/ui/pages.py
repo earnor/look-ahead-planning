@@ -8,6 +8,7 @@ This module contains all main page widgets for the application:
 - SettingsPage: Project settings configuration
 - ComparisonPage: Schedule comparison page with Gantt charts and metrics
 """
+from functools import reduce
 from PyQt6.QtCore import Qt, pyqtSignal, QDate
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
@@ -30,6 +31,7 @@ matplotlib.use('Qt5Agg')  # Use Qt5Agg backend for PyQt6
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import numpy as np
+from datetime import datetime, date, time, timedelta
 
 
 class DashboardPage(QWidget):
@@ -63,35 +65,35 @@ class DashboardPage(QWidget):
         top_row.setSpacing(12)
         
         # Planned vs Actual - neutral styling
-        card1 = KpiCard(
+        self.card_planned_vs_actual = KpiCard(
             "Planned vs Actual",
-            "92%",
-            "On schedule",
-            "+3%",
+            "N/A",
+            "",
+            "",
             accent_color=""  # No accent color for neutral metric
         )
         
         # Critical Tasks - orange accent for warning
-        card2 = KpiCard(
+        self.card_critical_tasks = KpiCard(
             "Critical Tasks",
-            "12",
+            "0",
             "Requiring attention",
-            "-2",
+            "",
             accent_color="#F59E0B"  # Orange accent
         )
         
-        # Delay Days - red accent for critical
-        card3 = KpiCard(
-            "Delay Days",
-            "23",
-            "Total across project",
-            "+5",
-            accent_color="#DC2626"  # Red accent
+        # Start Date - neutral styling
+        self.card_start_date = KpiCard(
+            "Start Date",
+            "N/A",
+            "",
+            "",
+            accent_color=""  # No accent color for neutral metric
         )
         
-        top_row.addWidget(card1)
-        top_row.addWidget(card2)
-        top_row.addWidget(card3)
+        top_row.addWidget(self.card_planned_vs_actual)
+        top_row.addWidget(self.card_critical_tasks)
+        top_row.addWidget(self.card_start_date)
         main_layout.addLayout(top_row)
 
         # Middle row: 3 status cards
@@ -99,35 +101,35 @@ class DashboardPage(QWidget):
         middle_row.setSpacing(12)
         
         # Forecast Completion - neutral styling
-        card4 = KpiCard(
+        self.card_forecast_completion = KpiCard(
             "Forecast Completion",
-            "Dec 15, 2025",
-            "3 days behind baseline",
+            "N/A",
+            "",
             "",
             accent_color=""
         )
         
         # Factory Storage Modules - neutral styling
-        card5 = KpiCard(
+        self.card_factory_storage = KpiCard(
             "Factory Storage Modules",
-            "2",
+            "0",
             "Ready for transport",
             "",
             accent_color=""
         )
         
         # Site Storage Modules - neutral styling
-        card6 = KpiCard(
+        self.card_site_storage = KpiCard(
             "Site Storage Modules",
-            "1",
+            "0",
             "Awaiting installation",
             "",
             accent_color=""
         )
         
-        middle_row.addWidget(card4)
-        middle_row.addWidget(card5)
-        middle_row.addWidget(card6)
+        middle_row.addWidget(self.card_forecast_completion)
+        middle_row.addWidget(self.card_factory_storage)
+        middle_row.addWidget(self.card_site_storage)
         main_layout.addLayout(middle_row)
 
         # Bottom section: What's Late This Week table
@@ -1382,6 +1384,8 @@ class ComparisonPage(QWidget):
         self.project_id = None
         # Store version_id mapping (combo index -> version_id)
         self.version_id_map = {}
+        # Reference to MainWindow (set by MainWindow)
+        self.main_window = None
 
         version_layout.addLayout(upper_version_layout)
         version_layout.addStretch(1)
@@ -1744,6 +1748,11 @@ class ComparisonPage(QWidget):
         3. Transport (from Transport_Start, duration Transport_Duration, to Arrival_Time)
         4. Site Storage (from Arrival_Time to Installation_Start)
         5. Installation (from Installation_Start, duration Installation_Duration, to Installation_Finish)
+        
+        Args:
+            canvas: Matplotlib canvas
+            solution_df: DataFrame with solution data (time indices)
+            version_label: Label for the version
         """
         if solution_df.empty:
             # Clear and show empty message
@@ -1783,7 +1792,7 @@ class ComparisonPage(QWidget):
         # Calculate y positions (one row per module)
         y_positions = np.arange(num_modules)
         
-        # Find overall time range
+        # Find time range (time index mode)
         min_time = float('inf')
         max_time = float('-inf')
         
@@ -1809,69 +1818,76 @@ class ComparisonPage(QWidget):
         
         # Draw bars for each module
         bar_height = 0.6
+        
         for idx, (_, row) in enumerate(solution_df.iterrows()):
             y_pos = y_positions[idx]
             module_id = str(row.get('Module_ID', ''))
             
-            # Initialize variables
-            prod_start = None
-            prod_dur = 0
-            prod_end = None
-            transport_start = None
-            transport_dur = 0
-            arrival_time = None
-            install_start = None
-            install_dur = 0
-            
-            # 1. Production
+            # Get time indices
             prod_start_val = row.get('Production_Start')
             prod_dur_val = row.get('Production_Duration', 0)
-            if pd.notna(prod_start_val) and pd.notna(prod_dur_val) and prod_dur_val > 0:
-                prod_start = float(prod_start_val)
-                prod_dur = float(prod_dur_val)
-                ax.barh(y_pos, prod_dur, left=prod_start, height=bar_height,
-                       color=colors['production'], edgecolor='white', linewidth=0.5)
-                prod_end = prod_start + prod_dur
-            
-            # 2. Factory Storage (from Production end to Transport_Start)
             transport_start_val = row.get('Transport_Start')
-            if pd.notna(transport_start_val):
-                transport_start = float(transport_start_val)
-                if prod_end is not None and transport_start > prod_end:
-                    factory_storage_dur = transport_start - prod_end
-                    if factory_storage_dur > 0:
-                        ax.barh(y_pos, factory_storage_dur, left=prod_end, height=bar_height,
-                               color=colors['factory_storage'], edgecolor='white', linewidth=0.5)
-            
-            # 3. Transport
-            if transport_start is not None:
-                transport_dur_val = row.get('Transport_Duration', 0)
-                if pd.notna(transport_dur_val) and transport_dur_val > 0:
-                    transport_dur = float(transport_dur_val)
-                    ax.barh(y_pos, transport_dur, left=transport_start, height=bar_height,
-                           color=colors['transport'], edgecolor='white', linewidth=0.5)
-            
-            # 4. Site Storage (from Arrival_Time to Installation_Start)
             arrival_time_val = row.get('Arrival_Time')
             install_start_val = row.get('Installation_Start')
-            if pd.notna(arrival_time_val):
-                arrival_time = float(arrival_time_val)
-                if pd.notna(install_start_val):
-                    install_start = float(install_start_val)
-                    if install_start > arrival_time:
-                        site_storage_dur = install_start - arrival_time
-                        if site_storage_dur > 0:
-                            ax.barh(y_pos, site_storage_dur, left=arrival_time, height=bar_height,
-                                   color=colors['site_storage'], edgecolor='white', linewidth=0.5)
+            install_dur_val = row.get('Installation_Duration', 0)
+            
+            # Convert to numeric values (simple time index)
+            prod_start_num = float(prod_start_val) if pd.notna(prod_start_val) else None
+            transport_start_num = float(transport_start_val) if pd.notna(transport_start_val) else None
+            arrival_time_num = float(arrival_time_val) if pd.notna(arrival_time_val) else None
+            install_start_num = float(install_start_val) if pd.notna(install_start_val) else None
+            
+            # Calculate end times
+            # In model.py: prod_finish = prod_start + Production_Duration - 1
+            prod_end_num = None
+            if pd.notna(prod_start_val) and pd.notna(prod_dur_val) and prod_dur_val > 0:
+                prod_end_num = float(int(prod_start_val) + int(prod_dur_val) - 1)
+            
+            install_end_num = None
+            if pd.notna(install_start_val) and pd.notna(install_dur_val) and install_dur_val > 0:
+                install_end_num = float(int(install_start_val) + int(install_dur_val) - 1)
+            
+            # Draw all bars in order
+            # 1. Production
+            if prod_start_num is not None and prod_end_num is not None:
+                prod_dur_num = prod_end_num - prod_start_num + 1  # +1 because both start and end are inclusive
+                if prod_dur_num > 0:
+                    ax.barh(y_pos, prod_dur_num, left=prod_start_num, height=bar_height,
+                           color=colors['production'], edgecolor='white', linewidth=0.5)
+            
+            # 2. Factory Storage (from Production end + 1 to Transport_Start - 1)
+            if prod_end_num is not None and transport_start_num is not None:
+                factory_storage_start_num = prod_end_num + 1
+                factory_storage_end_num = transport_start_num - 1
+                if factory_storage_end_num >= factory_storage_start_num:
+                    factory_storage_dur_num = factory_storage_end_num - factory_storage_start_num + 1
+                    if factory_storage_dur_num > 0:
+                        ax.barh(y_pos, factory_storage_dur_num, left=factory_storage_start_num, height=bar_height,
+                               color=colors['factory_storage'], edgecolor='white', linewidth=0.5)
+            
+            # 3. Transport (from Transport_Start to Arrival_Time - 1)
+            if transport_start_num is not None and arrival_time_num is not None:
+                transport_end_num = arrival_time_num - 1
+                if transport_end_num >= transport_start_num:
+                    transport_dur_num = transport_end_num - transport_start_num + 1
+                    if transport_dur_num > 0:
+                        ax.barh(y_pos, transport_dur_num, left=transport_start_num, height=bar_height,
+                               color=colors['transport'], edgecolor='white', linewidth=0.5)
+            
+            # 4. Site Storage (from Arrival_Time to Installation_Start - 1)
+            if arrival_time_num is not None and install_start_num is not None:
+                site_storage_end_num = install_start_num - 1
+                if site_storage_end_num >= arrival_time_num:
+                    site_storage_dur_num = site_storage_end_num - arrival_time_num + 1
+                    if site_storage_dur_num > 0:
+                        ax.barh(y_pos, site_storage_dur_num, left=arrival_time_num, height=bar_height,
+                               color=colors['site_storage'], edgecolor='white', linewidth=0.5)
             
             # 5. Installation
-            if install_start is None and pd.notna(install_start_val):
-                install_start = float(install_start_val)
-            if install_start is not None:
-                install_dur_val = row.get('Installation_Duration', 0)
-                if pd.notna(install_dur_val) and install_dur_val > 0:
-                    install_dur = float(install_dur_val)
-                    ax.barh(y_pos, install_dur, left=install_start, height=bar_height,
+            if install_start_num is not None and install_end_num is not None:
+                install_dur_num = install_end_num - install_start_num + 1  # +1 because both start and end are inclusive
+                if install_dur_num > 0:
+                    ax.barh(y_pos, install_dur_num, left=install_start_num, height=bar_height,
                            color=colors['installation'], edgecolor='white', linewidth=0.5)
         
         # Set y-axis labels with smaller font size for better readability
@@ -2107,6 +2123,8 @@ class ComparisonPage(QWidget):
             
         except Exception as e:
             print(f"Error loading Gantt data: {e}")
+            import traceback
+            traceback.print_exc()
             # Draw empty charts on error
             self._draw_gantt_chart(self.upper_gantt_canvas, pd.DataFrame(), "Upper Version")
             self._draw_gantt_chart(self.lower_gantt_canvas, pd.DataFrame(), "Lower Version")

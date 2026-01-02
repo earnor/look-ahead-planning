@@ -113,6 +113,20 @@ class KpiCard(QFrame):
         
         main_layout.addLayout(content_layout)
         self.setLayout(main_layout)
+        
+        # Store label references for later updates
+        self._value_lbl = value_lbl
+        self._subtitle_lbl = sub_lbl
+        self._trend_lbl = trend_lbl
+    
+    def update(self, value: str = None, subtitle: str = None, trend: str = None):
+        """Update KPI card values"""
+        if value is not None:
+            self._value_lbl.setText(value)
+        if subtitle is not None:
+            self._subtitle_lbl.setText(subtitle)
+        if trend is not None:
+            self._trend_lbl.setText(trend)
 
 
 class AspectRatioPixmapLabel(QLabel):

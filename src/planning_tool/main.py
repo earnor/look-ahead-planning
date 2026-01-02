@@ -80,6 +80,8 @@ class MainWindow(QMainWindow):
         try:
             page_comparison = ComparisonPage()
             self.page_comparison = page_comparison
+            # Store reference to MainWindow in ComparisonPage for accessing settings and methods
+            page_comparison.main_window = self
         except NameError:
             page_comparison = QLabel("Comparison"); page_comparison.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.page_comparison = None
@@ -1546,6 +1548,11 @@ class MainWindow(QMainWindow):
             # Load data into table
             if hasattr(self.page_dashboard, "table"):
                 self.page_dashboard.table.load_tomorrow_fabrication_modules(table_data)
+            
+            # Calculate and update key metrics
+            self._update_dashboard_metrics(
+                df_sol, max_version_id, slots, start_date, today_date, settings, inspector
+            )
                 
         except Exception as e:
             print(f"Error loading dashboard data: {e}")
@@ -1553,6 +1560,174 @@ class MainWindow(QMainWindow):
             traceback.print_exc()
             if hasattr(self.page_dashboard, "table"):
                 self.page_dashboard.table.load_tomorrow_fabrication_modules([])
+    
+    def _update_dashboard_metrics(self, df_sol: pd.DataFrame, max_version_id: int, 
+                                  slots: list, start_date: datetime.date, today_date: datetime.date,
+                                  settings: dict, inspector):
+        """Calculate and update dashboard key metrics"""
+        if not hasattr(self.page_dashboard, "card_planned_vs_actual"):
+            return  # Cards not initialized yet
+        
+        try:
+            from sqlalchemy import text
+            from calendar import month_abbr
+            
+            solution_table = self.mgr.solution_table_name(self.current_project_id)
+            versions_table = self.mgr.optimization_versions_table_name(self.current_project_id)
+            delay_table = ScheduleDataManager.delay_updates_table_name(self.current_project_id)
+            summary_table = self.mgr.summary_table_name(self.current_project_id)
+            
+            # Re-query solution data to ensure we're using the correct version_id
+            query = f'SELECT * FROM "{solution_table}" WHERE version_id = :version_id'
+            df_sol = pd.read_sql(text(query), self.engine, params={"version_id": max_version_id})
+            
+            if df_sol.empty:
+                return  # No data for this version, skip metrics update
+            
+            # Helper function to format date as "Dec, 15, 2025"
+            def format_date_as_month_day_year(dt: datetime.date) -> str:
+                """Format date as 'Dec, 15, 2025'"""
+                month_name = month_abbr[dt.month]
+                return f"{month_name}, {dt.day}, {dt.year}"
+            
+            # Helper function to convert time index to date
+            def idx_to_date(idx: int) -> datetime.date:
+                if idx is None or idx <= 0 or idx >= len(slots):
+                    return None
+                return slots[idx].date()
+            
+            # Calculate current time index from current datetime
+            # Use the last time index <= current_datetime (most accurate for completed status)
+            current_datetime = datetime.now()
+            current_time_idx = None
+            # Find the last time index <= current_datetime
+            for idx in range(1, len(slots)):
+                if slots[idx] is not None and slots[idx] <= current_datetime:
+                    current_time_idx = idx
+                elif slots[idx] is not None and slots[idx] > current_datetime:
+                    break
+            
+            # If current_datetime is before all slots, use index 1
+            if current_time_idx is None:
+                current_time_idx = 1 if len(slots) > 1 else None
+            
+            # 1. Planned vs Actual: completed modules / total modules
+            total_modules = len(df_sol)
+            completed_modules = 0
+            if current_time_idx is not None and 'Installation_Finish' in df_sol.columns:
+                for _, row in df_sol.iterrows():
+                    install_finish_idx = row.get('Installation_Finish')
+                    if pd.notna(install_finish_idx) and int(install_finish_idx) <= current_time_idx:
+                        completed_modules += 1
+            
+            planned_vs_actual_pct = (completed_modules / total_modules * 100) if total_modules > 0 else 0
+            planned_vs_actual_str = f"{planned_vs_actual_pct:.0f}%"
+            
+            # 2. Critical Tasks: count of delays
+            critical_tasks_count = 0
+            if delay_table in inspector.get_table_names():
+                try:
+                    delay_count_query = f'SELECT COUNT(*) FROM "{delay_table}" WHERE version_id = :version_id'
+                    delay_count_result = pd.read_sql(text(delay_count_query), self.engine, params={"version_id": max_version_id})
+                    critical_tasks_count = delay_count_result.iloc[0, 0] if not delay_count_result.empty else 0
+                except Exception:
+                    pass
+            
+            # Update Planned vs Actual with subtitle based on delays
+            planned_vs_actual_subtitle = "Delayed" if critical_tasks_count > 0 else ""
+            self.page_dashboard.card_planned_vs_actual.update(
+                value=planned_vs_actual_str,
+                subtitle=planned_vs_actual_subtitle
+            )
+            
+            self.page_dashboard.card_critical_tasks.update(
+                value=str(critical_tasks_count),
+                subtitle="Requiring attention" if critical_tasks_count > 0 else "No delays"
+            )
+            
+            # 3. Start Date: project start date from version record, formatted as "Dec, 15, 2025"
+            start_date_str = "N/A"
+            if versions_table in inspector.get_table_names():
+                try:
+                    start_date_query = f'SELECT project_start_datetime FROM "{versions_table}" WHERE version_id = :version_id'
+                    start_date_result = pd.read_sql(text(start_date_query), self.engine, params={"version_id": max_version_id})
+                    if not start_date_result.empty and pd.notna(start_date_result.iloc[0]['project_start_datetime']):
+                        start_date_str_db = start_date_result.iloc[0]['project_start_datetime']
+                        # Parse date string (format: "MM/DD/YYYY")
+                        try:
+                            fmt = "%m/%d/%Y"
+                            start_date_dt = datetime.strptime(start_date_str_db, fmt)
+                            start_date_str = format_date_as_month_day_year(start_date_dt.date())
+                        except ValueError:
+                            pass
+                except Exception:
+                    pass
+            
+            self.page_dashboard.card_start_date.update(
+                value=start_date_str,
+                subtitle=""
+            )
+            
+            # 4. Forecast Completion: project finish date from solution table (max version)
+            forecast_completion_str = "N/A"
+            if 'Installation_Finish' in df_sol.columns:
+                try:
+                    install_finish_col = df_sol['Installation_Finish'].dropna()
+                    if len(install_finish_col) > 0:
+                        finish_time_idx = int(install_finish_col.max())
+                        finish_date = idx_to_date(finish_time_idx)
+                        if finish_date:
+                            forecast_completion_str = format_date_as_month_day_year(finish_date)
+                except Exception:
+                    pass
+            
+            self.page_dashboard.card_forecast_completion.update(
+                value=forecast_completion_str,
+                subtitle=""
+            )
+            
+            # 5. Factory Storage Modules: modules currently in factory storage
+            factory_storage_count = 0
+            if current_time_idx is not None:
+                if 'Factory_Wait_Start' in df_sol.columns and 'Factory_Wait_Duration' in df_sol.columns:
+                    for _, row in df_sol.iterrows():
+                        factory_wait_start = row.get('Factory_Wait_Start')
+                        factory_wait_duration = row.get('Factory_Wait_Duration')
+                        if pd.notna(factory_wait_start) and pd.notna(factory_wait_duration):
+                            factory_wait_start_idx = int(factory_wait_start)
+                            factory_wait_end_idx = factory_wait_start_idx + int(factory_wait_duration)
+                            # Module is in factory storage if current time is within wait period
+                            if factory_wait_start_idx <= current_time_idx < factory_wait_end_idx:
+                                factory_storage_count += 1
+            
+            self.page_dashboard.card_factory_storage.update(
+                value=str(factory_storage_count),
+                subtitle="Ready for transport"
+            )
+            
+            # 6. Site Storage Modules: modules currently in site storage
+            site_storage_count = 0
+            if current_time_idx is not None:
+                if 'Onsite_Wait_Start' in df_sol.columns and 'Onsite_Wait_Duration' in df_sol.columns:
+                    for _, row in df_sol.iterrows():
+                        onsite_wait_start = row.get('Onsite_Wait_Start')
+                        onsite_wait_duration = row.get('Onsite_Wait_Duration')
+                        if pd.notna(onsite_wait_start) and pd.notna(onsite_wait_duration):
+                            onsite_wait_start_idx = int(onsite_wait_start)
+                            onsite_wait_end_idx = onsite_wait_start_idx + int(onsite_wait_duration)
+                            # Module is in site storage if current time is within wait period
+                            if onsite_wait_start_idx <= current_time_idx < onsite_wait_end_idx:
+                                site_storage_count += 1
+            
+            self.page_dashboard.card_site_storage.update(
+                value=str(site_storage_count),
+                subtitle="Awaiting installation"
+            )
+            
+        except Exception as e:
+            print(f"Error updating dashboard metrics: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _on_delete_project_clicked(self):
         """Handler for delete project button click"""
