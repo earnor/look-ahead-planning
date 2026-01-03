@@ -1309,8 +1309,7 @@ class MainWindow(QMainWindow):
                     self.page_schedule.load_version_list(self.engine, self.current_project_id)
             # Load data for dashboard page when it's shown
             elif name == "dashboard" and hasattr(self, "page_dashboard") and self.page_dashboard:
-                if self.current_project_id is not None:
-                    self.load_dashboard_data()
+                self.load_dashboard_data()
     
     def _update_sidebar_selection(self, page_name: str):
         """Update sidebar button selection based on current page"""
@@ -1360,6 +1359,11 @@ class MainWindow(QMainWindow):
         if project_name and project_name in self.project_lookup:
             self.current_project_id = self.project_lookup[project_name]
             self.topbar.delete_project_btn.show()  # Show delete button when project is selected
+            # Refresh dashboard page if currently viewing it
+            if hasattr(self, "page_dashboard") and self.page_dashboard:
+                current_idx = self.stack.currentIndex()
+                if current_idx == self.page_index.get("dashboard"):
+                    self.load_dashboard_data()
             # Refresh comparison page version list if currently viewing it
             if hasattr(self, "page_comparison") and self.page_comparison:
                 current_idx = self.stack.currentIndex()
@@ -1373,6 +1377,11 @@ class MainWindow(QMainWindow):
         else:
             self.current_project_id = None
             self.topbar.delete_project_btn.hide()  # Hide delete button when no project selected
+            # Clear dashboard page if currently viewing it
+            if hasattr(self, "page_dashboard") and self.page_dashboard:
+                current_idx = self.stack.currentIndex()
+                if current_idx == self.page_index.get("dashboard"):
+                    self.load_dashboard_data()
             # Clear comparison page if currently viewing it
             if hasattr(self, "page_comparison") and self.page_comparison:
                 current_idx = self.stack.currentIndex()
@@ -1394,6 +1403,7 @@ class MainWindow(QMainWindow):
         combo.setCurrentText(project_name)
         self.current_project_id = project_id
         self.topbar.delete_project_btn.show()  # Show delete button when project exists
+        
     
     def load_dashboard_data(self):
         """Load data for dashboard page, specifically today's fabrication modules"""
@@ -1405,6 +1415,8 @@ class MainWindow(QMainWindow):
             if hasattr(self.page_dashboard, "table"):
                 self.page_dashboard.table.load_tomorrow_fabrication_modules([])
             return
+        else:
+            print(f"current_project_id: {self.current_project_id}")
         
         try:
             from sqlalchemy import inspect, text
@@ -1462,6 +1474,7 @@ class MainWindow(QMainWindow):
             # Parse start date - use saved value if available, otherwise fallback to current settings
             fmt = "%m/%d/%Y"
             start_str = saved_start_str if saved_start_str else settings.get("start_datetime", "")
+            print(f"start_str: {start_str}")
             if not start_str or start_str.lower() == "mm/dd/yyyy":
                 start_date = datetime.today().date()
             else:
@@ -1502,19 +1515,12 @@ class MainWindow(QMainWindow):
                     if slot_date == today_date:
                         today_indices.add(idx)
             
-            if not today_indices:
-                # No working slots today, show empty
-                if hasattr(self.page_dashboard, "table"):
-                    self.page_dashboard.table.load_tomorrow_fabrication_modules([])
-                return
-            
             # Query modules with Production_Start in today's time indices
-            df_today = df_sol[df_sol['Production_Start'].isin(today_indices)].copy()
-            
-            if df_today.empty:
-                if hasattr(self.page_dashboard, "table"):
-                    self.page_dashboard.table.load_tomorrow_fabrication_modules([])
-                return
+            if not today_indices:
+                # No working slots today, table will be empty
+                df_today = pd.DataFrame()
+            else:
+                df_today = df_sol[df_sol['Production_Start'].isin(today_indices)].copy()
             
             # Convert Production_Start to datetime string
             def idx_to_dt_str(idx: int) -> str:
