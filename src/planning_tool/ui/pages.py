@@ -1748,7 +1748,9 @@ class ComparisonPage(QWidget):
         canvas.setMinimumHeight(300)
         return canvas
     
-    def _draw_gantt_chart(self, canvas: FigureCanvas, solution_df: pd.DataFrame, version_label: str = ""):
+    def _draw_gantt_chart(self, canvas: FigureCanvas, solution_df: pd.DataFrame, version_label: str = "",
+                         settings: Optional[dict] = None,
+                         project_start_datetime: Optional[str] = None):
         """
         Draw Gantt chart with 5 phases:
         1. Production (from Production_Start, duration Production_Duration)
@@ -1761,6 +1763,8 @@ class ComparisonPage(QWidget):
             canvas: Matplotlib canvas
             solution_df: DataFrame with solution data (time indices)
             version_label: Label for the version
+            settings: Settings dictionary for building working calendar
+            project_start_datetime: Project start datetime string (format: "%m/%d/%Y")
         """
         if solution_df.empty:
             # Clear and show empty message
@@ -1786,7 +1790,10 @@ class ComparisonPage(QWidget):
             'installation': '#10B981'     # Green
         }
         
-        # Data is already sorted by Installation_Start when saved to database
+        # Sort by Production_Start (ascending - earliest first) to ensure proper order
+        if 'Production_Start' in solution_df.columns:
+            solution_df = solution_df.sort_values('Production_Start', ascending=True, na_position='last').reset_index(drop=True)
+        
         num_modules = len(solution_df)
         
         if num_modules == 0:
@@ -1798,7 +1805,8 @@ class ComparisonPage(QWidget):
             return
         
         # Calculate y positions (one row per module)
-        y_positions = np.arange(num_modules)
+        # Reverse the y positions so earliest fabrication starts appear at the top
+        y_positions = np.arange(num_modules)[::-1]  # Reverse: [n-1, n-2, ..., 1, 0]
         
         # Find time range (time index mode)
         min_time_num = float('inf')
@@ -1823,6 +1831,18 @@ class ComparisonPage(QWidget):
             time_range = 1
         padding = time_range * 0.1
         ax.set_xlim(min_time_num - padding, max_time_num + padding)
+        
+        # Build working calendar slots for time index to date conversion
+        working_calendar_slots = None
+        if settings and project_start_datetime and hasattr(self, 'main_window') and self.main_window:
+            try:
+                fmt = "%m/%d/%Y"
+                start_date = datetime.strptime(project_start_datetime, fmt).date()
+                # Determine max index needed based on actual data
+                max_idx = max(int(max_time_num), 1000)  # Use at least 1000, or actual max if larger
+                working_calendar_slots = self.main_window._build_working_calendar_slots(settings, start_date, max_idx)
+            except Exception as e:
+                print(f"Warning: Could not build working calendar slots: {e}")
         
         # Draw bars for each module
         bar_height = 0.6
@@ -1882,11 +1902,87 @@ class ComparisonPage(QWidget):
             draw_bar_from_to_num(install_start_num, install_finish_num, colors['installation'])
         
         # Set y-axis labels with smaller font size for better readability
+        # Labels should match the reversed order (earliest at top)
         ax.set_yticks(y_positions)
         module_labels = [str(row.get('Module_ID', '')) for _, row in solution_df.iterrows()]
         ax.set_yticklabels(module_labels)
+        # Set y-axis limits to match reversed positions (top to bottom: highest to lowest y value)
+        # y_positions is already reversed, so earliest (y=num_modules-1) appears at top
         ax.set_ylim(-0.5, num_modules - 0.5)
         
+        # Add date annotations: project start and finish dates
+        project_start_time_idx = 1  # Time index 1 corresponds to project start
+        project_finish_time_idx = None
+        
+        # Find the maximum actual finish time index (project finish)
+        # Note: Database stores Installation_Finish as (start + duration - 1), but 
+        # we draw bars with end position as (start + duration), so we need to calculate
+        # the actual visual end position to match what's drawn in the chart
+        max_visual_finish = float('-inf')
+        for _, row in solution_df.iterrows():
+            install_start_val = row.get('Installation_Start')
+            install_dur_val = row.get('Installation_Duration', 0)
+            if pd.notna(install_start_val) and pd.notna(install_dur_val) and install_dur_val > 0:
+                # Visual end position is start + duration (exclusive end, matches bar drawing)
+                visual_finish = int(install_start_val) + int(install_dur_val)
+                max_visual_finish = max(max_visual_finish, visual_finish)
+        
+        if max_visual_finish != float('-inf'):
+            project_finish_time_idx = int(max_visual_finish)
+        
+        # Convert time indices to dates if working_calendar_slots is available
+        project_start_date_str = None
+        project_finish_date_str = None
+        
+        if working_calendar_slots and len(working_calendar_slots) > project_start_time_idx:
+            try:
+                start_dt = working_calendar_slots[project_start_time_idx]
+                project_start_date_str = start_dt.strftime("%Y-%m-%d")
+            except (IndexError, AttributeError):
+                pass
+        
+        if working_calendar_slots and project_finish_time_idx and len(working_calendar_slots) > project_finish_time_idx:
+            try:
+                finish_dt = working_calendar_slots[project_finish_time_idx]
+                if finish_dt is not None:
+                    project_finish_date_str = finish_dt.strftime("%Y-%m-%d")
+            except (IndexError, AttributeError, TypeError):
+                pass
+        
+        # Draw vertical reference lines for start and finish
+        ref_line_color = '#9CA3AF'
+        ref_line_alpha = 0.5
+        ref_line_style = '--'
+        ref_line_width = 1.5
+        
+        # Draw start reference line
+        if project_start_time_idx:
+            ax.axvline(x=project_start_time_idx, color=ref_line_color, alpha=ref_line_alpha,
+                      linestyle=ref_line_style, linewidth=ref_line_width, zorder=0)
+        
+        # Draw finish reference line
+        if project_finish_time_idx:
+            ax.axvline(x=project_finish_time_idx, color=ref_line_color, alpha=ref_line_alpha,
+                      linestyle=ref_line_style, linewidth=ref_line_width, zorder=0)
+        
+        # Add date labels at the top of reference lines
+        label_fontsize = 8
+        label_color = '#6B7280'
+        label_y_pos = num_modules - 0.3  # Position labels at the top
+        
+        if project_start_time_idx and project_start_date_str:
+            ax.text(project_start_time_idx, label_y_pos, f'Start: {project_start_date_str}',
+                   ha='center', va='bottom', fontsize=label_fontsize, color=label_color,
+                   bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor=ref_line_color,
+                            alpha=0.8, linewidth=0.5))
+        
+        if project_finish_time_idx and project_finish_date_str:
+            ax.text(project_finish_time_idx, label_y_pos, f'Finish: {project_finish_date_str}',
+                   ha='center', va='bottom', fontsize=label_fontsize, color=label_color,
+                   bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor=ref_line_color,
+                            alpha=0.8, linewidth=0.5))
+        
+
         # Labels and styling
         ax.set_xlabel('Time Index', fontsize=11, color='#374151')
         ax.set_ylabel('Module ID', fontsize=11, color='#374151')
@@ -1900,7 +1996,7 @@ class ComparisonPage(QWidget):
         ax.spines['bottom'].set_color('#E5E7EB')
         # Use smaller font size for y-axis labels (module IDs) for better readability
         ax.tick_params(axis='x', colors='#6B7280', labelsize=10)
-        ax.tick_params(axis='y', colors='#6B7280', labelsize=8)  # Smaller font for module IDs
+        ax.tick_params(axis='y', colors='#6B7280', labelsize=6)  # Smaller font for module IDs
         ax.grid(True, axis='x', linestyle='--', alpha=0.3, color='#D1D5DB')
         
         canvas.figure.tight_layout()
@@ -2028,49 +2124,61 @@ class ComparisonPage(QWidget):
             except Exception as e:
                 print(f"[DEBUG] Error checking available versions: {e}")
             
+            # Get settings and project_start_datetime for time conversion
+            # Try to get settings from main_window if available
+            settings = {}
+            if hasattr(self, 'main_window') and self.main_window:
+                settings = self.main_window._get_active_settings() or {}
+            
+            # Helper function to load version data and get project_start_datetime
+            def load_version_data(version_id, available_ids, table_name, versions_table_name):
+                df = pd.DataFrame()
+                label = "Version"
+                start_datetime = None
+                
+                if version_id is not None:
+                    if version_id in available_ids:
+                        # Load data for the specific version_id, sorted by Production_Start ASC (earliest first)
+                        query = f'SELECT * FROM "{table_name}" WHERE version_id = :version_id ORDER BY Production_Start ASC'
+                        df = pd.read_sql(text(query), self.engine, params={"version_id": version_id})
+                        # Get version label and project_start_datetime
+                        if versions_table_name in inspector.get_table_names():
+                            v_query = f'SELECT version_number, project_start_datetime FROM "{versions_table_name}" WHERE version_id = :version_id'
+                            v_result = pd.read_sql(text(v_query), self.engine, params={"version_id": version_id})
+                            if not v_result.empty:
+                                label = f"Version {v_result.iloc[0]['version_number']}"
+                                if pd.notna(v_result.iloc[0]['project_start_datetime']):
+                                    start_datetime = v_result.iloc[0]['project_start_datetime']
+                    else:
+                        label = f"Version {version_id} (No data)"
+                
+                return df, label, start_datetime
+            
             # Load upper version data
-            upper_df = pd.DataFrame()
-            upper_label = "Upper Version"
-            if upper_version_id is not None:
-                # Check if this version has data
-                if upper_version_id in available_version_ids:
-                    # Load data for the specific version_id
-                    query = f'SELECT * FROM "{solution_table}" WHERE version_id = :version_id ORDER BY Installation_Start ASC'
-                    upper_df = pd.read_sql(text(query), self.engine, params={"version_id": upper_version_id})
-                    # Get version label
-                    if versions_table in inspector.get_table_names():
-                        v_query = f'SELECT version_number FROM "{versions_table}" WHERE version_id = :version_id'
-                        v_result = pd.read_sql(text(v_query), self.engine, params={"version_id": upper_version_id})
-                        if not v_result.empty:
-                            upper_label = f"Version {v_result.iloc[0]['version_number']}"
+            upper_df, upper_label, upper_start_datetime = load_version_data(
+                upper_version_id, available_version_ids, solution_table, versions_table)
+            
+            if not upper_label or upper_label == "Version":
+                if self.upper_version_combo.count() > 0:
+                    upper_label = "Upper Version (Please select)"
                 else:
-                    # This version has no data, show empty state
-                    upper_label = f"Version {upper_version_id} (No data)"
-            elif self.upper_version_combo.count() > 0:
-                # No version selected but combobox has items - show empty state
-                upper_label = "Upper Version (Please select)"
+                    upper_label = "Upper Version"
             
             # Load lower version data
-            lower_df = pd.DataFrame()
-            lower_label = "Lower Version"
-            if lower_version_id is not None:
-                # Check if this version has data
-                if lower_version_id in available_version_ids:
-                    # Load data for the specific version_id
-                    query = f'SELECT * FROM "{solution_table}" WHERE version_id = :version_id ORDER BY Installation_Start ASC'
-                    lower_df = pd.read_sql(text(query), self.engine, params={"version_id": lower_version_id})
-                    # Get version label
-                    if versions_table in inspector.get_table_names():
-                        v_query = f'SELECT version_number FROM "{versions_table}" WHERE version_id = :version_id'
-                        v_result = pd.read_sql(text(v_query), self.engine, params={"version_id": lower_version_id})
-                        if not v_result.empty:
-                            lower_label = f"Version {v_result.iloc[0]['version_number']}"
+            lower_df, lower_label, lower_start_datetime = load_version_data(
+                lower_version_id, available_version_ids, solution_table, versions_table)
+            
+            if not lower_label or lower_label == "Version":
+                if self.lower_version_combo.count() > 0:
+                    lower_label = "Lower Version (Please select)"
                 else:
-                    # This version has no data, show empty state
-                    lower_label = f"Version {lower_version_id} (No data)"
-            elif self.lower_version_combo.count() > 0:
-                # No version selected but combobox has items - show empty state
-                lower_label = "Lower Version (Please select)"
+                    lower_label = "Lower Version"
+            
+            # Determine project_start_datetime (use upper version's if available, otherwise lower's)
+            project_start_datetime = upper_start_datetime or lower_start_datetime
+            
+            # Build working calendar slots if we have settings and start date
+            # We'll build it dynamically in _draw_gantt_chart based on actual data max index
             
             # Calculate metrics for both versions
             upper_metrics = self._calculate_metrics(upper_df)
@@ -2103,10 +2211,14 @@ class ComparisonPage(QWidget):
                     lower_metrics["transport_bunch_number"]
                 )
             
-            # Draw charts
+            # Draw charts with date annotations
             print(f"[DEBUG] Drawing charts...")
-            self._draw_gantt_chart(self.upper_gantt_canvas, upper_df, upper_label)
-            self._draw_gantt_chart(self.lower_gantt_canvas, lower_df, lower_label)
+            self._draw_gantt_chart(self.upper_gantt_canvas, upper_df, upper_label,
+                                  settings=settings,
+                                  project_start_datetime=upper_start_datetime or project_start_datetime)
+            self._draw_gantt_chart(self.lower_gantt_canvas, lower_df, lower_label,
+                                  settings=settings,
+                                  project_start_datetime=lower_start_datetime or project_start_datetime)
             # Force UI update
             from PyQt6.QtWidgets import QApplication
             QApplication.processEvents()

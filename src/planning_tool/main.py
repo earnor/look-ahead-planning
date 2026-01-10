@@ -756,7 +756,7 @@ class MainWindow(QMainWindow):
                         update_start_date_query = text(f'''
                             UPDATE "{versions_table}" 
                             SET project_start_datetime = :project_start_datetime
-                            WHERE version_id = :version_id AND (project_start_datetime IS NULL OR project_start_datetime = '')
+                            WHERE version_id = :version_id 
                         ''')
                         conn.execute(update_start_date_query, {
                             "project_start_datetime": start_str if start_str and start_str.lower() != "mm/dd/yyyy" else None,
