@@ -153,7 +153,8 @@ class PrefabScheduler:
         m.Params.Heuristics = 0.2     # 增强启发式（默认 0.05 左右）
         m.Params.Cuts = 0             # 如果节点过多，可以适当减弱 cuts
         # 利用多核
-        m.Params.Threads = 0   
+        m.Params.Threads = 0
+        m.setParam("Seed", 0)         # 设置随机种子为0   
 
         N, T = self.N, self.T
         d = self.d
@@ -598,8 +599,14 @@ class PrefabScheduler:
             )
             
             # Also create a summary table with project-level results
+            # ---- 版本累计策略 ----
+            # 为 optimization_summary_{project_id} 增加 version_id 字段，
+            # 不再整表 replace，而是：
+            #   - 按 version_id 维度累积多条记录（多版本并存）
+            #   - 如果同一 version_id 重新求解，则先删掉该 version_id 的旧记录，再追加新记录
             summary_data = [{
                 'project_id': project_id,
+                'version_id': version_id,
                 'objective_value': solution['objective'],
                 'status': solution['status'],
                 'project_finish_time': solution['project_finish_time'],
@@ -608,10 +615,31 @@ class PrefabScheduler:
             }]
             
             summary_df = pd.DataFrame(summary_data)
+
+            # 确保 summary 表存在 version_id 列，并按版本做“先删再插”
+            with engine.begin() as conn:
+                from sqlalchemy import inspect as _inspect_summary
+                inspector_summary = _inspect_summary(engine)
+                if summary_table in inspector_summary.get_table_names():
+                    # 表已存在：如果没有 version_id 列则新增
+                    summary_columns = [col['name'] for col in inspector_summary.get_columns(summary_table)]
+                    if 'version_id' not in summary_columns:
+                        conn.exec_driver_sql(f'ALTER TABLE "{summary_table}" ADD COLUMN version_id INTEGER')
+                    # 如果当前有 version_id（新架构下应总是如此），对同一版本先删除旧记录
+                    if version_id is not None:
+                        delete_summary = text(f'DELETE FROM "{summary_table}" WHERE version_id = :version_id')
+                        conn.execute(delete_summary, {"version_id": version_id})
+                    else:
+                        # 兼容旧数据：没有传 version_id 时，清理 version_id IS NULL 的记录
+                        delete_summary = text(f'DELETE FROM "{summary_table}" WHERE version_id IS NULL')
+                        conn.execute(delete_summary)
+                # 如果表不存在，则交给 to_sql 使用 append 自动建表
+
+            # 采用 append 方式写入，实现“版本累计”
             summary_df.to_sql(
                 summary_table,
                 engine,
-                if_exists='replace',
+                if_exists='append',
                 index=False
             )
             
