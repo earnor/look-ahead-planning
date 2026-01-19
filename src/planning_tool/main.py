@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import QDateTime, QTime, QDate, QLocale
 from pathlib import Path
 import sys
+import os
 import pandas as pd
 from sqlalchemy import create_engine, text, inspect
 from planning_tool.datamanager import ScheduleDataManager
@@ -17,6 +18,41 @@ from planning_tool.model import PrefabScheduler, estimate_time_horizon
 from planning_tool.rescheduler import load_delays_from_db, TaskStateIdentifier, DelayApplier, FixedConstraintsBuilder
 from datetime import datetime, time, timedelta
 import traceback
+
+def get_current_datetime() -> datetime:
+    """
+    Get current datetime for the system.
+    
+    For rolling optimization testing: can be overridden by environment variable TEST_REOPTIMIZE_DATETIME.
+    This makes the system "think" it's at a different time point, enabling simulation of project progress
+    at various time points without waiting for real time to advance.
+    
+    The simulated time affects:
+    - Task state identification (COMPLETED/IN_PROGRESS/NOT_STARTED)
+    - Fixed constraints for re-optimization
+    - Delay detection timing
+    - All time-based decisions in the system
+    
+    Format: "YYYY-MM-DD HH:MM" (e.g., "2026-01-19 09:00")
+    Returns system datetime.now() if TEST_REOPTIMIZE_DATETIME is not set.
+    """
+    test_time_str = os.getenv('TEST_REOPTIMIZE_DATETIME')
+    if test_time_str:
+        try:
+            # Try parsing with common datetime formats
+            for fmt in ["%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M"]:
+                try:
+                    test_datetime = datetime.strptime(test_time_str, fmt)
+                    print(f"[SIMULATION MODE] System using simulated current time: {test_datetime}")
+                    return test_datetime
+                except ValueError:
+                    continue
+            # If all formats fail, fall back to system time
+            print(f"[WARNING] Failed to parse TEST_REOPTIMIZE_DATETIME='{test_time_str}', using system time instead")
+        except Exception as e:
+            print(f"[WARNING] Error parsing TEST_REOPTIMIZE_DATETIME: {e}, using system time instead")
+    
+    return datetime.now()
 from planning_tool.ui import (
     DashboardPage, SchedulePage, UploadPage, SettingsPage, ComparisonPage,
     TopBar, Sidebar, DashboardTable, StatusCell,
@@ -473,6 +509,44 @@ class MainWindow(QMainWindow):
                         calculate_btn.setText(original_btn_text)
                     QMessageBox.warning(self, "No Base Solution", "No previous solution found. Please run initial optimization first.")
                     return
+
+                # IMPORTANT (Re-optimization): initialize duration dictionaries (D, L, I_d)
+                # from the latest base solution (df_base_solution), NOT from the raw input table.
+                #
+                # Reason:
+                # - Raw table contains original durations.
+                # - df_base_solution contains durations after previous re-optimizations (including DURATION_EXTENSION).
+                # If we always start from raw, a second re-optimization can unintentionally reset durations and
+                # "convert" the missing duration into storage/wait time instead.
+                try:
+                    # Build a quick lookup by Module_ID -> row (use first match if duplicates)
+                    _base_by_id = {}
+                    for _idx, _row in df_base_solution.iterrows():
+                        _mid = str(_row.get('Module_ID', '')).strip()
+                        if _mid and _mid not in _base_by_id:
+                            _base_by_id[_mid] = _row
+                    for _mid, _midx in id_to_index.items():
+                        _r = _base_by_id.get(_mid)
+                        if _r is None:
+                            continue
+
+                        # Production duration (D)
+                        _pd = _r.get('Production_Duration')
+                        if pd.notna(_pd):
+                            D[_midx] = int(_pd)
+
+                        # Transport duration (L)
+                        _td = _r.get('Transport_Duration')
+                        if pd.notna(_td):
+                            L[_midx] = int(_td)
+
+                        # Installation duration (I_d)
+                        _id = _r.get('Installation_Duration')
+                        if pd.notna(_id):
+                            I_d[_midx] = int(_id)
+                except Exception as e:
+                    # Non-fatal: fall back to raw-based durations (old behavior) if something unexpected happens
+                    print(f"[WARNING] (Reopt) Failed to initialize durations from base solution: {e}")
                 
                 # Debug safeguard
                 print(f"[Reopt] base_solution type={type(df_base_solution)} shape={getattr(df_base_solution, 'shape', None)}")
@@ -487,11 +561,28 @@ class MainWindow(QMainWindow):
                 )
                 working_calendar_slots = self._build_working_calendar_slots(settings, start_date, int(max_idx))
                 
+                # Print working calendar slots for debugging
+                print(f"\n[DEBUG] ========== Working Calendar Slots ==========")
+                print(f"[DEBUG] Total slots: {len(working_calendar_slots)} (index 0 is placeholder)")
+                if len(working_calendar_slots) > 1:
+                    print(f"[DEBUG] First 10 slots:")
+                    for idx in range(1, min(11, len(working_calendar_slots))):
+                        print(f"  [DEBUG]   Index {idx}: {working_calendar_slots[idx]}")
+                    if len(working_calendar_slots) > 11:
+                        print(f"  [DEBUG]   ...")
+                    if len(working_calendar_slots) > 20:
+                        print(f"[DEBUG] Last 10 slots:")
+                        for idx in range(max(1, len(working_calendar_slots) - 10), len(working_calendar_slots)):
+                            print(f"  [DEBUG]   Index {idx}: {working_calendar_slots[idx]}")
+                print(f"[DEBUG] ============================================\n")
+                
                 # Determine current_time (actual current time for re-optimization)
-                # Use system time or allow future extension for simulation time
-                current_datetime = datetime.now()
+                # Use get_current_datetime() which respects TEST_REOPTIMIZE_DATETIME for testing
+                current_datetime = get_current_datetime()
                 
                 # Convert current_datetime to time index
+                print(f"[DEBUG] Converting current_datetime to time index: {current_datetime}")
+                
                 current_time = None
                 for idx, slot_dt in enumerate(working_calendar_slots[1:], start=1):  # Skip index 0
                     if slot_dt >= current_datetime:
@@ -503,12 +594,23 @@ class MainWindow(QMainWindow):
                     # If current_datetime is before all slots, use index 1 (first slot)
                     if len(working_calendar_slots) > 1 and working_calendar_slots[1] > current_datetime:
                         current_time = 1
+                        print(f"[DEBUG] current_datetime is before first slot, using current_time = 1")
                     else:
                         current_time = len(working_calendar_slots) - 1
+                        print(f"[DEBUG] current_datetime is after last slot, using current_time = {current_time}")
+                else:
+                    print(f"[DEBUG] Found current_time = {current_time} for current_datetime = {current_datetime}")
+                    if current_time < len(working_calendar_slots):
+                        print(f"[DEBUG]   Slot at current_time: {working_calendar_slots[current_time]}")
+                    if current_time > 1:
+                        print(f"[DEBUG]   Previous slot: {working_calendar_slots[current_time - 1]}")
+                    if current_time + 1 < len(working_calendar_slots):
+                        print(f"[DEBUG]   Next slot: {working_calendar_slots[current_time + 1]}")
                 
                 # 2. Identify task states (based on current_time)
                 QApplication.processEvents()
-                state_identifier = TaskStateIdentifier(df_base_solution, current_time, working_calendar_slots)
+                # Pass current_datetime directly to ensure accurate time comparison for state identification
+                state_identifier = TaskStateIdentifier(df_base_solution, current_time, working_calendar_slots, current_datetime=current_datetime)
                 task_states = state_identifier.identify_all_states()
                 
                 # 3. Apply delays
@@ -519,6 +621,7 @@ class MainWindow(QMainWindow):
                 # 4. Update D, d, L dictionaries with delayed durations
                 # This ensures the optimizer uses the correct durations for tasks with DURATION_EXTENSION
                 # Only COMPLETED tasks keep original durations (they're already finished)
+                print(f"[DEBUG] Updating duration dictionaries (D, L, I_d) from modified_solution_df")
                 for _, row in modified_solution_df.iterrows():
                     module_id = str(row['Module_ID'])
                     if module_id in id_to_index:
@@ -538,6 +641,9 @@ class MainWindow(QMainWindow):
                                     # Only update if duration was actually changed (delay was applied)
                                     if pd.notna(new_duration) and new_duration != original_duration:
                                         D[module_idx] = int(new_duration)
+                                        print(f"[DEBUG] Updated D[{module_idx}] (FABRICATION) for {module_id}: {original_duration} -> {new_duration} (status: {state.status})")
+                                    elif state.status == "IN_PROGRESS":
+                                        print(f"[DEBUG] IN_PROGRESS FABRICATION {module_id}: new={new_duration}, orig={original_duration}, same={new_duration == original_duration if pd.notna(new_duration) else 'N/A'}")
                             elif state.phase == "TRANSPORT":
                                 if state.status != "COMPLETED":
                                     new_duration = row.get('Transport_Duration')
@@ -651,20 +757,58 @@ class MainWindow(QMainWindow):
                     fixed_production_starts=fixed_constraints.get('fixed_production_starts'),
                     fixed_arrival_times=fixed_constraints.get('fixed_arrival_times'),
                     fixed_durations=fixed_constraints.get('fixed_durations'),
-                    reoptimize_from_time=current_time
+                    reoptimize_from_time=current_time,
+                    earliest_production_starts=fixed_constraints.get('earliest_production_starts'),
+                    earliest_transport_starts=fixed_constraints.get('earliest_transport_starts'),
+                    earliest_installation_starts=fixed_constraints.get('earliest_installation_starts')
                 )
                 
                 QApplication.processEvents()
                 status = scheduler.solve()
                 
+                # Check if optimization was successful
+                from gurobipy import GRB
+                print(f"[DEBUG] Re-optimization solve status: {status}")
+                if status not in [GRB.OPTIMAL, GRB.TIME_LIMIT, GRB.SUBOPTIMAL]:
+                    calc_dialog.close()
+                    if calculate_btn:
+                        calculate_btn.setEnabled(True)
+                        calculate_btn.setText(original_btn_text)
+                    status_names = {
+                        GRB.INFEASIBLE: "INFEASIBLE",
+                        GRB.UNBOUNDED: "UNBOUNDED",
+                        GRB.INF_OR_UNBD: "INF_OR_UNBD",
+                        GRB.INTERRUPTED: "INTERRUPTED",
+                        GRB.NUMERIC: "NUMERIC",
+                    }
+                    status_name = status_names.get(status, f"Status {status}")
+                    QMessageBox.warning(self, "Optimization Failed", 
+                        f"Re-optimization failed with status: {status_name}\n\n"
+                        f"Please check your constraints and delays.")
+                    return
+                
                 # 8. Save results with version_id (Phase 6.3)
+                # Include Earliest_* columns from modified_solution_df (lower bounds from START_POSTPONEMENT)
                 QApplication.processEvents()
-                scheduler.save_results_to_db(
+                print(f"[DEBUG] Saving results to database with version_id={new_version_id}")
+                save_success = scheduler.save_results_to_db(
                     self.engine,
                     self.current_project_id,
                     module_id_mapping=index_to_id,
-                    version_id=new_version_id
+                    version_id=new_version_id,
+                    earliest_start_columns=modified_solution_df  # Pass modified_solution_df to include Earliest_* columns
                 )
+                
+                print(f"[DEBUG] Save results returned: {save_success}")
+                if not save_success:
+                    calc_dialog.close()
+                    if calculate_btn:
+                        calculate_btn.setEnabled(True)
+                        calculate_btn.setText(original_btn_text)
+                    QMessageBox.critical(self, "Save Failed", 
+                        "Failed to save optimization results to database.\n"
+                        "Please check the console for error messages.")
+                    return
                 
                 # Update version record with optimization results
                 solution = scheduler.get_solution_dict()
@@ -743,7 +887,7 @@ class MainWindow(QMainWindow):
                             VALUES (0, NULL, :reoptimize_from_time, :project_start_datetime)
                         ''')
                         conn.execute(insert_version_query, {
-                            "reoptimize_from_time": datetime.now(),
+                            "reoptimize_from_time": get_current_datetime(),
                             "project_start_datetime": start_str if start_str and start_str.lower() != "mm/dd/yyyy" else None
                         })
                         
@@ -847,7 +991,7 @@ class MainWindow(QMainWindow):
                     if isinstance(settings_widget, SettingsPage):
                         use_system_time = settings_widget.use_system_time.isChecked()
                 
-                current_time = datetime.now() if use_system_time else datetime.now()  # For now always use system time, may change later
+                current_time = get_current_datetime() if use_system_time else get_current_datetime()  # Use simulated time if TEST_REOPTIMIZE_DATETIME is set
 
                 rows = []
                 # Use pending delays map if available (only for re-optimization)
@@ -1071,7 +1215,7 @@ class MainWindow(QMainWindow):
                 if isinstance(settings_widget, SettingsPage):
                     use_system_time = settings_widget.use_system_time.isChecked()
             
-            current_time = datetime.now() if use_system_time else datetime.now()
+            current_time = get_current_datetime() if use_system_time else get_current_datetime()
             
             # Load delays for this version (if any)
             delay_table = ScheduleDataManager.delay_updates_table_name(project_id)
@@ -1483,8 +1627,8 @@ class MainWindow(QMainWindow):
                 except ValueError:
                     start_date = datetime.today().date()
             
-            # Calculate today's date
-            today_date = datetime.now().date()
+            # Calculate today's date (use simulated time if TEST_REOPTIMIZE_DATETIME is set)
+            today_date = get_current_datetime().date()
             
             # Load solution data for max version
             query = f'SELECT * FROM "{solution_table}" WHERE version_id = :version_id'
@@ -1604,7 +1748,8 @@ class MainWindow(QMainWindow):
             
             # Calculate current time index from current datetime
             # Use the last time index <= current_datetime (most accurate for completed status)
-            current_datetime = datetime.now()
+            # Use simulated time if TEST_REOPTIMIZE_DATETIME is set
+            current_datetime = get_current_datetime()
             current_time_idx = None
             # Find the last time index <= current_datetime
             for idx in range(1, len(slots)):

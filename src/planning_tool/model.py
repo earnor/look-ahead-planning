@@ -104,6 +104,10 @@ class PrefabScheduler:
         self.fixed_arrival_times = {} 
         self.fixed_durations = {} # any problem here?
         self.reoptimize_from_time = None  # Current time (time index) from which to re-optimize
+        # Lower bounds from START_POSTPONEMENT delays (for NOT_STARTED tasks)
+        self.earliest_production_starts = {}
+        self.earliest_transport_starts = {}
+        self.earliest_installation_starts = {}
 
         # preprocessing roots / leaves
         self.roots, self.leaves = self._find_roots_and_leaves()
@@ -113,16 +117,22 @@ class PrefabScheduler:
                              fixed_production_starts: Optional[Dict[int, int]] = None,
                              fixed_arrival_times: Optional[Dict[int, int]] = None,
                              fixed_durations: Optional[Dict[int, Dict[str, float]]] = None,
-                             reoptimize_from_time: Optional[int] = None):
+                             reoptimize_from_time: Optional[int] = None,
+                             earliest_production_starts: Optional[Dict[int, int]] = None,
+                             earliest_transport_starts: Optional[Dict[int, int]] = None,
+                             earliest_installation_starts: Optional[Dict[int, int]] = None):
         """
         Set fixed constraints for re-optimization.
         
         Args:
-            fixed_installation_starts: {module_index: start_time}
-            fixed_production_starts: {module_index: start_time}
-            fixed_arrival_times: {module_index: arrival_time}
+            fixed_installation_starts: {module_index: start_time} (exact values for COMPLETED/IN_PROGRESS)
+            fixed_production_starts: {module_index: start_time} (exact values for COMPLETED/IN_PROGRESS)
+            fixed_arrival_times: {module_index: arrival_time} (exact values for COMPLETED/IN_PROGRESS)
             fixed_durations: {module_index: {phase: duration}}
             reoptimize_from_time: Current time (time index) from which to re-optimize
+            earliest_production_starts: {module_index: earliest_start_time} (lower bounds for NOT_STARTED)
+            earliest_transport_starts: {module_index: earliest_start_time} (lower bounds for NOT_STARTED)
+            earliest_installation_starts: {module_index: earliest_start_time} (lower bounds for NOT_STARTED)
         """
         if fixed_installation_starts:
             self.fixed_installation_starts = fixed_installation_starts.copy()
@@ -134,6 +144,12 @@ class PrefabScheduler:
             self.fixed_durations = fixed_durations.copy()
         if reoptimize_from_time is not None:
             self.reoptimize_from_time = reoptimize_from_time
+        if earliest_production_starts:
+            self.earliest_production_starts = earliest_production_starts.copy()
+        if earliest_transport_starts:
+            self.earliest_transport_starts = earliest_transport_starts.copy()
+        if earliest_installation_starts:
+            self.earliest_installation_starts = earliest_installation_starts.copy()
 
     def _find_roots_and_leaves(self):
         preds = {i: [] for i in range(1, self.N + 1)}
@@ -154,7 +170,6 @@ class PrefabScheduler:
         m.Params.Cuts = 0             # 如果节点过多，可以适当减弱 cuts
         # 利用多核
         m.Params.Threads = 0
-        m.setParam("Seed", 0)         # 设置随机种子为0   
 
         N, T = self.N, self.T
         d = self.d
@@ -260,6 +275,61 @@ class PrefabScheduler:
                 if 'INSTALLATION' in phase_durations:
                     # Installation duration is in d[i] and used in constraints
                     pass
+
+        # (2e) Prevent NOT_STARTED tasks from starting before reoptimize_from_time
+        # For re-optimization: all unfixed tasks (NOT_STARTED) cannot start before current_time
+        # This ensures that we cannot schedule tasks in the past
+        if self.reoptimize_from_time is not None and self.reoptimize_from_time > 1:
+            min_time = self.reoptimize_from_time
+            # Prevent installation starts before current_time for unfixed tasks
+            for i in range(1, N + 1):
+                if i not in self.fixed_installation_starts:
+                    for t in range(1, min_time):
+                        m.addConstr(x[i, t] == 0, f"no_install_before_current_{i}_{t}")
+            
+            # Prevent production starts before current_time for unfixed tasks
+            for i in range(1, N + 1):
+                if i not in self.fixed_production_starts:
+                    for t in range(1, min_time):
+                        m.addConstr(q[i, t] == 0, f"no_prod_before_current_{i}_{t}")
+            
+            # Prevent arrival times before current_time for unfixed tasks
+            for i in range(1, N + 1):
+                if i not in self.fixed_arrival_times:
+                    for t in range(1, min_time):
+                        m.addConstr(p[i, t] == 0, f"no_arrival_before_current_{i}_{t}")
+
+        # (2f) Lower bounds from START_POSTPONEMENT delays (for NOT_STARTED tasks)
+        # These are lower bounds, not fixed values - tasks can start at or after these times
+        # Production lower bounds
+        for i, earliest_start in self.earliest_production_starts.items():
+            if 1 <= i <= N and 1 <= earliest_start <= T:
+                # Only apply if not already fixed (NOT_STARTED tasks)
+                if i not in self.fixed_production_starts:
+                    for t in range(1, earliest_start):
+                        m.addConstr(q[i, t] == 0, f"earliest_prod_lb_{i}_{t}")
+        
+        # Transport lower bounds (constraint on arrival time, which implies transport start)
+        # Note: Transport start = arrival_time - L[i], so we constrain arrival time
+        for i, earliest_start in self.earliest_transport_starts.items():
+            if 1 <= i <= N and 1 <= earliest_start <= T:
+                # Only apply if not already fixed (NOT_STARTED tasks)
+                if i not in self.fixed_arrival_times:
+                    # Earliest_Transport_Start refers to when transport can start
+                    # Arrival time = transport_start + L[i]
+                    # So earliest arrival >= earliest_transport_start + L[i]
+                    earliest_arrival = earliest_start + self.L.get(i, 0)
+                    if 1 <= earliest_arrival <= T:
+                        for t in range(1, earliest_arrival):
+                            m.addConstr(p[i, t] == 0, f"earliest_arrival_lb_{i}_{t}")
+        
+        # Installation lower bounds
+        for i, earliest_start in self.earliest_installation_starts.items():
+            if 1 <= i <= N and 1 <= earliest_start <= T:
+                # Only apply if not already fixed (NOT_STARTED tasks)
+                if i not in self.fixed_installation_starts:
+                    for t in range(1, earliest_start):
+                        m.addConstr(x[i, t] == 0, f"earliest_install_lb_{i}_{t}")
 
         # (3) dummy end starts once
         m.addConstr(quicksum(x[dummy_end, t] for t in range(1, T + 1)) == 1,
@@ -483,7 +553,8 @@ class PrefabScheduler:
                           engine: Engine, 
                           project_id: int,
                           module_id_mapping: Optional[Dict[int, str]] = None,
-                          version_id: Optional[int] = None) -> bool:
+                          version_id: Optional[int] = None,
+                          earliest_start_columns: Optional[pd.DataFrame] = None) -> bool:
         """
         Save optimization results to the database.
         
@@ -566,15 +637,48 @@ class PrefabScheduler:
             
             results_df = pd.DataFrame(results_data)
             
-            # Ensure solution table has version_id column and delete old data for this version if table exists
+            # Merge Earliest_* columns from earliest_start_columns if provided
+            # These columns represent lower bounds from START_POSTPONEMENT delays
+            if earliest_start_columns is not None and not earliest_start_columns.empty:
+                # Extract only Earliest_* columns and Module_ID for merging
+                earliest_cols_to_merge = []
+                for col in ['Earliest_Production_Start', 'Earliest_Transport_Start', 'Earliest_Installation_Start']:
+                    if col in earliest_start_columns.columns:
+                        earliest_cols_to_merge.append(col)
+                
+                if earliest_cols_to_merge:
+                    # Create a subset DataFrame with only Module_ID and Earliest_* columns
+                    merge_cols = ['Module_ID'] + earliest_cols_to_merge
+                    earliest_df = earliest_start_columns[merge_cols].copy()
+                    # Merge on Module_ID (left join to keep all results_df rows)
+                    results_df = results_df.merge(
+                        earliest_df,
+                        on='Module_ID',
+                        how='left'
+                    )
+            
+            # Ensure solution table has version_id column and Earliest_* columns, and delete old data for this version if table exists
             with engine.begin() as conn:
                 from sqlalchemy import inspect
                 inspector = inspect(engine)
                 if solution_table in inspector.get_table_names():
-                    # Table exists: check if version_id column exists and add if needed
+                    # Table exists: check if required columns exist and add if needed
                     columns = [col['name'] for col in inspector.get_columns(solution_table)]
+                    
+                    # Add version_id column if missing
                     if 'version_id' not in columns:
                         conn.exec_driver_sql(f'ALTER TABLE "{solution_table}" ADD COLUMN version_id INTEGER')
+                    
+                    # Add Earliest_* columns if missing (for START_POSTPONEMENT delay lower bounds)
+                    earliest_columns = {
+                        'Earliest_Production_Start': 'INTEGER',
+                        'Earliest_Transport_Start': 'INTEGER',
+                        'Earliest_Installation_Start': 'INTEGER'
+                    }
+                    for col_name, col_type in earliest_columns.items():
+                        if col_name not in columns:
+                            conn.exec_driver_sql(f'ALTER TABLE "{solution_table}" ADD COLUMN "{col_name}" {col_type}')
+                            print(f"[DEBUG] Added column {col_name} to {solution_table}")
                     
                     # Delete old data for this version before appending new data
                     if version_id is not None:
@@ -673,5 +777,8 @@ class PrefabScheduler:
             return True
             
         except Exception as e:
-            print(f"Error saving results to database: {e}")
+            import traceback
+            print(f"[ERROR] Error saving results to database: {e}")
+            print(f"[ERROR] Traceback:")
+            traceback.print_exc()
             return False

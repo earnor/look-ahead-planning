@@ -1253,10 +1253,10 @@ class SettingsPage(QWidget):
         cost_group.addWidget(cost_label, 0, 0, 1, 2)
         
         cost_params = [
-            ("Order Batch Cost (OC):", "order_cost", "0.25"),
-            ("Penalty Cost per Unit Time (C_I):", "penalty_cost", "0.5"),
+            ("Order Batch Cost (OC):", "order_cost", "0.1"),
+            ("Penalty Cost per Unit Time (C_I):", "penalty_cost", "0.7"),
             ("Factory Inventory Cost (C_F):", "factory_inv_cost", "0.1"),
-            ("Onsite Inventory Cost (C_O):", "onsite_inv_cost", "0.15"),
+            ("Onsite Inventory Cost (C_O):", "onsite_inv_cost", "0.1"),
         ]
         
         self.cost_inputs = {}

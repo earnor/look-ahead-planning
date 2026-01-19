@@ -42,37 +42,68 @@ class TaskStateIdentifier:
     """Identifies task states from solution data based on current_time"""
     
     def __init__(self, solution_df: pd.DataFrame, current_time: int,
-                 working_calendar_slots: List[datetime]):
+                 working_calendar_slots: List[datetime], current_datetime: Optional[datetime] = None):
         """
         Args:
             solution_df: DataFrame with columns Module_ID, Installation_Start, 
                         Production_Start, Arrival_Time, etc.
             current_time: Time index representing the actual current time (re-optimization starts from here)
             working_calendar_slots: List of datetime objects mapping time indices to real times
+            current_datetime: Optional datetime representing current time (if provided, will be used directly instead of converting from current_time)
         """
         self.solution_df = solution_df
         self.current_time = current_time
         self.working_calendar_slots = working_calendar_slots
-        # Convert current_time (time index) to datetime for comparison
-        self.current_datetime = self._index_to_datetime(current_time) if current_time > 0 else None
+        # Use provided current_datetime directly if available, otherwise convert from current_time
+        if current_datetime is not None:
+            self.current_datetime = current_datetime
+            print(f"[DEBUG TaskStateIdentifier] Using provided current_datetime={current_datetime}")
+        else:
+            # Convert current_time (time index) to datetime for comparison
+            self.current_datetime = self._index_to_datetime(current_time) if current_time > 0 else None
+            print(f"[DEBUG TaskStateIdentifier] Converted from current_time={current_time} to current_datetime={self.current_datetime}")
         self._time_to_index_map = self._build_time_map()
     
     def _build_time_map(self) -> Dict[datetime, int]:
-        """Build mapping from datetime to time index"""
-        return {dt: idx + 1 for idx, dt in enumerate(self.working_calendar_slots)}
+        """
+        Build mapping from datetime to time index.
+        
+        working_calendar_slots structure:
+        - slots[0] = None (placeholder, unused)
+        - slots[1] = first working slot (time index 1)
+        - slots[2] = second working slot (time index 2)
+        - ...
+        
+        So idx directly maps to time index (skip idx=0).
+        """
+        return {dt: idx for idx, dt in enumerate(self.working_calendar_slots) if dt is not None}
     
     def _datetime_to_index(self, dt: datetime) -> Optional[int]:
-        """Convert datetime to time index"""
-        # Find closest time index
+        """
+        Convert datetime to time index.
+        
+        Skip index 0 (placeholder), start from index 1.
+        """
+        # Find closest time index, skip index 0 (placeholder)
         for idx, slot in enumerate(self.working_calendar_slots):
-            if slot >= dt:
-                return idx + 1
+            if slot is not None and slot >= dt:
+                return idx  # idx directly maps to time index
         return None
     
     def _index_to_datetime(self, idx: int) -> Optional[datetime]:
-        """Convert time index to datetime"""
-        if 1 <= idx <= len(self.working_calendar_slots):
-            return self.working_calendar_slots[idx - 1]
+        """
+        Convert time index to datetime.
+        
+        working_calendar_slots structure:
+        - slots[0] = None (placeholder, unused)
+        - slots[1] = first working slot (time index 1)
+        - slots[2] = second working slot (time index 2)
+        - ...
+        
+        So time index idx directly maps to slots[idx].
+        """
+        if 1 <= idx < len(self.working_calendar_slots):
+            return self.working_calendar_slots[idx]
         return None
     
     def identify_all_states(self) -> Dict[str, List[TaskState]]:
@@ -150,6 +181,10 @@ class TaskStateIdentifier:
         # Convert time indices to datetimes
         start_dt = self._index_to_datetime(start_idx)
         finish_dt = self._index_to_datetime(finish_idx) if finish_idx else None
+        
+        # Debug: print time conversion for state identification
+        if module_id and (module_id.startswith("VS-02-21") or phase == "FABRICATION"):
+            print(f"[DEBUG _identify_phase_state] {module_id} {phase}: start_idx={start_idx} -> {start_dt}, finish_idx={finish_idx} -> {finish_dt}, current_datetime={self.current_datetime}")
         
         # Determine status based on current_time (actual current time)
         if self.current_datetime is None:
@@ -235,6 +270,7 @@ class DelayApplier:
         if 'Earliest_Installation_Start' not in modified_df.columns:
             modified_df['Earliest_Installation_Start'] = None
         
+        print(f"[DEBUG DelayApplier] Applying {len(self.delays)} delays")
         for delay in self.delays:
             module_id = delay.module_id
             if module_id not in self._module_id_to_index:
@@ -266,15 +302,32 @@ class DelayApplier:
         However, we apply it to the DataFrame regardless, and FixedConstraintsBuilder
         will only use the updated duration if the task is not completed.
         """
+        module_id = df.at[idx, 'Module_ID']
+        # Check task state for this module and phase
+        module_states = self.task_states.get(str(module_id), [])
+        task_state = None
+        for state in module_states:
+            if state.phase == delay.phase:
+                task_state = state
+                break
+        
+        print(f"[DEBUG DelayApplier] Applying DURATION_EXTENSION to {module_id}, phase={delay.phase}, delay={delay.delay_hours}h, status={task_state.status if task_state else 'UNKNOWN'}")
+        
         if delay.phase == "FABRICATION":
             current_duration = df.at[idx, 'Production_Duration']
-            df.at[idx, 'Production_Duration'] = current_duration + delay.delay_hours
+            new_duration = current_duration + delay.delay_hours
+            df.at[idx, 'Production_Duration'] = new_duration
+            print(f"[DEBUG DelayApplier] {module_id} FABRICATION: {current_duration} -> {new_duration}")
         elif delay.phase == "TRANSPORT":
             current_duration = df.at[idx, 'Transport_Duration']
-            df.at[idx, 'Transport_Duration'] = current_duration + delay.delay_hours
+            new_duration = current_duration + delay.delay_hours
+            df.at[idx, 'Transport_Duration'] = new_duration
+            print(f"[DEBUG DelayApplier] {module_id} TRANSPORT: {current_duration} -> {new_duration}")
         elif delay.phase == "INSTALLATION":
             current_duration = df.at[idx, 'Installation_Duration']
-            df.at[idx, 'Installation_Duration'] = current_duration + delay.delay_hours
+            new_duration = current_duration + delay.delay_hours
+            df.at[idx, 'Installation_Duration'] = new_duration
+            print(f"[DEBUG DelayApplier] {module_id} INSTALLATION: {current_duration} -> {new_duration}")
     
     def _apply_start_postponement(self, df: pd.DataFrame, idx: int, delay: DelayInfo):
         """
@@ -282,27 +335,40 @@ class DelayApplier:
         This sets a lower bound (earliest start time) rather than fixing the exact start time.
         """
         delay_hours = int(delay.delay_hours)
+        
+        def _safe_compare_lb(new_lb: int, current_lb) -> bool:
+            """Safely compare new_lb with current_lb, handling None/NaN/string types"""
+            if pd.isna(current_lb) or current_lb is None:
+                return True  # No existing lower bound, use new one
+            try:
+                # Try to convert to numeric if it's a string or other type
+                current_lb_num = pd.to_numeric(current_lb, errors='coerce')
+                if pd.isna(current_lb_num):
+                    return True  # Couldn't convert, use new one
+                return new_lb > current_lb_num
+            except (TypeError, ValueError):
+                return True  # Conversion failed, use new one
+        
         if delay.phase == "FABRICATION":
             base_start = df.at[idx, 'Production_Start']
             if pd.notna(base_start):
-                new_lb = base_start + delay_hours
+                new_lb = int(base_start) + delay_hours
                 current_lb = df.at[idx, 'Earliest_Production_Start']
-                # current_lb can be None/NaN on first delay; only compare when it is a number
-                if pd.isna(current_lb) or current_lb is None or new_lb > current_lb:
+                if _safe_compare_lb(new_lb, current_lb):
                     df.at[idx, 'Earliest_Production_Start'] = new_lb
         elif delay.phase == "TRANSPORT":
             transport_start = df.at[idx, 'Transport_Start']
             if pd.notna(transport_start):
-                new_lb = transport_start + delay_hours
+                new_lb = int(transport_start) + delay_hours
                 current_lb = df.at[idx, 'Earliest_Transport_Start']
-                if pd.isna(current_lb) or current_lb is None or new_lb > current_lb:
+                if _safe_compare_lb(new_lb, current_lb):
                     df.at[idx, 'Earliest_Transport_Start'] = new_lb
         elif delay.phase == "INSTALLATION":
             install_start = df.at[idx, 'Installation_Start']
             if pd.notna(install_start):
-                new_lb = install_start + delay_hours
+                new_lb = int(install_start) + delay_hours
                 current_lb = df.at[idx, 'Earliest_Installation_Start']
-                if pd.isna(current_lb) or current_lb is None or new_lb > current_lb:
+                if _safe_compare_lb(new_lb, current_lb):
                     df.at[idx, 'Earliest_Installation_Start'] = new_lb
 
 
@@ -333,16 +399,31 @@ class FixedConstraintsBuilder:
         }
         
     def _index_to_datetime(self, idx: int) -> Optional[datetime]:
-        """Convert time index to datetime"""
-        if 1 <= idx <= len(self.working_calendar_slots):
-            return self.working_calendar_slots[idx - 1]
+        """
+        Convert time index to datetime.
+        
+        working_calendar_slots structure:
+        - slots[0] = None (placeholder, unused)
+        - slots[1] = first working slot (time index 1)
+        - slots[2] = second working slot (time index 2)
+        - ...
+        
+        So time index idx directly maps to slots[idx].
+        """
+        if 1 <= idx < len(self.working_calendar_slots):
+            return self.working_calendar_slots[idx]
         return None
     
     def _datetime_to_index(self, dt: datetime) -> Optional[int]:
-        """Convert datetime to time index"""
+        """
+        Convert datetime to time index.
+        
+        Skip index 0 (placeholder), start from index 1.
+        """
+        # Find closest time index, skip index 0 (placeholder)
         for idx, slot in enumerate(self.working_calendar_slots):
-            if slot >= dt:
-                return idx + 1
+            if slot is not None and slot >= dt:
+                return idx  # idx directly maps to time index
         return None
     
     def build_fixed_constraints(self) -> Dict[str, any]:
@@ -353,6 +434,9 @@ class FixedConstraintsBuilder:
         - fixed_production_starts: {module_index: start_time}
         - fixed_arrival_times: {module_index: arrival_time}
         - fixed_durations: {module_index: {phase: duration}}
+        - earliest_production_starts: {module_index: earliest_start_time} (lower bounds)
+        - earliest_transport_starts: {module_index: earliest_start_time} (lower bounds)
+        - earliest_installation_starts: {module_index: earliest_start_time} (lower bounds)
         
         Logic:
         - COMPLETED: Fix start time, duration = original (not used by optimizer)
@@ -364,6 +448,9 @@ class FixedConstraintsBuilder:
         fixed_production_starts = {}
         fixed_arrival_times = {}
         fixed_durations = {}
+        earliest_production_starts = {}
+        earliest_transport_starts = {}
+        earliest_installation_starts = {}
         
         for module_id, states in self.task_states.items():
             if module_id not in self._module_id_to_index:
@@ -391,22 +478,75 @@ class FixedConstraintsBuilder:
                         state, module_index, row, original_row,
                         fixed_production_starts, fixed_durations
                     )
+                    # Extract Earliest_Production_Start lower bound for NOT_STARTED tasks
+                    if state.status == "NOT_STARTED" and module_index not in fixed_production_starts:
+                        earliest_prod_val = row.get('Earliest_Production_Start')
+                        if pd.notna(earliest_prod_val) and earliest_prod_val is not None:
+                            # Earliest_* columns contain time indices (int), not datetime
+                            # If it's already an int, use it directly; otherwise convert from datetime
+                            if isinstance(earliest_prod_val, (int, float)):
+                                earliest_prod_idx = int(earliest_prod_val)
+                            elif isinstance(earliest_prod_val, datetime):
+                                earliest_prod_idx = self._datetime_to_index(earliest_prod_val)
+                            else:
+                                earliest_prod_idx = None
+                            
+                            if earliest_prod_idx is not None and earliest_prod_idx > 0:
+                                earliest_production_starts[module_index] = earliest_prod_idx
+                                print(f"[DEBUG FixedConstraintsBuilder] Module {module_id} (index {module_index}) FABRICATION: Earliest_Production_Start = {earliest_prod_val} -> time_index {earliest_prod_idx}")
                 elif state.phase == "TRANSPORT":
                     self._handle_transport_phase(
                         state, module_index, row, original_row,
                         fixed_arrival_times, fixed_durations
                     )
+                    # Extract Earliest_Transport_Start lower bound for NOT_STARTED tasks
+                    # Note: Transport start is not directly fixed, but arrival time may be
+                    # We use Earliest_Transport_Start to constrain when transport can start
+                    if state.status == "NOT_STARTED" and module_index not in fixed_arrival_times:
+                        earliest_trans_val = row.get('Earliest_Transport_Start')
+                        if pd.notna(earliest_trans_val) and earliest_trans_val is not None:
+                            # Earliest_* columns contain time indices (int), not datetime
+                            # If it's already an int, use it directly; otherwise convert from datetime
+                            if isinstance(earliest_trans_val, (int, float)):
+                                earliest_trans_idx = int(earliest_trans_val)
+                            elif isinstance(earliest_trans_val, datetime):
+                                earliest_trans_idx = self._datetime_to_index(earliest_trans_val)
+                            else:
+                                earliest_trans_idx = None
+                            
+                            if earliest_trans_idx is not None and earliest_trans_idx > 0:
+                                earliest_transport_starts[module_index] = earliest_trans_idx
+                                print(f"[DEBUG FixedConstraintsBuilder] Module {module_id} (index {module_index}) TRANSPORT: Earliest_Transport_Start = {earliest_trans_val} -> time_index {earliest_trans_idx}")
                 elif state.phase == "INSTALLATION":
                     self._handle_installation_phase(
                         state, module_index, row, original_row,
                         fixed_installation_starts, fixed_durations
                     )
+                    # Extract Earliest_Installation_Start lower bound for NOT_STARTED tasks
+                    if state.status == "NOT_STARTED" and module_index not in fixed_installation_starts:
+                        earliest_install_val = row.get('Earliest_Installation_Start')
+                        if pd.notna(earliest_install_val) and earliest_install_val is not None:
+                            # Earliest_* columns contain time indices (int), not datetime
+                            # If it's already an int, use it directly; otherwise convert from datetime
+                            if isinstance(earliest_install_val, (int, float)):
+                                earliest_install_idx = int(earliest_install_val)
+                            elif isinstance(earliest_install_val, datetime):
+                                earliest_install_idx = self._datetime_to_index(earliest_install_val)
+                            else:
+                                earliest_install_idx = None
+                            
+                            if earliest_install_idx is not None and earliest_install_idx > 0:
+                                earliest_installation_starts[module_index] = earliest_install_idx
+                                print(f"[DEBUG FixedConstraintsBuilder] Module {module_id} (index {module_index}) INSTALLATION: Earliest_Installation_Start = {earliest_install_val} -> time_index {earliest_install_idx}")
         
         return {
             'fixed_installation_starts': fixed_installation_starts,
             'fixed_production_starts': fixed_production_starts,
             'fixed_arrival_times': fixed_arrival_times,
-            'fixed_durations': fixed_durations
+            'fixed_durations': fixed_durations,
+            'earliest_production_starts': earliest_production_starts,
+            'earliest_transport_starts': earliest_transport_starts,
+            'earliest_installation_starts': earliest_installation_starts
         }
     
     def _handle_fabrication_phase(self, state: TaskState, module_index: int,
@@ -428,12 +568,14 @@ class FixedConstraintsBuilder:
                 fixed_production_starts[module_index] = actual_start
             
             # Calculate remaining duration
-            # Total duration after DURATION_EXTENSION
+            # Total duration after DURATION_EXTENSION (should include delay if applied)
             total_duration = row.get('Production_Duration', 0)
+            original_duration = original_row.get('Production_Duration', 0)
             # Elapsed time = current_time - actual_start
             elapsed = max(0, self.current_time - actual_start) if actual_start else 0
             # Remaining duration = total - elapsed
             remaining_duration = max(0, total_duration - elapsed)
+            print(f"[DEBUG FixedConstraintsBuilder] IN_PROGRESS FABRICATION module_index={module_index}: original={original_duration}, total_after_delay={total_duration}, elapsed={elapsed}, remaining={remaining_duration}")
             fixed_durations.setdefault(module_index, {})['FABRICATION'] = remaining_duration
             
         elif state.status == "NOT_STARTED":
