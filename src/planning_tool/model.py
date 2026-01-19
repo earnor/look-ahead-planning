@@ -241,8 +241,14 @@ class PrefabScheduler:
         # (2a) Fixed installation starts (for re-optimization)
         # Note: Since we have sum(x[i, t]) = 1, fixing x[i, fixed_start] = 1 
         # automatically forces all other x[i, t] = 0
+        # IMPORTANT: Fixed starts for COMPLETED/IN_PROGRESS tasks must be <= current_time (reoptimize_from_time)
+        # This ensures we don't schedule tasks in the past
         for i, fixed_start in self.fixed_installation_starts.items():
             if 1 <= i <= N and 1 <= fixed_start <= T:
+                # Validate: fixed_start should be <= reoptimize_from_time (for COMPLETED/IN_PROGRESS tasks)
+                if self.reoptimize_from_time is not None and fixed_start > self.reoptimize_from_time:
+                    print(f"[WARNING] Fixed installation start {fixed_start} for module {i} is after current_time {self.reoptimize_from_time}. This may indicate an error in state identification.")
+                    # Still add the constraint, but log a warning
                 m.addConstr(x[i, fixed_start] == 1, f"fixed_install_start_{i}")
         
         # (2b) Fixed production starts
@@ -250,6 +256,9 @@ class PrefabScheduler:
         # automatically forces all other q[i, t] = 0
         for i, fixed_start in self.fixed_production_starts.items():
             if 1 <= i <= N and 1 <= fixed_start <= T:
+                # Validate: fixed_start should be <= reoptimize_from_time (for COMPLETED/IN_PROGRESS tasks)
+                if self.reoptimize_from_time is not None and fixed_start > self.reoptimize_from_time:
+                    print(f"[WARNING] Fixed production start {fixed_start} for module {i} is after current_time {self.reoptimize_from_time}. This may indicate an error in state identification.")
                 m.addConstr(q[i, fixed_start] == 1, f"fixed_prod_start_{i}")
         
         # (2c) Fixed arrival times
@@ -257,6 +266,9 @@ class PrefabScheduler:
         # automatically forces all other p[i, t] = 0
         for i, fixed_arrival in self.fixed_arrival_times.items():
             if 1 <= i <= N and 1 <= fixed_arrival <= T:
+                # Validate: fixed_arrival should be <= reoptimize_from_time (for COMPLETED/IN_PROGRESS tasks)
+                if self.reoptimize_from_time is not None and fixed_arrival > self.reoptimize_from_time:
+                    print(f"[WARNING] Fixed arrival time {fixed_arrival} for module {i} is after current_time {self.reoptimize_from_time}. This may indicate an error in state identification.")
                 m.addConstr(p[i, fixed_arrival] == 1, f"fixed_arrival_{i}")
         
         # (2d) Fixed durations

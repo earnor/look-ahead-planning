@@ -425,6 +425,35 @@ class SchedulePage(QWidget):
         self.version_combo.currentIndexChanged.connect(self._on_version_changed)
         h.addWidget(self.version_combo)
         
+        # Delete version button
+        self.btn_delete_version = QPushButton("🗑️ Delete")
+        self.btn_delete_version.setStyleSheet("""
+            QPushButton {
+                background: #FFFFFF;
+                border: 1px solid #E5E7EB;
+                border-radius: 8px;
+                padding: 8px 16px;
+                font-size: 13px;
+                font-weight: 500;
+                color: #DC2626;
+            }
+            QPushButton:hover {
+                background: #FEF2F2;
+                border-color: #DC2626;
+            }
+            QPushButton:pressed {
+                background: #FEE2E2;
+            }
+            QPushButton:disabled {
+                background: #F9FAFB;
+                color: #9CA3AF;
+                border-color: #E5E7EB;
+            }
+        """)
+        self.btn_delete_version.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_delete_version.setEnabled(False)  # Disabled by default until version is selected
+        h.addWidget(self.btn_delete_version)
+        
         h.addStretch(1)
         
         # Action buttons with icons (using emoji as placeholders)
@@ -644,6 +673,9 @@ class SchedulePage(QWidget):
         if versions_table not in table_names:
             print(f"[DEBUG SchedulePage] versions_table {versions_table} not found in database")
             self.version_combo.clear()
+            # Disable delete button if table doesn't exist
+            if hasattr(self, 'btn_delete_version'):
+                self.btn_delete_version.setEnabled(False)
             return
         
         try:
@@ -695,6 +727,10 @@ class SchedulePage(QWidget):
                     self.version_combo.addItem(display_text)
                     self.version_id_map[index] = version_id
                 
+                # Enable delete button if there are versions
+                if hasattr(self, 'btn_delete_version'):
+                    self.btn_delete_version.setEnabled(True)
+                
                 # Try to restore previous selection, otherwise select latest version
                 if current_selected_version_id is not None:
                     # Find the index of the previously selected version
@@ -709,6 +745,10 @@ class SchedulePage(QWidget):
                         self.version_combo.setCurrentIndex(0)
                 elif len(versions_df) >= 1:
                     self.version_combo.setCurrentIndex(0)
+            else:
+                # No versions available, disable delete button
+                if hasattr(self, 'btn_delete_version'):
+                    self.btn_delete_version.setEnabled(False)
             
             self.version_combo.blockSignals(False)
             
@@ -728,6 +768,9 @@ class SchedulePage(QWidget):
         
         if self.engine is None or self.project_id is None:
             print(f"[DEBUG SchedulePage] Engine or project_id is None, returning")
+            # Disable delete button if no project selected
+            if hasattr(self, 'btn_delete_version'):
+                self.btn_delete_version.setEnabled(False)
             return
         
         # Get selected version_id
@@ -737,6 +780,9 @@ class SchedulePage(QWidget):
         
         if current_index < 0:
             print(f"[DEBUG SchedulePage] Invalid current_index, returning")
+            # Disable delete button if no version selected
+            if hasattr(self, 'btn_delete_version'):
+                self.btn_delete_version.setEnabled(False)
             return
         
         version_id = self.version_id_map.get(current_index)
@@ -744,7 +790,14 @@ class SchedulePage(QWidget):
         
         if version_id is None:
             print(f"[DEBUG SchedulePage] version_id is None, returning")
+            # Disable delete button if invalid version
+            if hasattr(self, 'btn_delete_version'):
+                self.btn_delete_version.setEnabled(False)
             return
+        
+        # Enable delete button when valid version is selected
+        if hasattr(self, 'btn_delete_version'):
+            self.btn_delete_version.setEnabled(True)
         
         # Load schedule data for this version
         if self.main_window:

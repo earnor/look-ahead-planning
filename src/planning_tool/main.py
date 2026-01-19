@@ -136,6 +136,7 @@ class MainWindow(QMainWindow):
             self.page_schedule = page_schedule
             page_schedule.btn_calculate.clicked.connect(self.on_calculate_clicked)
             page_schedule.btn_export.clicked.connect(self.on_export_schedule)
+            page_schedule.btn_delete_version.clicked.connect(self.on_delete_version_clicked)
             # Store reference to MainWindow in SchedulePage for delay saving and version loading
             page_schedule.main_window = self
 
@@ -1880,6 +1881,100 @@ class MainWindow(QMainWindow):
             import traceback
             traceback.print_exc()
     
+    def on_delete_version_clicked(self):
+        """
+        Handle delete version button click.
+        Deletes the currently selected version and all its associated data.
+        """
+        if self.current_project_id is None:
+            QMessageBox.warning(self, "Error", "No project selected.")
+            return
+        
+        # Get currently selected version
+        if not hasattr(self.page_schedule, 'version_combo') or self.page_schedule.version_combo.count() == 0:
+            QMessageBox.warning(self, "Error", "No version selected.")
+            return
+        
+        current_index = self.page_schedule.version_combo.currentIndex()
+        if current_index < 0:
+            QMessageBox.warning(self, "Error", "No version selected.")
+            return
+        
+        version_id = self.page_schedule.version_id_map.get(current_index)
+        if version_id is None:
+            QMessageBox.warning(self, "Error", "Invalid version selected.")
+            return
+        
+        # Get version number for display
+        versions_table = self.mgr.optimization_versions_table_name(self.current_project_id)
+        try:
+            with self.engine.begin() as conn:
+                version_query = text(f'SELECT version_number FROM "{versions_table}" WHERE version_id = :version_id')
+                version_number = conn.execute(version_query, {"version_id": version_id}).scalar()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to get version information: {str(e)}")
+            return
+        
+        if version_number is None:
+            QMessageBox.warning(self, "Error", "Version not found.")
+            return
+        
+        # Confirm deletion
+        reply = QMessageBox.question(
+            self,
+            "Delete Version",
+            f"Are you sure you want to delete Version {version_number}?\n\n"
+            "This will delete:\n"
+            "- All solution data for this version\n"
+            "- All summary data for this version\n"
+            "- All delay records associated with this version\n\n"
+            "This action cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                # Delete the version
+                success = self.mgr.delete_version(self.current_project_id, version_id)
+                
+                if success:
+                    # Get the index of the previous version (or next version if no previous)
+                    # Calculate this before reloading since the combo will be cleared
+                    previous_index = current_index - 1 if current_index > 0 else (current_index + 1 if current_index < self.page_schedule.version_combo.count() - 1 else -1)
+                    
+                    # Reload version list without auto_load to manually control which version is selected
+                    self.page_schedule.load_version_list(self.engine, self.current_project_id, auto_load=False)
+                    
+                    # If there are still versions, select the one at previous_index (or first if previous was deleted)
+                    if self.page_schedule.version_combo.count() > 0:
+                        if previous_index >= 0 and previous_index < self.page_schedule.version_combo.count():
+                            self.page_schedule.version_combo.setCurrentIndex(previous_index)
+                        else:
+                            self.page_schedule.version_combo.setCurrentIndex(0)
+                        # Manually trigger version change to load the selected version
+                        self.page_schedule._on_version_changed()
+                    
+                    QMessageBox.information(
+                        self,
+                        "Version Deleted",
+                        f"Version {version_number} has been deleted successfully."
+                    )
+                else:
+                    QMessageBox.critical(
+                        self,
+                        "Delete Failed",
+                        f"Failed to delete Version {version_number}. Please check the console for details."
+                    )
+            except Exception as e:
+                QMessageBox.critical(
+                    self,
+                    "Error",
+                    f"An error occurred while deleting the version:\n{str(e)}"
+                )
+                import traceback
+                traceback.print_exc()
+
     def _on_delete_project_clicked(self):
         """Handler for delete project button click"""
         if not self.current_project_id:

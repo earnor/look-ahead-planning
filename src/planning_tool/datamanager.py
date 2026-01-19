@@ -215,3 +215,86 @@ class ScheduleDataManager:
         except Exception as e:
             print(f"Error deleting project {project_id}: {e}")
             return False
+    
+    def delete_version(self, project_id: int, version_id: int) -> bool:
+        """
+        Delete a specific version and all its associated data.
+        
+        This will:
+        1. Delete the version record from optimization_versions table
+        2. Delete solution data for this version from solution_schedule table
+        3. Delete summary data for this version from optimization_summary table
+        4. Note: Delay records are kept (they may be referenced by other versions or serve as history)
+        
+        Args:
+            project_id: The ID of the project
+            version_id: The ID of the version to delete
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            with self.engine.begin() as conn:
+                from sqlalchemy import inspect
+                inspector = inspect(self.engine)
+                table_names = inspector.get_table_names()
+                
+                # Get table names
+                solution_table = ScheduleDataManager.solution_table_name(project_id)
+                summary_table = ScheduleDataManager.summary_table_name(project_id)
+                versions_table = ScheduleDataManager.optimization_versions_table_name(project_id)
+                
+                # Check if tables exist
+                if versions_table not in table_names:
+                    print(f"Version table {versions_table} does not exist")
+                    return False
+                
+                # Check if version exists and get version_number for logging
+                version_check_query = text(f'SELECT version_number FROM "{versions_table}" WHERE version_id = :version_id')
+                version_number = conn.execute(version_check_query, {"version_id": version_id}).scalar()
+                
+                if version_number is None:
+                    print(f"Version with version_id {version_id} does not exist")
+                    return False
+                
+                # Delete solution data for this version
+                if solution_table in table_names:
+                    delete_solution_query = text(f'DELETE FROM "{solution_table}" WHERE version_id = :version_id')
+                    conn.execute(delete_solution_query, {"version_id": version_id})
+                
+                # Delete summary data for this version
+                if summary_table in table_names:
+                    delete_summary_query = text(f'DELETE FROM "{summary_table}" WHERE version_id = :version_id')
+                    conn.execute(delete_summary_query, {"version_id": version_id})
+                
+                # Delete delay records associated with this version
+                delay_table = ScheduleDataManager.delay_updates_table_name(project_id)
+                if delay_table in table_names:
+                    delete_delays_query = text(f'DELETE FROM "{delay_table}" WHERE version_id = :version_id')
+                    conn.execute(delete_delays_query, {"version_id": version_id})
+                
+                # Delete the version record itself
+                # Note: We need to handle foreign key constraints if other versions reference this version as base_version_id
+                # First, check if any other versions depend on this version
+                dependent_versions_query = text(f'SELECT version_id, version_number FROM "{versions_table}" WHERE base_version_id = :version_id')
+                dependent_versions = conn.execute(dependent_versions_query, {"version_id": version_id}).fetchall()
+                
+                if dependent_versions:
+                    # Set base_version_id to NULL for dependent versions (they become independent)
+                    # Or optionally, we could prevent deletion if there are dependent versions
+                    # For now, we'll set base_version_id to NULL to allow deletion
+                    update_dependent_query = text(f'UPDATE "{versions_table}" SET base_version_id = NULL WHERE base_version_id = :version_id')
+                    conn.execute(update_dependent_query, {"version_id": version_id})
+                
+                # Now delete the version record
+                delete_version_query = text(f'DELETE FROM "{versions_table}" WHERE version_id = :version_id')
+                conn.execute(delete_version_query, {"version_id": version_id})
+                
+                print(f"Successfully deleted version {version_number} (version_id: {version_id})")
+            
+            return True
+        except Exception as e:
+            print(f"Error deleting version {version_id} for project {project_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            return False

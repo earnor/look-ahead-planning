@@ -554,9 +554,14 @@ class FixedConstraintsBuilder:
                                   fixed_production_starts: Dict[int, int],
                                   fixed_durations: Dict[int, Dict[str, float]]):
         """Handle fabrication phase constraints"""
+        module_id = state.module_id
         if state.status == "COMPLETED":
             # Fix start time (for historical record)
             if state.start_time:
+                # Validate: COMPLETED tasks should have started before current_time
+                if state.start_time > self.current_time:
+                    print(f"[ERROR FixedConstraintsBuilder] Module {module_id} (index {module_index}) FABRICATION COMPLETED but start_time {state.start_time} > current_time {self.current_time}. This is invalid!")
+                    print(f"[FIX FixedConstraintsBuilder] Keeping original start_time {state.start_time} but this may cause issues")
                 fixed_production_starts[module_index] = state.start_time
             # Duration = original (optimizer doesn't need it, but record for completeness)
             fixed_durations.setdefault(module_index, {})['FABRICATION'] = original_row.get('Production_Duration', 0)
@@ -565,6 +570,12 @@ class FixedConstraintsBuilder:
             # Fix start time (task has started)
             actual_start = state.actual_start_time if state.actual_start_time else state.start_time
             if actual_start:
+                # Validate: IN_PROGRESS tasks should have started before or at current_time
+                if actual_start > self.current_time:
+                    print(f"[ERROR FixedConstraintsBuilder] Module {module_id} (index {module_index}) FABRICATION IN_PROGRESS but actual_start {actual_start} > current_time {self.current_time}. This is invalid!")
+                    # Use current_time as the fixed start (task should have started by now)
+                    actual_start = self.current_time
+                    print(f"[FIX FixedConstraintsBuilder] Setting fixed_production_starts[{module_index}] = {actual_start}")
                 fixed_production_starts[module_index] = actual_start
             
             # Calculate remaining duration
@@ -589,12 +600,19 @@ class FixedConstraintsBuilder:
                                fixed_arrival_times: Dict[int, int],
                                fixed_durations: Dict[int, Dict[str, float]]):
         """Handle transport phase constraints"""
+        module_id = state.module_id
         if state.status == "COMPLETED":
             # Fix arrival time (transport completed)
             arrival = row.get('Arrival_Time')
             if arrival is None and state.finish_time:
                 arrival = state.finish_time
             if arrival:
+                # Validate: COMPLETED tasks should have finished before or at current_time
+                if arrival > self.current_time:
+                    print(f"[ERROR FixedConstraintsBuilder] Module {module_id} (index {module_index}) TRANSPORT COMPLETED but arrival {arrival} > current_time {self.current_time}. This is invalid!")
+                    # Use current_time as the fixed arrival (task should have finished by now)
+                    arrival = self.current_time
+                    print(f"[FIX FixedConstraintsBuilder] Setting fixed_arrival_times[{module_index}] = {arrival}")
                 fixed_arrival_times[module_index] = arrival
             # Duration = original (optimizer doesn't need it)
             fixed_durations.setdefault(module_index, {})['TRANSPORT'] = original_row.get('Transport_Duration', 0)
@@ -626,9 +644,14 @@ class FixedConstraintsBuilder:
                                   fixed_installation_starts: Dict[int, int],
                                   fixed_durations: Dict[int, Dict[str, float]]):
         """Handle installation phase constraints"""
+        module_id = state.module_id
         if state.status == "COMPLETED":
             # Fix start time (for historical record)
             if state.start_time:
+                # Validate: COMPLETED tasks should have started before current_time
+                if state.start_time > self.current_time:
+                    print(f"[ERROR FixedConstraintsBuilder] Module {module_id} (index {module_index}) INSTALLATION COMPLETED but start_time {state.start_time} > current_time {self.current_time}. This is invalid!")
+                    print(f"[FIX FixedConstraintsBuilder] Keeping original start_time {state.start_time} but this may cause issues")
                 fixed_installation_starts[module_index] = state.start_time
             # Duration = original (optimizer doesn't need it)
             fixed_durations.setdefault(module_index, {})['INSTALLATION'] = original_row.get('Installation_Duration', 0)
@@ -637,6 +660,12 @@ class FixedConstraintsBuilder:
             # Fix start time (task has started)
             actual_start = state.actual_start_time if state.actual_start_time else state.start_time
             if actual_start:
+                # Validate: IN_PROGRESS tasks should have started before or at current_time
+                if actual_start > self.current_time:
+                    print(f"[ERROR FixedConstraintsBuilder] Module {module_id} (index {module_index}) INSTALLATION IN_PROGRESS but actual_start {actual_start} > current_time {self.current_time}. This is invalid!")
+                    # Use current_time as the fixed start (task should have started by now)
+                    actual_start = self.current_time
+                    print(f"[FIX FixedConstraintsBuilder] Setting fixed_installation_starts[{module_index}] = {actual_start}")
                 fixed_installation_starts[module_index] = actual_start
             
             # Calculate remaining duration
