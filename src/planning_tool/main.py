@@ -13,8 +13,8 @@ import sys
 import pandas as pd
 from sqlalchemy import create_engine, text, inspect
 from planning_tool.datamanager import ScheduleDataManager
-from planning_tool.model import PrefabScheduler, estimate_time_horizon
-from planning_tool.rescheduler import load_delays_from_db, TaskStateIdentifier, DelayApplier, FixedConstraintsBuilder
+from planning_tool.scip import PrefabScheduler, estimate_time_horizon
+from planning_tool.rescheduler import load_delays_from_db, TaskStateIdentifier, DelayApplier
 from datetime import datetime, time, timedelta
 import traceback
 from planning_tool.ui import (
@@ -558,16 +558,58 @@ class MainWindow(QMainWindow):
                                     if pd.notna(new_duration) and new_duration != original_duration:
                                         I_d[module_idx] = int(new_duration)
                 
-                # 5. Build fixed constraints (using current_time, not tau)
+                # 5. Build re-optimization state directly (using current_time, not tau)
                 QApplication.processEvents()
-                fixed_builder = FixedConstraintsBuilder(
-                    task_states, 
-                    current_time, 
-                    modified_solution_df, 
-                    working_calendar_slots,
-                    df_base_solution
-                )
-                fixed_constraints = fixed_builder.build_fixed_constraints()
+                completed_installations = set()
+                site_inventory_modules = set()
+                factory_inventory_modules = set()
+                ongoing_installations = {}
+                ongoing_productions = {}
+
+                for module_id, module_states in task_states.items():
+                    module_idx = id_to_index.get(str(module_id))
+                    if module_idx is None:
+                        continue
+
+                    phase_map = {s.phase.upper(): s for s in module_states}
+                    fab_state = phase_map.get("FABRICATION")
+                    trans_state = phase_map.get("TRANSPORT")
+                    install_state = phase_map.get("INSTALLATION")
+
+                    if install_state:
+                        if install_state.status == "COMPLETED":
+                            completed_installations.add(module_idx)
+                        elif install_state.status == "IN_PROGRESS":
+                            start_t = install_state.actual_start_time or install_state.start_time or current_time
+                            elapsed = max(0, int(current_time - start_t))
+                            remaining = max(0, int(I_d.get(module_idx, 0)) - elapsed)
+                            if remaining > 0:
+                                ongoing_installations[module_idx] = {"remaining_duration": remaining}
+                            else:
+                                completed_installations.add(module_idx)
+
+                    install_pending = (
+                        module_idx not in completed_installations
+                        and module_idx not in ongoing_installations
+                    )
+
+                    if fab_state and fab_state.status == "IN_PROGRESS":
+                        fab_start_t = fab_state.actual_start_time or fab_state.start_time or current_time
+                        fab_elapsed = max(0, int(current_time - fab_start_t))
+                        fab_remaining = max(0, int(D.get(module_idx, 0)) - fab_elapsed)
+                        if fab_remaining > 0:
+                            ongoing_productions[module_idx] = {"remaining_duration": fab_remaining}
+
+                    if install_pending and trans_state and trans_state.status == "COMPLETED":
+                        site_inventory_modules.add(module_idx)
+                    elif (
+                        install_pending
+                        and fab_state
+                        and fab_state.status == "COMPLETED"
+                        and trans_state
+                        and trans_state.status == "NOT_STARTED"
+                    ):
+                        factory_inventory_modules.add(module_idx)
                 
                 # 6. Create new version record (Phase 5.2)
                 QApplication.processEvents()
@@ -626,7 +668,7 @@ class MainWindow(QMainWindow):
                     update_delays_query = text(f'UPDATE "{delay_table}" SET version_id = :version_id WHERE version_id IS NULL')
                     conn.execute(update_delays_query, {"version_id": new_version_id})
                 
-                # 7. Build and solve model with fixed constraints
+                # 7. Build and solve model with explicit re-optimization state
                 QApplication.processEvents()
                 scheduler = PrefabScheduler(
                     N=N,
@@ -645,13 +687,15 @@ class MainWindow(QMainWindow):
                     C_O=C_O,
                 )
                 
-                # Set fixed constraints and re-optimization time (use current_time, not tau)
-                scheduler.set_fixed_constraints(
-                    fixed_installation_starts=fixed_constraints.get('fixed_installation_starts'),
-                    fixed_production_starts=fixed_constraints.get('fixed_production_starts'),
-                    fixed_arrival_times=fixed_constraints.get('fixed_arrival_times'),
-                    fixed_durations=fixed_constraints.get('fixed_durations'),
-                    reoptimize_from_time=current_time
+                scheduler.set_reoptimization_state(
+                    {
+                        "current_time": current_time,
+                        "completed_installations": completed_installations,
+                        "site_inventory_modules": site_inventory_modules,
+                        "factory_inventory_modules": factory_inventory_modules,
+                        "ongoing_installations": ongoing_installations,
+                        "ongoing_productions": ongoing_productions,
+                    }
                 )
                 
                 QApplication.processEvents()
