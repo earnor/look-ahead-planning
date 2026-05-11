@@ -147,11 +147,23 @@ class MainWindow(QMainWindow):
             # Parse start date from settings
             fmt = "%m/%d/%Y"
             start_str = settings.get("start_datetime", "")
-            if not start_str:
-                QMessageBox.warning(self, "Error", "Start date not configured.")
+            if not start_str or start_str.lower() == "mm/dd/yyyy":
+                QMessageBox.warning(
+                    self,
+                    "Error",
+                    "Project start date is not configured. Please set it in Settings.",
+                )
                 return
-            
-            start_date = datetime.strptime(start_str, fmt).date()
+
+            try:
+                start_date = datetime.strptime(start_str, fmt).date()
+            except ValueError:
+                QMessageBox.warning(
+                    self,
+                    "Error",
+                    f"Invalid project start date: {start_str}",
+                )
+                return
             
             # Build working calendar slots to find time index
             # We need to estimate max_slot - use a large number for now
@@ -205,6 +217,54 @@ class MainWindow(QMainWindow):
         if isinstance(widget, SettingsPage):
             return widget._save_settings()
         return None
+
+    def _merge_solution_for_display(
+        self, new_df: pd.DataFrame, base_df: pd.DataFrame
+    ) -> pd.DataFrame:
+        """
+        Keep completed modules from the base schedule and overlay re-optimized rows.
+        """
+        if base_df is None or base_df.empty:
+            return new_df
+        if new_df is None or new_df.empty:
+            return base_df.copy()
+
+        schedule_columns = [
+            "Production_Start",
+            "Production_Duration",
+            "Production_Finish",
+            "Transport_Start",
+            "Transport_Duration",
+            "Arrival_Time",
+            "Factory_Wait_Start",
+            "Factory_Wait_Duration",
+            "Onsite_Wait_Start",
+            "Onsite_Wait_Duration",
+            "Installation_Start",
+            "Installation_Duration",
+            "Installation_Finish",
+        ]
+
+        merged = base_df.copy()
+        new_by_module = {
+            str(row.get("Module_ID")): row
+            for _, row in new_df.iterrows()
+            if row.get("Module_ID") is not None
+        }
+
+        for idx, base_row in merged.iterrows():
+            module_id = str(base_row.get("Module_ID"))
+            if module_id not in new_by_module:
+                continue
+            new_row = new_by_module[module_id]
+            for col in schedule_columns:
+                if col not in merged.columns or col not in new_df.columns:
+                    continue
+                new_value = new_row.get(col)
+                if pd.notna(new_value):
+                    merged.at[idx, col] = new_value
+
+        return merged
 
     def _build_working_calendar_slots(self, settings: dict, start_date: datetime.date, max_slot: int) -> list[datetime]:
         """
@@ -707,7 +767,7 @@ class MainWindow(QMainWindow):
                     self.engine,
                     self.current_project_id,
                     module_id_mapping=index_to_id,
-                    version_id=new_version_id
+                    version_id=new_version_id,
                 )
                 
                 # Update version record with optimization results
@@ -860,12 +920,16 @@ class MainWindow(QMainWindow):
                 df_sol = pd.read_sql_table(solution_table, self.engine)
 
             if not df_sol.empty and hasattr(self, "page_schedule") and isinstance(self.page_schedule, SchedulePage):
+                display_df = df_sol
+                if is_reoptimization and isinstance(locals().get("df_base_solution"), pd.DataFrame):
+                    display_df = self._merge_solution_for_display(df_sol, df_base_solution)
+
                 # determine max index needed
                 idx_cols = ["Installation_Start", "Installation_Finish", "Arrival_Time", "Production_Start", "Transport_Start"]
                 max_idx = 0
                 for col in idx_cols:
-                    if col in df_sol.columns:
-                        max_idx = max(max_idx, int(df_sol[col].max()))
+                    if col in display_df.columns:
+                        max_idx = max(max_idx, int(display_df[col].max()))
                 if max_idx <= 0:
                     max_idx = T
 
@@ -898,7 +962,7 @@ class MainWindow(QMainWindow):
                 pending_delay_map = locals().get("pending_delay_map", {})
                 modules_with_delay = locals().get("modules_with_delay", set())
 
-                for _, row in df_sol.iterrows():
+                for _, row in display_df.iterrows():
                     mod_id = row.get("Module_ID", "")
                     fab_start_idx = int(row["Production_Start"]) if not pd.isna(row.get("Production_Start")) else None
                     fab_dur = int(row.get("Production_Duration", 0))
@@ -1052,6 +1116,31 @@ class MainWindow(QMainWindow):
                 if hasattr(self, "page_schedule") and isinstance(self.page_schedule, SchedulePage):
                     self.page_schedule.populate_rows([])
                 return
+
+            versions_table = self.mgr.optimization_versions_table_name(project_id)
+            if versions_table in table_names:
+                base_version_query = (
+                    f'SELECT base_version_id FROM "{versions_table}" WHERE version_id = :version_id'
+                )
+                base_version_result = pd.read_sql(
+                    text(base_version_query),
+                    self.engine,
+                    params={"version_id": version_id},
+                )
+                if (
+                    not base_version_result.empty
+                    and pd.notna(base_version_result.iloc[0]["base_version_id"])
+                ):
+                    base_version_id = int(base_version_result.iloc[0]["base_version_id"])
+                    base_solution_query = (
+                        f'SELECT * FROM "{solution_table}" WHERE version_id = :version_id'
+                    )
+                    df_base_solution = pd.read_sql(
+                        text(base_solution_query),
+                        self.engine,
+                        params={"version_id": base_version_id},
+                    )
+                    df_sol = self._merge_solution_for_display(df_sol, df_base_solution)
             
             # Get settings for working calendar (still needed for other settings like work hours, working days, etc.)
             settings = self._get_active_settings() or {}
@@ -1059,7 +1148,6 @@ class MainWindow(QMainWindow):
                 return
             
             # Get saved start_datetime from version record (preferred)
-            versions_table = self.mgr.optimization_versions_table_name(project_id)
             saved_start_str = None
             if versions_table in table_names:
                 try:

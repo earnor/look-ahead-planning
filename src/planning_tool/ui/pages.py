@@ -1289,8 +1289,8 @@ class SettingsPage(QWidget):
     
     def _save_settings(self):
         return {
-            "start_datetime": self.start_datetime.text(),
-            "target_datetime": self.target_datetime.text(),
+            "start_datetime": self.start_datetime.date().toString("MM/dd/yyyy"),
+            "target_datetime": self.target_datetime.date().toString("MM/dd/yyyy"),
             "working_days": self.get_working_days_map(),
             "work_start_time": self.work_start_time.text(),
             "work_end_time": self.work_end_time.text(),
@@ -2143,12 +2143,31 @@ class ComparisonPage(QWidget):
                         df = pd.read_sql(text(query), self.engine, params={"version_id": version_id})
                         # Get version label and project_start_datetime
                         if versions_table_name in inspector.get_table_names():
-                            v_query = f'SELECT version_number, project_start_datetime FROM "{versions_table_name}" WHERE version_id = :version_id'
+                            v_query = (
+                                f'SELECT version_number, project_start_datetime, base_version_id '
+                                f'FROM "{versions_table_name}" WHERE version_id = :version_id'
+                            )
                             v_result = pd.read_sql(text(v_query), self.engine, params={"version_id": version_id})
                             if not v_result.empty:
                                 label = f"Version {v_result.iloc[0]['version_number']}"
                                 if pd.notna(v_result.iloc[0]['project_start_datetime']):
                                     start_datetime = v_result.iloc[0]['project_start_datetime']
+                                base_version_id = v_result.iloc[0].get("base_version_id")
+                                if (
+                                    pd.notna(base_version_id)
+                                    and hasattr(self, "main_window")
+                                    and self.main_window
+                                ):
+                                    base_query = (
+                                        f'SELECT * FROM "{table_name}" '
+                                        f'WHERE version_id = :version_id ORDER BY Production_Start ASC'
+                                    )
+                                    df_base = pd.read_sql(
+                                        text(base_query),
+                                        self.engine,
+                                        params={"version_id": int(base_version_id)},
+                                    )
+                                    df = self.main_window._merge_solution_for_display(df, df_base)
                     else:
                         label = f"Version {version_id} (No data)"
                 

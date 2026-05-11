@@ -217,7 +217,7 @@ class PrefabScheduler:
         The goal is to obtain an incumbent quickly; gap tightening can be done
         later via solve(time_limit=..., mip_gap=...).
         """
-        self._safe_set_param(model, "limits/time", 300.0)
+        self._safe_set_param(model, "limits/time", 360.0)
         self._safe_set_param(model, "limits/gap", 1.0)
         self._safe_set_param(model, "randomization/randomseedshift", 0)
         self._safe_set_param(model, "parallel/maxnthreads", 8)
