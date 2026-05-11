@@ -212,23 +212,27 @@ class PrefabScheduler:
 
     def _apply_default_scip_parameters(self, model):
         """
-        Default SCIP parameters.
+        Feasibility-first SCIP defaults.
 
-        These can be overwritten later in solve().
+        The goal is to obtain an incumbent quickly; gap tightening can be done
+        later via solve(time_limit=..., mip_gap=...).
         """
-        self._safe_set_param(model, "limits/time", 120.0) #SCIP的参数设置是包含slash的
-        self._safe_set_param(model, "limits/gap", 0.2)
+        self._safe_set_param(model, "limits/time", 300.0)
+        self._safe_set_param(model, "limits/gap", 1.0)
         self._safe_set_param(model, "randomization/randomseedshift", 0)
-
-        # Use a positive number of threads.
         self._safe_set_param(model, "parallel/maxnthreads", 8)
 
-        # Optional heuristic emphasis.
-        self._safe_set_param(model, "heuristics/emphasis", "aggressive")
+        # Prefer cheaper primal search over aggressive improvement heuristics.
+        self._safe_set_param(model, "heuristics/emphasis", "fast")
 
-        # Optional weakening of separation.
+        # Keep root separation light before the first feasible solution exists.
+        self._safe_set_param(model, "separating/maxroundsroot", 2)
         self._safe_set_param(model, "separating/maxrounds", 0)
-        self._safe_set_param(model, "separating/maxroundsroot", 0)
+
+        # Leave feasibility-oriented heuristics on SCIP defaults (-1 = auto).
+        self._safe_set_param(model, "heuristics/feaspump/freq", -1)
+        self._safe_set_param(model, "heuristics/rens/freq", -1)
+        self._safe_set_param(model, "heuristics/undercover/freq", -1)
 
     def _get_remaining_finish_time(self, current_time, info):
         """
