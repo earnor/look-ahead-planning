@@ -4,6 +4,7 @@ Dynamic Rescheduling Module
 This module handles delay detection and re-optimization of schedules.
 It identifies task states, applies delays, and builds fixed constraints for re-optimization.
 """
+import math
 from typing import Dict, List, Tuple, Optional, Set
 from datetime import datetime
 from dataclasses import dataclass
@@ -199,6 +200,88 @@ class TaskStateIdentifier:
             progress=progress,
             actual_start_time=actual_start
         )
+
+
+def _remaining_of_phase(state: Optional[TaskState], total_duration: int, current_time: int) -> int:
+    """Periods of this phase still occupying the calendar after tau."""
+    if state is None or state.status == "COMPLETED":
+        return 0
+    total = max(0, int(total_duration or 0))
+    if state.status == "IN_PROGRESS":
+        start = state.actual_start_time if state.actual_start_time else state.start_time
+        elapsed = max(0, current_time - int(start)) if start else 0
+        return max(0, total - elapsed)
+    return total
+
+
+def remaining_periods_after_tau(
+    task_states: Dict[str, List[TaskState]],
+    current_time: int,
+    D: Dict[int, int],
+    L: Dict[int, int],
+    d: Dict[int, int],
+    E: List[Tuple[int, int]],
+    C_install: int,
+    M_machine: int = 1,
+    earliest_starts: Optional[Dict[int, Dict[str, int]]] = None,
+) -> int:
+    """
+    Lower bound on how many periods are still needed after tau.
+
+    Unfixed processes cannot start before tau. New delay hours are not folded
+    in here; the caller adds them before applying the 25% slack.
+    """
+    by_index: Dict[int, Dict[str, TaskState]] = {}
+    for states in task_states.values():
+        for state in states:
+            by_index.setdefault(state.module_index, {})[state.phase] = state
+
+    modules = sorted({i for i in D} | {i for i in L} | {i for i in d} | set(by_index))
+    rem_D: Dict[int, int] = {}
+    rem_L: Dict[int, int] = {}
+    rem_d: Dict[int, int] = {}
+    es_install: Dict[int, int] = {}
+    earliest_starts = earliest_starts or {}
+
+    for i in modules:
+        phases = by_index.get(i, {})
+        rem_D[i] = _remaining_of_phase(phases.get("FABRICATION"), D.get(i, 0), current_time)
+        rem_L[i] = _remaining_of_phase(phases.get("TRANSPORT"), L.get(i, 0), current_time)
+        rem_d[i] = _remaining_of_phase(phases.get("INSTALLATION"), d.get(i, 0), current_time)
+
+        offset = 0
+        bounds = earliest_starts.get(i, {})
+        fab_state = phases.get("FABRICATION")
+        inst_state = phases.get("INSTALLATION")
+        if fab_state is not None and fab_state.status == "NOT_STARTED" and bounds.get("FABRICATION"):
+            offset = max(offset, int(bounds["FABRICATION"]) - current_time)
+        if inst_state is not None and inst_state.status == "NOT_STARTED" and bounds.get("INSTALLATION"):
+            offset = max(offset, int(bounds["INSTALLATION"]) - current_time - rem_D[i] - rem_L[i])
+        es_install[i] = max(0, offset) + rem_D[i] + rem_L[i]
+
+    preds = {i: [] for i in modules}
+    for pred, succ in E:
+        if pred in preds and succ in es_install:
+            preds[succ].append(pred)
+
+    changed = True
+    guard = 0
+    while changed and guard < len(modules) + 1:
+        changed = False
+        guard += 1
+        for i in modules:
+            for pred in preds[i]:
+                cand = es_install[pred] + rem_d[pred]
+                if cand > es_install[i]:
+                    es_install[i] = cand
+                    changed = True
+
+    chain = max((es_install[i] + rem_d[i] for i in modules), default=0)
+    crews = max(1, int(C_install or 1))
+    machines = max(1, int(M_machine or 1))
+    crew_bound = math.ceil(sum(rem_d.values()) / crews)
+    machine_bound = math.ceil(sum(rem_D.values()) / machines)
+    return int(max(chain, crew_bound, machine_bound, 0))
 
 
 class DelayApplier:

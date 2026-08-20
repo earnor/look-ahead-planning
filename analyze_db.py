@@ -2,9 +2,11 @@
 临时脚本：分析数据库表结构和内容
 """
 import sqlite3
+from pathlib import Path
 
 # 连接到数据库
-conn = sqlite3.connect("input_database.db")
+DB_PATH = Path(__file__).resolve().parent / "data" / "input_database.db"
+conn = sqlite3.connect(DB_PATH)
 cursor = conn.cursor()
 
 # 获取所有表

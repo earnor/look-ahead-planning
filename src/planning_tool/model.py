@@ -1,39 +1,8 @@
 from gurobipy import Model, GRB, quicksum
+import math
 import pandas as pd
 from sqlalchemy import Engine, text
 from typing import Optional, Dict, Any
-from datetime import date
-
-
-def estimate_time_horizon(start_date: date, end_date: date, 
-                         hours_per_day: float = 8.0,
-                         safety_factor: float = 1.0) -> int:
-    """
-    Estimate time horizon T in working hours from project start/end dates.
-    
-    Simple approach: T = (end_date - start_date).days * hours_per_day * safety_factor
-    
-    Args:
-        start_date: Project start date
-        end_date: Project target end date
-        hours_per_day: Average working hours per day (default 8.0)
-        safety_factor: Safety factor to add buffer (default 1.2)
-    
-    Returns:
-        T: Total number of working hours (time slots)
-    """
-    if end_date <= start_date:
-        total_days = 1
-    else:
-        total_days = (end_date - start_date).days + 1
-    
-    # Simple calculation: days * hours_per_day * safety_factor
-    raw_T = total_days * hours_per_day * safety_factor
-    T = int(raw_T)
-    if raw_T > T:  # ceil for non-integers
-        T += 1
-    
-    return max(1, T)
 
 
 class PrefabScheduler:
@@ -48,10 +17,13 @@ class PrefabScheduler:
                  M_machine,
                  S_site,
                  S_fac,
-                 OC,
-                 C_I,
-                 C_F, 
-                 C_O):
+                 w_duration,
+                 w_transport,
+                 w_site_storage,
+                 w_factory_storage,
+                 reference,
+                 min_batch_size: int = 3,
+                 max_batch_size: int = 5):
         """
         in English
         N: number of modules (real modules 1..N)
@@ -64,9 +36,12 @@ class PrefabScheduler:
         M_machine: machine number at factory
         S_site: onsite storage capacity
         S_fac: factory buffer storage capacity
-        OC: cost per order batch
-        C_I: penalty cost per unit time
-        C_F: factory inventory cost per unit time per unit
+        w_*: priority of each objective term, meant to add up to 1
+        reference: values each term is divided by. Duration and transport keep
+            their own scale. The two storage terms share one denominator (the
+            heuristic's total waiting time), so the weights compare a factory
+            module-period with a site module-period instead of being decided
+            by whichever side happened to be empty in the heuristic.
         """
         self.N = N
         self.T = T
@@ -78,10 +53,29 @@ class PrefabScheduler:
         self.M_machine = M_machine
         self.S_site = S_site
         self.S_fac = S_fac
-        self.OC = OC
-        self.C_I = C_I
-        self.C_F = C_F
-        self.C_O = C_O
+        self.w_duration = w_duration
+        self.w_transport = w_transport
+        self.w_site_storage = w_site_storage
+        self.w_factory_storage = w_factory_storage
+        raw = {k: float(v) for k, v in reference.items()}
+        # A zero divisor would blow up the term it scales. The two storage
+        # columns are kept separately for diagnostics; the MIP uses their sum
+        # so a JIT heuristic (factory wait = 0) cannot make factory storage
+        # look a hundred times more expensive than site storage.
+        self.reference = {
+            "ref_duration": max(1.0, raw["ref_duration"]),
+            "ref_transport": max(1.0, raw["ref_transport"]),
+            "ref_site_storage": raw.get("ref_site_storage", 0.0),
+            "ref_factory_storage": raw.get("ref_factory_storage", 0.0),
+            "ref_storage": max(
+                1.0,
+                raw.get("ref_site_storage", 0.0) + raw.get("ref_factory_storage", 0.0),
+            ),
+        }
+        # A delivery carries between min and max modules; a single load may be
+        # smaller because the module count rarely fills every truck.
+        self.min_batch_size = min_batch_size
+        self.max_batch_size = max_batch_size
         # dummies
         self.dummy_start = 0
         self.dummy_end = N + 1
@@ -97,6 +91,8 @@ class PrefabScheduler:
         self.q = {}
         self.z = {}
         self.F = {}
+        self.u = {}
+        self.time_windows = None
         
         # Fixed constraints for re-optimization
         self.fixed_installation_starts = {}
@@ -145,9 +141,164 @@ class PrefabScheduler:
         leaves = [i for i in range(1, self.N + 1) if len(succs[i]) == 0]    
         return roots, leaves
 
+    def _topological_order(self) -> Optional[list]:
+        """Modules in precedence order, or None if the precedence graph has a cycle."""
+        indeg = {i: 0 for i in range(1, self.N + 1)}
+        succs = {i: [] for i in range(1, self.N + 1)}
+        for (i, j) in set(self.E):
+            succs[i].append(j)
+            indeg[j] += 1
+
+        queue = [i for i in range(1, self.N + 1) if indeg[i] == 0]
+        order = []
+        while queue:
+            i = queue.pop()
+            order.append(i)
+            for j in succs[i]:
+                indeg[j] -= 1
+                if indeg[j] == 0:
+                    queue.append(j)
+
+        return order if len(order) == self.N else None
+
+    def compute_time_windows(self) -> Optional[Dict[str, Dict[int, tuple]]]:
+        """
+        Earliest and latest start time of every activity.
+
+        A module cannot be installed before it has been produced and shipped, nor
+        before its predecessors are done; and it cannot start so late that its
+        successors no longer fit before T. Arrival and production windows follow
+        from the installation window through the transport and production lead
+        times. Variables outside their window are created with an upper bound of
+        zero, so presolve drops them instead of leaving them to branch on.
+
+        Returns None when no tightening can be justified, in which case the model
+        keeps the full 1..T range for every activity.
+        """
+        N, T = self.N, self.T
+        d, D, L = self.d, self.D, self.L
+
+        order = self._topological_order()
+        if order is None:
+            return None
+
+        preds = {i: [] for i in range(1, N + 1)}
+        succs = {i: [] for i in range(1, N + 1)}
+        for (i, j) in self.E:
+            succs[i].append(j)
+            preds[j].append(i)
+
+        # All predecessors of a module have to be installed before it starts, and
+        # all its successors afterwards. With a limited number of crews that work
+        # needs room in the schedule, which bounds the module far more tightly
+        # than the longest chain does when the precedence graph is wide and flat.
+        crew = max(1, self.C_install)
+        work_before, work_after = {}, {}
+        for i in order:
+            done = set()
+            for p in preds[i]:
+                done |= work_before[p] | {p}
+            work_before[i] = done
+        for i in reversed(order):
+            todo = set()
+            for s in succs[i]:
+                todo |= work_after[s] | {s}
+            work_after[i] = todo
+
+        def crew_periods(modules) -> int:
+            return math.ceil(sum(d[k] for k in modules) / crew)
+
+        tau = self.reoptimize_from_time
+
+        # Installation, forward pass. Re-optimization pins some activities; those
+        # values replace the bound so that the windows stay consistent with them.
+        es_x, ls_x = {}, {}
+        for i in order:
+            fixed = self.fixed_installation_starts.get(i)
+            if fixed is not None:
+                es_x[i] = fixed
+                continue
+            earliest = max(1 + D[i] + L[i], 1 + crew_periods(work_before[i]))
+            for p in preds[i]:
+                earliest = max(earliest, es_x[p] + d[p])
+            fixed_arrival = self.fixed_arrival_times.get(i)
+            if fixed_arrival is not None:
+                earliest = max(earliest, fixed_arrival)
+            if tau is not None:
+                earliest = max(earliest, tau)
+            es_x[i] = earliest
+
+        # Installation, backward pass. A leaf must also finish before the dummy
+        # end activity, which itself cannot start later than T.
+        for i in reversed(order):
+            fixed = self.fixed_installation_starts.get(i)
+            if fixed is not None:
+                ls_x[i] = fixed
+                continue
+            latest = T - d[i] + 1 - crew_periods(work_after[i])
+            if succs[i]:
+                latest = min(latest, min(ls_x[j] - d[i] for j in succs[i]))
+            else:
+                latest = min(latest, T - d[i])
+            ls_x[i] = latest
+
+        # Arrival and production follow from the installation window.
+        es_p, ls_p, es_q, ls_q = {}, {}, {}, {}
+        for i in range(1, N + 1):
+            fixed_arrival = self.fixed_arrival_times.get(i)
+            fixed_prod = self.fixed_production_starts.get(i)
+
+            if fixed_arrival is not None:
+                es_p[i] = ls_p[i] = fixed_arrival
+            else:
+                es_p[i] = 1 + D[i] + L[i]
+                if fixed_prod is not None:
+                    es_p[i] = max(es_p[i], fixed_prod + D[i] + L[i])
+                if tau is not None:
+                    es_p[i] = max(es_p[i], tau)
+                ls_p[i] = ls_x[i]
+
+            if fixed_prod is not None:
+                es_q[i] = ls_q[i] = fixed_prod
+            else:
+                es_q[i] = 1 if tau is None else max(1, tau)
+                ls_q[i] = ls_p[i] - D[i] - L[i]
+
+        windows = {
+            "install": {i: (es_x[i], ls_x[i]) for i in range(1, N + 1)},
+            "arrival": {i: (es_p[i], ls_p[i]) for i in range(1, N + 1)},
+            "production": {i: (es_q[i], ls_q[i]) for i in range(1, N + 1)},
+        }
+
+        # An empty window means the horizon or the pinned values cannot hold this
+        # schedule. Tightening would then turn a merely tight model into an
+        # infeasible one, so drop the preprocessing and let the solver decide.
+        for kind, per_module in windows.items():
+            for i, (lo, hi) in per_module.items():
+                if lo > hi or hi < 1 or lo > T:
+                    print(f"[TimeWindows] {kind} window for module {i} is empty "
+                          f"({lo}..{hi}, T={T}); skipping the preprocessing.")
+                    return None
+
+        dummy_end_earliest = max(es_x[i] + d[i] for i in self.leaves) if self.leaves else 1
+
+        # Every installation has to fit between the first possible start and the
+        # end of the project, and the crews can only do so much per period. This
+        # bounds the project end far below what the precedence chains alone give,
+        # which is what the relaxation otherwise exploits to look cheap.
+        if es_x:
+            total_install = sum(d[i] for i in range(1, N + 1))
+            dummy_end_earliest = max(
+                dummy_end_earliest,
+                min(es_x.values()) + math.ceil(total_install / crew),
+            )
+
+        windows["dummy_end"] = (max(1, min(dummy_end_earliest, T)), T)
+        return windows
+
     def build_model(self):
         m = Model("prefab_with_factory_buffer")
-        m.Params.TimeLimit = 120      # 最多算 120 秒
+        m.Params.TimeLimit = 120      # 兜底：到 20% 间隙或到时限，先到为准
         m.Params.MIPGap    = 0.2     # 允许 20% 最优间隙
         m.Params.MIPFocus  = 1        # 更关注找可行解
         m.Params.Heuristics = 0.2     # 增强启发式（默认 0.05 左右）
@@ -164,40 +315,77 @@ class PrefabScheduler:
         dummy_end = self.dummy_end
 
         # ============ 3. variables ============
+        # Activities can only run inside their time window, so every variable
+        # outside it is fixed to zero and disappears in presolve.
+        windows = self.compute_time_windows()
+        self.time_windows = windows
+
+        def bound(kind: str, i: int, t: int) -> float:
+            if windows is None:
+                return 1.0
+            lo, hi = windows[kind][i]
+            return 1.0 if lo <= t <= hi else 0.0
+
+        start_time_dummy = 1 if self.reoptimize_from_time is None else max(1, self.reoptimize_from_time)
+
         # x[i,t] start installation (including dummy)
         x = {}
         for i in range(0, N + 2):
             for t in range(1, T + 1):
-                x[i, t] = m.addVar(vtype=GRB.BINARY, name=f"x_{i}_{t}")
+                if i == dummy_start:
+                    ub = 1.0 if t == start_time_dummy else 0.0
+                elif i == dummy_end:
+                    ub = 1.0 if windows is None or windows["dummy_end"][0] <= t <= windows["dummy_end"][1] else 0.0
+                else:
+                    ub = bound("install", i, t)
+                x[i, t] = m.addVar(vtype=GRB.BINARY, ub=ub, name=f"x_{i}_{t}")
 
         # y[i,t] installing (only real activities)
         y = {}
         for i in range(1, N + 1):
             for t in range(1, T + 1):
-                y[i, t] = m.addVar(vtype=GRB.BINARY, name=f"y_{i}_{t}")
+                if windows is None:
+                    ub = 1.0
+                else:
+                    lo, hi = windows["install"][i]
+                    ub = 1.0 if lo <= t <= hi + d[i] - 1 else 0.0
+                y[i, t] = m.addVar(vtype=GRB.BINARY, ub=ub, name=f"y_{i}_{t}")
 
         # p[i,t] arrival at site
         p = {}
         for i in range(1, N + 1):
             for t in range(1, T + 1):
-                p[i, t] = m.addVar(vtype=GRB.BINARY, name=f"p_{i}_{t}")
+                p[i, t] = m.addVar(vtype=GRB.BINARY, ub=bound("arrival", i, t), name=f"p_{i}_{t}")
 
-        # site inventory
+        # site inventory: a module only occupies the yard between its earliest
+        # arrival and its latest installation start
         I = {}
         for i in range(1, N + 1):
             for t in range(1, T + 1):
-                I[i, t] = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, name=f"I_{i}_{t}")
+                if windows is None:
+                    ub = GRB.INFINITY
+                else:
+                    ub = 1.0 if windows["arrival"][i][0] <= t < windows["install"][i][1] else 0.0
+                I[i, t] = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, ub=ub, name=f"I_{i}_{t}")
 
         # factory production start
         q = {}
         for i in range(1, N + 1):
             for t in range(1, T + 1):
-                q[i, t] = m.addVar(vtype=GRB.BINARY, name=f"q_{i}_{t}")
+                q[i, t] = m.addVar(vtype=GRB.BINARY, ub=bound("production", i, t), name=f"q_{i}_{t}")
 
-        # order per time (batch)
+        # order per time (batch): no delivery can happen outside the periods in
+        # which some module is able to arrive
+        if windows is None:
+            delivery_lo, delivery_hi = 1, T
+        else:
+            delivery_lo = min(lo for lo, _ in windows["arrival"].values())
+            delivery_hi = max(hi for _, hi in windows["arrival"].values())
+
         z = {}
         for t in range(1, T + 1):
-            z[t] = m.addVar(vtype=GRB.BINARY, name=f"z_{t}")
+            ub = 1.0 if delivery_lo <= t <= delivery_hi else 0.0
+            z[t] = m.addVar(vtype=GRB.BINARY, ub=ub, name=f"z_{t}")
 
         # factory inventory
         F = {}
@@ -354,6 +542,25 @@ class PrefabScheduler:
             for i in range(1, N + 1):
                 m.addConstr(p[i, t] <= z[t], f"link_order_{i}_{t}")
 
+        # (15b) truck load size: a delivery carries between min_batch_size and
+        # max_batch_size modules. u[t] marks the single partial load that the
+        # project is allowed to ship, since N rarely fills every truck exactly.
+        u = {}
+        for t in range(1, T + 1):
+            ub = 1.0 if delivery_lo <= t <= delivery_hi else 0.0
+            u[t] = m.addVar(vtype=GRB.BINARY, ub=ub, name=f"u_{t}")
+
+        m.addConstr(quicksum(u[t] for t in range(1, T + 1)) <= 1, "single_partial_load")
+        for t in range(1, T + 1):
+            load = quicksum(p[i, t] for i in range(1, N + 1))
+            m.addConstr(u[t] <= z[t], f"partial_load_needs_delivery_{t}")
+            m.addConstr(load >= z[t], f"delivery_not_empty_{t}")
+            m.addConstr(load <= self.max_batch_size * z[t], f"load_max_{t}")
+            m.addConstr(
+                load >= self.min_batch_size * z[t] - self.min_batch_size * u[t],
+                f"load_min_{t}"
+            )
+
         # (16) factory inventory: F1 = 0
         m.addConstr(F[1] == 0, "factory_init")
 
@@ -375,13 +582,23 @@ class PrefabScheduler:
             m.addConstr(F[s] <= self.S_fac, f"factory_cap_{s}")
 
         # ============ 5. objective ============
+        # Duration and transport are different units, so each keeps its own
+        # reference. Site and factory storage are both module-periods and share
+        # one, so the weights 0.4 / 0.1 mean a factory wait is a quarter as
+        # costly as the same wait on site.
         finish_time = quicksum(t * x[dummy_end, t] for t in range(1, T + 1))
-        order_cost = quicksum(self.OC * z[t] for t in range(1, T + 1))
-        factory_cost = quicksum(self.C_F * F[s] for s in range(1, T + 1))
-        onsite_cost = quicksum(self.C_O * I[i, t] for i in range(1, N + 1) for t in range(1, T + 1))
-        indirect_cost = self.C_I * finish_time
+        deliveries = quicksum(z[t] for t in range(1, T + 1))
+        factory_storage = quicksum(F[s] for s in range(1, T + 1))
+        site_storage = quicksum(I[i, t] for i in range(1, N + 1) for t in range(1, T + 1))
 
-        m.setObjective(order_cost + factory_cost + onsite_cost + indirect_cost, GRB.MINIMIZE) # add onsite cost
+        ref = self.reference
+        m.setObjective(
+            self.w_duration * finish_time / ref["ref_duration"]
+            + self.w_transport * deliveries / ref["ref_transport"]
+            + self.w_site_storage * site_storage / ref["ref_storage"]
+            + self.w_factory_storage * factory_storage / ref["ref_storage"],
+            GRB.MINIMIZE,
+        )
 
         # 保存对象
         self.m = m
@@ -392,6 +609,7 @@ class PrefabScheduler:
         self.q = q
         self.z = z
         self.F = F
+        self.u = u
 
         return m
 
@@ -416,6 +634,11 @@ class PrefabScheduler:
             return None
         
         if self.m.Status not in [GRB.OPTIMAL, GRB.TIME_LIMIT, GRB.SUBOPTIMAL]:
+            return None
+
+        # A run can stop on the time limit before any feasible solution was found;
+        # reading variable values in that case raises inside gurobipy.
+        if self.m.SolCount == 0:
             return None
         
         solution = {

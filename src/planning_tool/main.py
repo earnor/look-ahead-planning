@@ -9,12 +9,26 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import QDateTime, QTime, QDate, QLocale
 from pathlib import Path
+import math
 import sys
 import pandas as pd
 from sqlalchemy import create_engine, text, inspect
 from planning_tool.datamanager import ScheduleDataManager
-from planning_tool.model import PrefabScheduler, estimate_time_horizon
-from planning_tool.rescheduler import load_delays_from_db, TaskStateIdentifier, DelayApplier, FixedConstraintsBuilder
+from planning_tool.model import PrefabScheduler
+from planning_tool.warm_start import (
+    construct_solution,
+    horizon_from_makespan,
+    horizon_from_remaining,
+    reference_values,
+    trivial_horizon_bound,
+)
+from planning_tool.rescheduler import (
+    load_delays_from_db,
+    TaskStateIdentifier,
+    DelayApplier,
+    FixedConstraintsBuilder,
+    remaining_periods_after_tau,
+)
 from datetime import datetime, time, timedelta
 import traceback
 from planning_tool.ui import (
@@ -23,6 +37,15 @@ from planning_tool.ui import (
     DelayInputDialog, Card, FileDropArea, Chip
 )
 
+# Resolved from the source tree so the app finds the same database no matter
+# which directory it is launched from.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "input_database.db"
+
+
+def create_default_engine():
+    return create_engine(f"sqlite:///{DEFAULT_DB_PATH}", echo=False, future=True)
+
 
 class MainWindow(QMainWindow):
     def __init__(self, engine=None, parent=None):
@@ -30,7 +53,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("ETH Zurich")
         self.resize(1280, 760)
         if engine is None:
-            engine = create_engine("sqlite:///scheduler.db", echo=False, future=True)
+            engine = create_default_engine()
         self.engine = engine
         self.mgr = ScheduleDataManager(engine)
 
@@ -205,6 +228,60 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save delay: {str(e)}")
 
+    @staticmethod
+    def _read_duration_column(df: pd.DataFrame, column: str) -> dict[int, int]:
+        """
+        Read a duration column as non-negative whole numbers.
+        Raises ValueError naming the offending rows instead of failing on the first one.
+        """
+        if column not in df.columns:
+            raise ValueError(f'Required column "{column}" is missing from the input data.')
+
+        values: dict[int, int] = {}
+        bad_rows: list[str] = []
+        for i in range(len(df)):
+            raw = df.iloc[i][column]
+            try:
+                if pd.isna(raw):
+                    raise ValueError
+                number = float(raw)
+            except (TypeError, ValueError):
+                bad_rows.append(f"    row {i + 2}: {raw!r}")
+                continue
+            if number < 0 or number != int(number):
+                bad_rows.append(f"    row {i + 2}: {raw!r}")
+                continue
+            values[i + 1] = int(number)
+
+        if bad_rows:
+            shown = bad_rows[:10]
+            if len(bad_rows) > len(shown):
+                shown.append(f"    ... and {len(bad_rows) - len(shown)} more")
+            raise ValueError(
+                f'Column "{column}" must contain non-negative whole numbers.\n'
+                "These rows are invalid:\n" + "\n".join(shown)
+            )
+        return values
+
+    def _abort_calculation(self, calc_dialog, calculate_btn, original_btn_text: str,
+                           title: str, message: str):
+        """Close the progress dialog, restore the Calculate button and explain why we stopped."""
+        calc_dialog.close()
+        if calculate_btn:
+            calculate_btn.setEnabled(True)
+            calculate_btn.setText(original_btn_text)
+        QMessageBox.warning(self, title, message)
+
+    @staticmethod
+    def _parse_settings_date(value: str):
+        """
+        Parse a date string coming from SettingsPage.
+        Raises ValueError when the field still holds the "not set" placeholder.
+        """
+        if not value or value.strip().lower() == "mm/dd/yyyy":
+            raise ValueError("Date is not configured")
+        return datetime.strptime(value.strip(), "%m/%d/%Y").date()
+
     def _get_active_settings(self) -> dict | None:
         """
         Helper to fetch current settings from SettingsPage.
@@ -355,22 +432,38 @@ class MainWindow(QMainWindow):
             # 1) get settings
             settings = self._get_active_settings() or {}  # return a dict of settings
             
-            # parse dates (we use only date part for T)
+            # parse dates (we use only the date part to anchor the schedule)
             fmt = "%m/%d/%Y"
             start_str = settings.get("start_datetime", "")
-            target_str = settings.get("target_datetime", "")
-            start_date = datetime.strptime(start_str, fmt).date() if start_str else datetime.today().date()
-            end_date = datetime.strptime(target_str, fmt).date() if target_str else start_date
 
-            # crew / machines / capacities / costs
+            try:
+                start_date = self._parse_settings_date(start_str)
+            except ValueError:
+                self._abort_calculation(
+                    calc_dialog, calculate_btn, original_btn_text,
+                    "Missing Start Date",
+                    "Project start date is not configured. Please set it in Settings before running Calculate.",
+                )
+                return
+
+            # crew / machines / capacities / objective weights
             C_install = int(settings.get("crew_count", "1") or 1)
             M_machine = int(settings.get("machine_count", "1") or 1)
             S_site = int(settings.get("site_storage", "0") or 0)
             S_fac = int(settings.get("factory_storage", "0") or 0)
-            OC = float(settings.get("order_cost", "0") or 0)
-            C_I = float(settings.get("penalty_cost", "0") or 0)
-            C_F = float(settings.get("factory_inv_cost", "0") or 0)
-            C_O = float(settings.get("onsite_inv_cost", "0") or 0)
+            w_duration = float(settings.get("w_duration", "0") or 0)
+            w_transport = float(settings.get("w_transport", "0") or 0)
+            w_site_storage = float(settings.get("w_site_storage", "0") or 0)
+            w_factory_storage = float(settings.get("w_factory_storage", "0") or 0)
+
+            if w_duration + w_transport + w_site_storage + w_factory_storage <= 0:
+                self._abort_calculation(
+                    calc_dialog, calculate_btn, original_btn_text,
+                    "No Objective Weights",
+                    "All objective weights are zero, so there is nothing to optimize. "
+                    "Set them in Settings before running Calculate.",
+                )
+                return
 
             # 2) load raw schedule for current project
             QApplication.processEvents()
@@ -383,9 +476,16 @@ class MainWindow(QMainWindow):
             N = len(df)
             # Use clearer names to avoid confusion with delay objects:
             # I_d: installation durations, D: production durations, L: transport durations
-            I_d = {i + 1: int(df.iloc[i]["Installation Duration"]) for i in range(N)}
-            D = {i + 1: int(df.iloc[i]["Production Duration"]) for i in range(N)}
-            L = {i + 1: int(df.iloc[i]["Transportation Duration"]) for i in range(N)}
+            try:
+                I_d = self._read_duration_column(df, "Installation Duration")
+                D = self._read_duration_column(df, "Production Duration")
+                L = self._read_duration_column(df, "Transportation Duration")
+            except ValueError as e:
+                self._abort_calculation(
+                    calc_dialog, calculate_btn, original_btn_text,
+                    "Invalid Input Data", str(e),
+                )
+                return
 
             # Accept both uploaded raw CSV naming ("Module ID") and
             # internal solution naming ("Module_ID").
@@ -406,69 +506,100 @@ class MainWindow(QMainWindow):
 
             # precedence list E, expecting a column like "Installation Precedence" with module IDs
             E = []
+            unknown_predecessors: list[str] = []
             if "Installation Precedence" in df.columns:
                 for i in range(N):
-                    preds_str = str(df.iloc[i]["Installation Precedence"] or "").strip()
-                    if not preds_str or preds_str.upper() == "NaN":
+                    raw_preds = df.iloc[i]["Installation Precedence"]
+                    if pd.isna(raw_preds):
                         continue
-                    preds = [p.strip() for p in preds_str.split(",") if p.strip()]
+                    preds = [p.strip() for p in str(raw_preds).split(",") if p.strip()]
                     for p in preds:
                         idx = id_to_index.get(p)
-                        if idx is not None:
-                            E.append((idx, i + 1))
+                        if idx is None:
+                            # Dropping it silently would remove a precedence constraint
+                            # and produce a schedule that looks valid but is not.
+                            unknown_predecessors.append(f'    row {i + 2}: "{p}"')
+                            continue
+                        E.append((idx, i + 1))
 
-            # 3) compute time horizon T from dates (in working hours)
-            # Simple estimate: calculate average hours per day from working calendar
-            # If not available, default to 8 hours per day
-            hours_per_day = 8.0  # default
-            try:
-                # Try to estimate from working calendar settings
-                working_days = settings.get("working_days", {})
-                if working_days:
-                    # Count working days per week
-                    working_days_per_week = sum(1 for v in working_days.values() if v)
-                    if working_days_per_week > 0:
-                        # Parse work hours (datetime and time are already imported at top of file)
-                        def parse_time(s: str, default: time) -> time:
-                            if not s:
-                                return default
-                            for fmt in ("%I:%M %p", "%H:%M"):
-                                try:
-                                    return datetime.strptime(s, fmt).time()
-                                except ValueError:
-                                    continue
-                            return default
-                        
-                        work_start = parse_time(settings.get("work_start_time", "08:00"), time(8, 0))
-                        work_end = parse_time(settings.get("work_end_time", "17:00"), time(17, 0))
-                        break_start = parse_time(settings.get("break_start_time", "12:00"), time(12, 0))
-                        break_end = parse_time(settings.get("break_end_time", "13:00"), time(13, 0))
-                        
-                        # Calculate hours per working day
-                        ref_date = datetime(2025, 1, 1)
-                        period1 = (datetime.combine(ref_date, break_start) - datetime.combine(ref_date, work_start)).total_seconds() / 3600
-                        period2 = (datetime.combine(ref_date, work_end) - datetime.combine(ref_date, break_end)).total_seconds() / 3600
-                        hours_per_working_day = max(0, period1) + max(0, period2)
-                        
-                        # Average hours per calendar day = (working_days_per_week / 7) * hours_per_working_day
-                        hours_per_day = (working_days_per_week / 7.0) * hours_per_working_day
-            except Exception:
-                pass  # Use default 8.0 if calculation fails
-            
-            QApplication.processEvents()
-            T = estimate_time_horizon(start_date, end_date, hours_per_day=hours_per_day)
+            if unknown_predecessors:
+                shown = unknown_predecessors[:10]
+                if len(unknown_predecessors) > len(shown):
+                    shown.append(f"    ... and {len(unknown_predecessors) - len(shown)} more")
+                self._abort_calculation(
+                    calc_dialog, calculate_btn, original_btn_text,
+                    "Unknown Predecessor Modules",
+                    'These entries in "Installation Precedence" do not match any module ID '
+                    "in the input data, so their precedence constraints cannot be applied:\n\n"
+                    + "\n".join(shown),
+                )
+                return
 
-            # Check if we have pending delays (Phase 5.2 & 6: Re-optimization workflow)
+            # 3) horizon and objective reference
+            # First optimization: a constructive heuristic sizes T and the
+            # reference. Re-optimization reuses the stored reference and sizes
+            # T from the work still left after tau, so skip the heuristic then.
             QApplication.processEvents()
             delay_table = ScheduleDataManager.delay_updates_table_name(self.current_project_id)
             versions_table = ScheduleDataManager.optimization_versions_table_name(self.current_project_id)
-            
-            # Check for delays without version_id (pending delays)
             with self.engine.begin() as conn:
-                pending_delays_query = f'SELECT COUNT(*) FROM "{delay_table}" WHERE version_id IS NULL'
-                pending_count = conn.execute(text(pending_delays_query)).scalar()
-            
+                pending_count = conn.execute(
+                    text(f'SELECT COUNT(*) FROM "{delay_table}" WHERE version_id IS NULL')
+                ).scalar()
             is_reoptimization = pending_count > 0
+
+            reference = self.mgr.get_normalization_reference(self.current_project_id)
+            heuristic_solution = None
+            T = None
+            need_heuristic = (not is_reoptimization) or (reference is None)
+            if need_heuristic:
+                try:
+                    heuristic_solution = construct_solution(
+                        N=N,
+                        E=E,
+                        d=I_d,
+                        D=D,
+                        L=L,
+                        C_install=C_install,
+                        M_machine=M_machine,
+                        S_site=S_site,
+                        S_fac=S_fac,
+                    )
+                except ValueError as e:
+                    self._abort_calculation(
+                        calc_dialog, calculate_btn, original_btn_text,
+                        "Invalid Precedence", str(e),
+                    )
+                    return
+                except RuntimeError as e:
+                    print(f"[Heuristic] Could not build a schedule: {e}")
+
+            if not is_reoptimization:
+                if heuristic_solution is not None:
+                    T = horizon_from_makespan(heuristic_solution.cmax)
+                    print(f"[Heuristic] Makespan {heuristic_solution.cmax}, horizon T={T}")
+                else:
+                    T = trivial_horizon_bound(N, I_d, D, L)
+                    print(f"[Heuristic] No schedule; falling back to horizon T={T}")
+
+            if reference is None:
+                if heuristic_solution is None:
+                    self._abort_calculation(
+                        calc_dialog, calculate_btn, original_btn_text,
+                        "Cannot Scale Objective",
+                        "The heuristic could not build a schedule for this project, so "
+                        "there is no reference to weigh the objective against.\n\n"
+                        "Check the crew, machine and storage settings.",
+                    )
+                    return
+                reference = reference_values(heuristic_solution, D, L)
+                self.mgr.set_normalization_reference(self.current_project_id, reference)
+                print(f"[Objective] Reference stored for this project: {reference}")
+            else:
+                print(f"[Objective] Reusing stored reference: {reference}")
+
+            # Check if we have pending delays (Phase 5.2 & 6: Re-optimization workflow)
+            QApplication.processEvents()
             
             if is_reoptimization:
                 QApplication.processEvents()
@@ -544,15 +675,20 @@ class MainWindow(QMainWindow):
                 # Debug safeguard
                 print(f"[Reopt] base_solution type={type(df_base_solution)} shape={getattr(df_base_solution, 'shape', None)}")
 
-                # Build working calendar slots (needed for datetime to index conversion)
-                max_idx = max(
-                    df_base_solution.get('Installation_Start', pd.Series([T])).max(),
-                    df_base_solution.get('Installation_Finish', pd.Series([T])).max(),
-                    df_base_solution.get('Arrival_Time', pd.Series([T])).max(),
-                    df_base_solution.get('Production_Start', pd.Series([T])).max(),
-                    T
+                # Calendar only needs to cover the base schedule so that "now"
+                # can be mapped to tau. T itself is computed after the leftover
+                # work from tau is known.
+                time_cols = [
+                    "Installation_Start", "Installation_Finish",
+                    "Arrival_Time", "Production_Start",
+                ]
+                prev_cmax = 1
+                for col in time_cols:
+                    if col in df_base_solution.columns and not df_base_solution[col].isna().all():
+                        prev_cmax = max(prev_cmax, int(df_base_solution[col].max()))
+                working_calendar_slots = self._build_working_calendar_slots(
+                    settings, start_date, int(prev_cmax)
                 )
-                working_calendar_slots = self._build_working_calendar_slots(settings, start_date, int(max_idx))
                 
                 # Determine current_time (actual current time for re-optimization)
                 # Use system time or allow future extension for simulation time
@@ -582,6 +718,27 @@ class MainWindow(QMainWindow):
                 QApplication.processEvents()
                 delay_applier = DelayApplier(df_base_solution, delays, task_states)
                 modified_solution_df = delay_applier.apply_delays()
+
+                remaining = remaining_periods_after_tau(
+                    task_states=task_states,
+                    current_time=current_time,
+                    D=D,
+                    L=L,
+                    d=I_d,
+                    E=E,
+                    C_install=C_install,
+                    M_machine=M_machine,
+                )
+                delay_hours = int(math.ceil(sum(float(dl.delay_hours or 0) for dl in delays)))
+                T = horizon_from_remaining(current_time, remaining + delay_hours)
+                print(
+                    f"[Reopt] tau={current_time}, previous finish={prev_cmax}, "
+                    f"remaining={remaining}, delay_hours={delay_hours}, horizon T={T}"
+                )
+                if T > len(working_calendar_slots) - 1:
+                    working_calendar_slots = self._build_working_calendar_slots(
+                        settings, start_date, int(T)
+                    )
                 
                 # 4. Update D, d, L dictionaries with delayed durations
                 # This ensures the optimizer uses the correct durations for tasks with DURATION_EXTENSION
@@ -663,7 +820,7 @@ class MainWindow(QMainWindow):
                             print(f"[DEBUG] Using base version {base_version_id} project_start_datetime: '{base_start_datetime}'")
                     
                     # Use base version's start_datetime if available, otherwise fallback to current settings
-                    reopt_start_datetime = base_start_datetime if base_start_datetime else (start_str if start_str and start_str.lower() != "mm/dd/yyyy" else None)
+                    reopt_start_datetime = base_start_datetime or start_str
                     
                     # Get delay IDs for pending delays
                     delay_ids_query = f'SELECT delay_id FROM "{delay_table}" WHERE version_id IS NULL'
@@ -706,10 +863,11 @@ class MainWindow(QMainWindow):
                     M_machine=M_machine,
                     S_site=S_site,
                     S_fac=S_fac,
-                    OC=OC,
-                    C_I=C_I,
-                    C_F=C_F,
-                    C_O=C_O,
+                    w_duration=w_duration,
+                    w_transport=w_transport,
+                    w_site_storage=w_site_storage,
+                    w_factory_storage=w_factory_storage,
+                    reference=reference,
                 )
                 
                 # Set fixed constraints and re-optimization time (use current_time, not tau)
@@ -723,7 +881,29 @@ class MainWindow(QMainWindow):
                 
                 QApplication.processEvents()
                 status = scheduler.solve()
-                
+
+                if scheduler.get_solution_dict() is None:
+                    # Drop the version created for this attempt and release its delays,
+                    # otherwise they would stay attached to a version that has no schedule.
+                    with self.engine.begin() as conn:
+                        conn.execute(
+                            text(f'UPDATE "{delay_table}" SET version_id = NULL WHERE version_id = :vid'),
+                            {"vid": new_version_id},
+                        )
+                        conn.execute(
+                            text(f'DELETE FROM "{versions_table}" WHERE version_id = :vid'),
+                            {"vid": new_version_id},
+                        )
+                    self._abort_calculation(
+                        calc_dialog, calculate_btn, original_btn_text,
+                        "No Schedule Found",
+                        "The solver finished without finding a feasible schedule for the "
+                        f"delays you entered (solver status {status}).\n\n"
+                        "The delays are still pending, so you can adjust the settings and "
+                        "run Calculate again.",
+                    )
+                    return
+
                 # 8. Save results with version_id (Phase 6.3)
                 QApplication.processEvents()
                 scheduler.save_results_to_db(
@@ -745,7 +925,7 @@ class MainWindow(QMainWindow):
                             if base_start_result:
                                 base_start_datetime = base_start_result
                         
-                        reopt_start_datetime = base_start_datetime if base_start_datetime else (start_str if start_str and start_str.lower() != "mm/dd/yyyy" else None)
+                        reopt_start_datetime = base_start_datetime or start_str
                         
                         update_version_query = text(f'''
                             UPDATE "{versions_table}" 
@@ -783,13 +963,25 @@ class MainWindow(QMainWindow):
                 M_machine=M_machine,
                 S_site=S_site,
                 S_fac=S_fac,
-                OC=OC,
-                C_I=C_I,
-                C_F=C_F,
-                C_O=C_O,
+                w_duration=w_duration,
+                w_transport=w_transport,
+                w_site_storage=w_site_storage,
+                w_factory_storage=w_factory_storage,
+                reference=reference,
             )
                 QApplication.processEvents()
                 status = scheduler.solve()
+
+                if scheduler.get_solution_dict() is None:
+                    self._abort_calculation(
+                        calc_dialog, calculate_btn, original_btn_text,
+                        "No Schedule Found",
+                        "The solver finished without finding a feasible schedule "
+                        f"(solver status {status}).\n\n"
+                        "Try giving the project more room: more crews or machines, "
+                        "or larger storage capacity.",
+                    )
+                    return
 
                 # 5) Create or get version 0 record for initial optimization (before saving results)
                 QApplication.processEvents()
@@ -810,23 +1002,27 @@ class MainWindow(QMainWindow):
                             VALUES (0, NULL, :reoptimize_from_time, :project_start_datetime)
                         ''')
                         conn.execute(insert_version_query, {
-                            "reoptimize_from_time": datetime.now(),
-                            "project_start_datetime": start_str if start_str and start_str.lower() != "mm/dd/yyyy" else None
+                            # Version 0 is the initial run, so there is no time index to re-optimize from.
+                            "reoptimize_from_time": None,
+                            "project_start_datetime": start_str
                         })
                         
                         # Get the version_id for version 0 (after insert or if it was created concurrently)
                         get_version_id_query = text(f'SELECT version_id FROM "{versions_table}" WHERE version_number = 0')
                         version_0_id = conn.execute(get_version_id_query).scalar()
                     
-                    # Update project_start_datetime if it's missing (for existing records)
+                    # Backfill project_start_datetime only when it is missing. Overwriting it
+                    # would desynchronise version 0 from the re-optimized versions, which
+                    # inherit their start date from the version they are based on.
                     if version_0_id is not None:
                         update_start_date_query = text(f'''
                             UPDATE "{versions_table}" 
                             SET project_start_datetime = :project_start_datetime
                             WHERE version_id = :version_id 
+                              AND project_start_datetime IS NULL
                         ''')
                         conn.execute(update_start_date_query, {
-                            "project_start_datetime": start_str if start_str and start_str.lower() != "mm/dd/yyyy" else None,
+                            "project_start_datetime": start_str,
                             "version_id": version_0_id
                         })
 
@@ -853,7 +1049,7 @@ class MainWindow(QMainWindow):
                         conn.execute(update_version_query, {
                             "objective_value": solution.get('objective'),
                             "status": solution.get('status'),
-                            "project_start_datetime": start_str if start_str and start_str.lower() != "mm/dd/yyyy" else None,
+                            "project_start_datetime": start_str,
                             "version_id": version_0_id
                         })
 
@@ -1348,10 +1544,10 @@ class MainWindow(QMainWindow):
             # Get settings for weight values
             settings = self._get_active_settings() or {}
             weight_settings_data = [
-                {"Setting": "Factory Inventory Cost (C_F)", "Value": settings.get("factory_inv_cost", "")},
-                {"Setting": "Onsite Inventory Cost (C_O)", "Value": settings.get("onsite_inv_cost", "")},
-                {"Setting": "Penalty Cost per Unit Time (C_I)", "Value": settings.get("penalty_cost", "")},
-                {"Setting": "Order Batch Cost (OC)", "Value": settings.get("order_cost", "")}
+                {"Setting": "Project Duration Weight", "Value": settings.get("w_duration", "")},
+                {"Setting": "Transportation Weight", "Value": settings.get("w_transport", "")},
+                {"Setting": "Onsite Storage Weight", "Value": settings.get("w_site_storage", "")},
+                {"Setting": "Factory Storage Weight", "Value": settings.get("w_factory_storage", "")},
             ]
             weight_settings_df = pd.DataFrame(weight_settings_data)
             
@@ -1904,10 +2100,7 @@ def main():
     app.setFont(QFont("Segoe UI"))
     # Set application locale to English to ensure date/time widgets display in English
     QLocale.setDefault(QLocale(QLocale.Language.English, QLocale.Country.Switzerland))
-    engine = create_engine(
-        "sqlite:///input_database.db",  
-        echo=False, future=True
-    )
+    engine = create_default_engine()
     w = MainWindow(engine=engine)
     w.show()
     sys.exit(app.exec())

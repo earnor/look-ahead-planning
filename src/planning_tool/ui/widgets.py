@@ -134,12 +134,13 @@ class AspectRatioPixmapLabel(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._orig = None
+        self._scaled_for = None
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setScaledContents(False)
 
     def setPixmap(self, pm: QPixmap) -> None:
         self._orig = pm
-        super().setPixmap(pm)
+        self._scaled_for = None
         self._rescale()
 
     def resizeEvent(self, e):
@@ -147,13 +148,24 @@ class AspectRatioPixmapLabel(QLabel):
         self._rescale()
 
     def _rescale(self):
-        if not self._orig or self.width() <= 0 or self.height() <= 0:
+        if self._orig is None or self._orig.isNull():
             return
+        if self.width() <= 0 or self.height() <= 0:
+            return
+
+        dpr = self.devicePixelRatioF()
+        target = (self.width(), self.height(), dpr)
+        if target == self._scaled_for:
+            return
+        self._scaled_for = target
+
+        # Scale to physical pixels so the image stays sharp on HiDPI displays.
         scaled = self._orig.scaled(
-            self.size(),
+            self.size() * dpr,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation
         )
+        scaled.setDevicePixelRatio(dpr)
         super().setPixmap(scaled)
 
 

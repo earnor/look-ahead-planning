@@ -9,7 +9,7 @@ from PyQt6.QtGui import QPixmap, QColor, QFont
 from PyQt6.QtWidgets import (
     QFrame, QLabel, QPushButton, QComboBox, QLineEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QWidget, QHBoxLayout, QVBoxLayout,
-    QButtonGroup, QSizePolicy
+    QButtonGroup
 )
 from pathlib import Path
 from .widgets import SidebarButton, AspectRatioPixmapLabel
@@ -82,6 +82,36 @@ class Sidebar(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("Sidebar")
+        self.setFixedWidth(220)
+        self.setStyleSheet("""
+            QFrame#Sidebar {
+                background: #FFFFFF;
+                border-right: 1px solid #E5E7EB;
+            }
+            QFrame#SidebarDivider {
+                background: #E5E7EB;
+                border: none;
+            }
+            QPushButton[sidebar="true"] {
+                background: transparent;
+                border: none;
+                border-radius: 8px;
+                padding-left: 14px;
+                text-align: left;
+                color: #374151;
+                font-size: 14px;
+                font-weight: 500;
+            }
+            QPushButton[sidebar="true"]:hover {
+                background: #F3F4F6;
+                color: #111827;
+            }
+            QPushButton[sidebar="true"]:checked {
+                background: #EAF0F8;
+                color: #213F7B;
+                font-weight: 600;
+            }
+        """)
 
         APP_DIR = Path(__file__).resolve().parent.parent
         pix_path = APP_DIR / "logo.png"
@@ -89,8 +119,13 @@ class Sidebar(QFrame):
         logo = AspectRatioPixmapLabel()
         pm = QPixmap(str(pix_path))
         logo.setPixmap(pm)
-        logo.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        logo.setMaximumHeight(80)
+        logo.setFixedHeight(56)
+        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo.setAccessibleName("ETH Zurich")
+
+        divider = QFrame()
+        divider.setObjectName("SidebarDivider")
+        divider.setFixedHeight(1)
 
         self.btn_dash = SidebarButton("Dashboard")
         self.btn_sched = SidebarButton("Schedule")
@@ -112,10 +147,12 @@ class Sidebar(QFrame):
         self.btn_settings.clicked.connect(lambda: self.pageRequested.emit("settings"))
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(8, 8, 8, 8)
-        lay.setSpacing(24)
+        lay.setContentsMargins(16, 20, 16, 16)
+        lay.setSpacing(6)
         lay.addWidget(logo)
-        lay.addSpacing(16)
+        lay.addSpacing(18)
+        lay.addWidget(divider)
+        lay.addSpacing(18)
         lay.addWidget(self.btn_dash)
         lay.addWidget(self.btn_sched)
         lay.addWidget(self.btn_comparison)

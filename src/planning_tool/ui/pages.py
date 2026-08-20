@@ -169,7 +169,7 @@ class UploadPage(QWidget):
         req_lay = QHBoxLayout(req_wrap)
         req_lay.setContentsMargins(0,0,0,0); req_lay.setSpacing(8)
         req_lay.addWidget(QLabel("<b>Required Fields in Upload</b>"))
-        for t in ["Module ID", "Installation Duration", "Production Duration", "Transportation Duration", "Installation Precedence"]:
+        for t in self.REQUIRED_COLS:
             req_lay.addWidget(Chip(t))
         req_lay.addStretch(1)
         card1.body.addWidget(req_wrap)
@@ -212,9 +212,22 @@ class UploadPage(QWidget):
         print("[Model Upload] selected:", path)
 
     # ---------------- Process Our Data ----------------
+    # Required column -> spellings accepted in the uploaded file.
     REQUIRED_COLS = {
-        "Module ID", "Installation Duration", "Production Duration", "Transportation Duration", "Installation Precedence"
+        "Module ID": ("Module ID", "Module_ID"),
+        "Installation Duration": ("Installation Duration",),
+        "Production Duration": ("Production Duration",),
+        "Transportation Duration": ("Transportation Duration",),
+        "Installation Precedence": ("Installation Precedence",),
     }
+
+    def _missing_required_columns(self, path: str) -> list[str]:
+        """Names of required columns that the file does not provide under any accepted spelling."""
+        columns = set(pd.read_csv(path, nrows=0).columns)
+        return [
+            name for name, accepted in self.REQUIRED_COLS.items()
+            if not any(spelling in columns for spelling in accepted)
+        ]
 
     def on_create_project_from_csv(self, path: str = None):
         # If path is not provided (e.g., called from elsewhere), open file dialog
@@ -222,7 +235,25 @@ class UploadPage(QWidget):
             path, _ = QFileDialog.getOpenFileName(self, "Select CSV", "", "CSV Files (*.csv)")
             if not path: 
                 return
-        
+
+        # Validate the header before registering anything, so a malformed file
+        # cannot be imported only to fail later during Calculate.
+        try:
+            missing = self._missing_required_columns(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Unreadable File", f"Could not read this CSV file:\n{e}")
+            return
+
+        if missing:
+            QMessageBox.critical(
+                self,
+                "Missing Required Columns",
+                "This file cannot be imported because the following required "
+                "columns are missing:\n\n"
+                + "\n".join(f"    - {name}" for name in missing),
+            )
+            return
+
         # Now ask for project name
         name, ok = QInputDialog.getText(self, "New Project", "Project name:")
         if not ok or not name.strip(): 
@@ -790,6 +821,13 @@ class SchedulePage(QWidget):
 
 class SettingsPage(QWidget):
     """Settings page for configuring project parameters"""
+
+    # A date widget shows its special value text only while it sits on its minimum,
+    # so the minimum is reserved as the "not set" marker and 2025-01-01 stays the
+    # earliest date the user can actually pick.
+    UNSET_DATE = QDate(2026, 1, 1)
+    UNSET_DATE_TEXT = "mm/dd/yyyy"
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._build_ui()
@@ -875,7 +913,7 @@ class SettingsPage(QWidget):
         
         # Project Start Date & Time
         start_group = QVBoxLayout()
-        start_label = QLabel("Project Start Date & Time <span style='color: red;'>*</span>")
+        start_label = QLabel("Project Start Date")
         start_label.setTextFormat(Qt.TextFormat.RichText)
         start_label.setStyleSheet("font-size: 13px; font-weight: 500; color: #374151; margin-bottom: 6px;")
         start_group.addWidget(start_label)
@@ -884,12 +922,11 @@ class SettingsPage(QWidget):
         self.start_datetime = QDateTimeEdit()
         self.start_datetime.setLocale(QLocale(QLocale.Language.English, QLocale.Country.Switzerland))
         # calendar should start from 2025 instead of 2000
-        default_start = QDate(2025, 1, 1)
-        self.start_datetime.setMinimumDate(default_start)
-        self.start_datetime.setDate(default_start)
+        self.start_datetime.setMinimumDate(self.UNSET_DATE)
+        self.start_datetime.setDate(self.UNSET_DATE)
         self.start_datetime.setCalendarPopup(True)
         self.start_datetime.setDisplayFormat("MM/dd/yyyy")
-        self.start_datetime.setSpecialValueText("mm/dd/yyyy")
+        self.start_datetime.setSpecialValueText(self.UNSET_DATE_TEXT)
         self.start_datetime.setStyleSheet("""
             QDateTimeEdit {
                 border: 1px solid #D1D5DB;
@@ -912,46 +949,6 @@ class SettingsPage(QWidget):
         start_layout.addStretch(1)
         start_group.addLayout(start_layout)
         layout.addLayout(start_group)
-        
-        # Target Completion Date
-        target_group = QVBoxLayout()
-        target_label = QLabel("Target Completion Date")
-        target_label.setStyleSheet("font-size: 13px; font-weight: 500; color: #374151; margin-bottom: 6px;")
-        target_group.addWidget(target_label)
-        
-        target_layout = QHBoxLayout()
-        self.target_datetime = QDateTimeEdit()
-        self.target_datetime.setLocale(QLocale(QLocale.Language.English, QLocale.Country.Switzerland))
-        # calendar should also start from 2025 here
-        default_target = QDate(2025, 1, 1)
-        self.target_datetime.setMinimumDate(default_target)
-        self.target_datetime.setDate(default_target)
-        self.target_datetime.setCalendarPopup(True)
-        self.target_datetime.setDisplayFormat("MM/dd/yyyy")
-        self.target_datetime.setSpecialValueText("mm/dd/yyyy")
-        self.target_datetime.setStyleSheet("""
-            QDateTimeEdit {
-                border: 1px solid #D1D5DB;
-                border-radius: 6px;
-                padding: 8px 12px;
-                font-size: 13px;
-                background: #FFFFFF;
-                color: #9CA3AF;
-            }
-            QDateTimeEdit:hover {
-                border-color: #9CA3AF;
-            }
-            QDateTimeEdit::drop-down {
-                subcontrol-origin: padding;
-                subcontrol-position: top right;
-                width: 30px;
-                border-left: 1px solid #D1D5DB;
-            }
-        """)
-        target_layout.addWidget(self.target_datetime)
-        target_layout.addStretch(1)
-        target_group.addLayout(target_layout)
-        layout.addLayout(target_group)
         
         # Current Simulation Time
         sim_group = QHBoxLayout()
@@ -1146,7 +1143,7 @@ class SettingsPage(QWidget):
         # Prefabrication Workbenches (Machines)
         machine_group = QVBoxLayout()
         machine_input_layout = QHBoxLayout()
-        self.machine_count = QLineEdit("6")
+        self.machine_count = QLineEdit("5")
         self.machine_count.setMaximumWidth(100)
         self.machine_count.setStyleSheet("""
             QLineEdit {
@@ -1206,7 +1203,7 @@ class SettingsPage(QWidget):
         site_label = QLabel("Onsite Storage:")
         site_label.setStyleSheet("font-size: 12px; color: #6B7280;")
         onsite_layout.addWidget(site_label)
-        self.site_storage = QLineEdit("5")
+        self.site_storage = QLineEdit("10")
         self.site_storage.setMaximumWidth(100)
         self.site_storage.setStyleSheet("""
             QLineEdit {
@@ -1226,7 +1223,7 @@ class SettingsPage(QWidget):
         factory_label = QLabel("Factory Storage:")
         factory_label.setStyleSheet("font-size: 12px; color: #6B7280;")
         factory_layout.addWidget(factory_label)
-        self.factory_storage = QLineEdit("5")
+        self.factory_storage = QLineEdit("10")
         self.factory_storage.setMaximumWidth(100)
         self.factory_storage.setStyleSheet("""
             QLineEdit {
@@ -1248,20 +1245,24 @@ class SettingsPage(QWidget):
         cost_group = QGridLayout()
         cost_group.setHorizontalSpacing(24)
         cost_group.setVerticalSpacing(8)
-        cost_label = QLabel("Cost Parameters")
+        cost_label = QLabel("Objective Weights")
         cost_label.setStyleSheet("font-size: 13px; font-weight: 500; color: #374151;")
         cost_group.addWidget(cost_label, 0, 0, 1, 2)
-        
+
+        cost_hint = QLabel("Relative priority of each goal. The weights should add up to 1.")
+        cost_hint.setStyleSheet("font-size: 11px; color: #9CA3AF;")
+        cost_group.addWidget(cost_hint, 1, 0, 1, 2)
+
         cost_params = [
-            ("Order Batch Cost (OC):", "order_cost", "0.25"),
-            ("Penalty Cost per Unit Time (C_I):", "penalty_cost", "0.5"),
-            ("Factory Inventory Cost (C_F):", "factory_inv_cost", "0.1"),
-            ("Onsite Inventory Cost (C_O):", "onsite_inv_cost", "0.15"),
+            ("Project Duration:", "w_duration", "0.4"),
+            ("Transportation:", "w_transport", "0.1"),
+            ("Onsite Storage:", "w_site_storage", "0.4"),
+            ("Factory Storage:", "w_factory_storage", "0.1"),
         ]
         
         self.cost_inputs = {}
         for idx, (label_text, key, default) in enumerate(cost_params):
-            row = 1 + idx // 2
+            row = 2 + idx // 2
             col = idx % 2
             cost_input_layout = QHBoxLayout()
             cost_label_widget = QLabel(label_text)
@@ -1287,10 +1288,15 @@ class SettingsPage(QWidget):
         
         return card
     
+    def _date_value(self, widget) -> str:
+        """Return the picked date, or the placeholder text while the field is unset."""
+        if widget.date() == widget.minimumDate():
+            return self.UNSET_DATE_TEXT
+        return widget.date().toString("MM/dd/yyyy")
+
     def _save_settings(self):
         return {
-            "start_datetime": self.start_datetime.date().toString("MM/dd/yyyy"),
-            "target_datetime": self.target_datetime.date().toString("MM/dd/yyyy"),
+            "start_datetime": self._date_value(self.start_datetime),
             "working_days": self.get_working_days_map(),
             "work_start_time": self.work_start_time.text(),
             "work_end_time": self.work_end_time.text(),
@@ -1300,10 +1306,10 @@ class SettingsPage(QWidget):
             "crew_count": self.crew_count.text(),
             "site_storage": self.site_storage.text(),
             "factory_storage": self.factory_storage.text(),
-            "order_cost": self.cost_inputs.get("order_cost").text() if "order_cost" in self.cost_inputs else "",
-            "penalty_cost": self.cost_inputs.get("penalty_cost").text() if "penalty_cost" in self.cost_inputs else "",
-            "factory_inv_cost": self.cost_inputs.get("factory_inv_cost").text() if "factory_inv_cost" in self.cost_inputs else "",
-            "onsite_inv_cost": self.cost_inputs.get("onsite_inv_cost").text() if "onsite_inv_cost" in self.cost_inputs else "",
+            "w_duration": self.cost_inputs["w_duration"].text(),
+            "w_transport": self.cost_inputs["w_transport"].text(),
+            "w_site_storage": self.cost_inputs["w_site_storage"].text(),
+            "w_factory_storage": self.cost_inputs["w_factory_storage"].text(),
         }
 
     def get_working_days_map(self) -> dict[str, bool]:

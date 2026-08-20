@@ -4,6 +4,19 @@ import pandas as pd
 from sqlalchemy import text, Engine
 
 class ScheduleDataManager:
+    # The objective weights are priorities, so each term is divided by a reference
+    # value before they are added up. The reference comes from the constructive
+    # heuristic on the first optimization and is then kept, so that the objective
+    # values of later versions stay comparable with the first one. The two storage
+    # columns are kept separate for diagnostics; the MIP divides both inventory
+    # terms by their sum.
+    NORMALIZATION_COLUMNS = (
+        "ref_duration",
+        "ref_transport",
+        "ref_site_storage",
+        "ref_factory_storage",
+    )
+
     def __init__(self, engine: Engine):
         self.engine = engine
         self.ensure_schema()
@@ -17,6 +30,36 @@ class ScheduleDataManager:
               project_name   TEXT NOT NULL UNIQUE
             );
             """)
+
+            existing = {
+                row[1] for row in conn.exec_driver_sql("PRAGMA table_info(projects)").fetchall()
+            }
+            for column in self.NORMALIZATION_COLUMNS:
+                if column not in existing:
+                    conn.exec_driver_sql(f"ALTER TABLE projects ADD COLUMN {column} REAL")
+
+    def get_normalization_reference(self, project_id: int) -> dict | None:
+        """Stored reference values, or None if this project has never been optimized."""
+        columns = ", ".join(self.NORMALIZATION_COLUMNS)
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                text(f"SELECT {columns} FROM projects WHERE project_id = :pid"),
+                {"pid": project_id},
+            ).fetchone()
+
+        if row is None or any(value is None for value in row):
+            return None
+        return dict(zip(self.NORMALIZATION_COLUMNS, (float(v) for v in row)))
+
+    def set_normalization_reference(self, project_id: int, reference: dict) -> None:
+        assignments = ", ".join(f"{c} = :{c}" for c in self.NORMALIZATION_COLUMNS)
+        params = {c: float(reference[c]) for c in self.NORMALIZATION_COLUMNS}
+        params["pid"] = project_id
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(f"UPDATE projects SET {assignments} WHERE project_id = :pid"),
+                params,
+            )
 
     # --------- 各类表名约定（一个 project_id 对应一套表） ---------
 
