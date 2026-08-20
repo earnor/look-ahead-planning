@@ -1,6 +1,6 @@
-# Look-ahead Planning Tool
+# Prefabricated Construction Scheduling Tool
 
-**Prototype software developed at ETH Zurich for the RENOMIZE project.**
+**Prototype software developed by ETH Zurich for the RENOMIZE project.**
 
 This repository is a research prototype. It is not a production product, has not been certified for operational use, and may change without notice.
 
@@ -10,7 +10,7 @@ The mixed-integer program is solved with **Gurobi Optimizer** under a **Gurobi E
 
 ## Overview
 
-The tool supports **look-ahead scheduling** of prefabricated building modules: factory production, truck transport, on-site storage, and installation. Given module durations, installation precedence, resource capacities, and a working calendar, it builds a time-indexed MIP, solves it with Gurobi, and shows the resulting schedule in a desktop UI.
+The tool supports **look-ahead scheduling** of prefabricated building modules: factory production, factory storage, truck transport, on-site storage, and installation. Given module durations, installation precedence, resource capacities, and a working calendar, it builds a time-indexed MIP, solves it with Gurobi, and shows the resulting schedule in a desktop UI.
 
 When delays are recorded against a live schedule, the tool can **re-optimize from a detection time τ**, keeping completed and in-progress work fixed and planning the remainder.
 
@@ -123,7 +123,7 @@ Work through the sidebar pages in this order.
 
 The raw table is stored as read-only. Later optimization writes separate solution tables; it does not modify the uploaded CSV data.
 
-A sample file is provided at [`data/test_input.csv`](data/test_input.csv). [`data/Rapla_Stage1_input.csv`](data/Rapla_Stage1_input.csv) is a larger example.
+A sample file is provided at [`data/test_input.csv`](data/test_input.csv). 
 
 ### 2. Settings — calendar, resources, weights
 
@@ -234,8 +234,7 @@ VS-01-2,3,4,1,VS-02-21
 look-ahead-planning/
 ├── data/
 │   ├── input_database.db      # SQLite store (created at runtime)
-│   ├── test_input.csv         # small example
-│   └── Rapla_Stage1_input.csv
+│   └── test_input.csv         # small example
 ├── src/planning_tool/
 │   ├── main.py                # application entry
 │   ├── model.py               # Gurobi MIP
@@ -246,23 +245,12 @@ look-ahead-planning/
 └── tests/                     # scripts for selected policies and metrics
 ```
 
-## Tests
-
-From the repository root, with `PYTHONPATH=src` and Gurobi available where a script solves a model:
-
-```bash
-python tests/check_transport_delay_policy.py
-python tests/check_socio_economic_metrics.py
-python tests/check_reopt_horizon.py
-```
-
-`check_reopt_horizon.py` calls Gurobi.
 
 ## Solver notes
 
 - One time period is one **working hour** on the calendar from Settings (weekends and non-working days are skipped).
 - Truck loads are batched (typically 3–5 modules; one partial load is allowed).
-- The heuristic is used to choose \(T\) and objective reference values. It is **not** injected as a MIP warm start.
+- The heuristic is used to choose \(T\) and objective reference values.
 - Default Gurobi limits: `TimeLimit = 120` seconds, `MIPGap = 0.2`. A run may stop at the time limit with a feasible but not proven-optimal solution.
 
 ## Disclaimer
@@ -273,4 +261,5 @@ Use of Gurobi is subject to the [Gurobi End User License Agreement](https://www.
 
 ## Contact
 
-Zhaoyu Wang — [wangzha@ethz.ch](mailto:wangzha@ethz.ch)
+Zhaoyu Wang — [zhaoyu.wang@ibi.baug.ethz.ch](mailto:zhaoyu.wang@ibi.baug.ethz.ch)
+Dr. Arnor Elvarsson — [elvarsson@ibi.baug.ethz.ch](mailto:elvarsson@ibi.baug.ethz.ch)
