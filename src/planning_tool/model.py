@@ -100,6 +100,9 @@ class PrefabScheduler:
         self.fixed_arrival_times = {} 
         self.fixed_durations = {} # any problem here?
         self.reoptimize_from_time = None  # Current time (time index) from which to re-optimize
+        self.earliest_production_starts = {}
+        self.earliest_arrival_times = {}
+        self.earliest_installation_starts = {}
 
         # preprocessing roots / leaves
         self.roots, self.leaves = self._find_roots_and_leaves()
@@ -109,7 +112,10 @@ class PrefabScheduler:
                              fixed_production_starts: Optional[Dict[int, int]] = None,
                              fixed_arrival_times: Optional[Dict[int, int]] = None,
                              fixed_durations: Optional[Dict[int, Dict[str, float]]] = None,
-                             reoptimize_from_time: Optional[int] = None):
+                             reoptimize_from_time: Optional[int] = None,
+                             earliest_production_starts: Optional[Dict[int, int]] = None,
+                             earliest_arrival_times: Optional[Dict[int, int]] = None,
+                             earliest_installation_starts: Optional[Dict[int, int]] = None):
         """
         Set fixed constraints for re-optimization.
         
@@ -119,6 +125,7 @@ class PrefabScheduler:
             fixed_arrival_times: {module_index: arrival_time}
             fixed_durations: {module_index: {phase: duration}}
             reoptimize_from_time: Current time (time index) from which to re-optimize
+            earliest_*: lower bounds for phases that have not started
         """
         if fixed_installation_starts:
             self.fixed_installation_starts = fixed_installation_starts.copy()
@@ -130,6 +137,12 @@ class PrefabScheduler:
             self.fixed_durations = fixed_durations.copy()
         if reoptimize_from_time is not None:
             self.reoptimize_from_time = reoptimize_from_time
+        if earliest_production_starts:
+            self.earliest_production_starts = earliest_production_starts.copy()
+        if earliest_arrival_times:
+            self.earliest_arrival_times = earliest_arrival_times.copy()
+        if earliest_installation_starts:
+            self.earliest_installation_starts = earliest_installation_starts.copy()
 
     def _find_roots_and_leaves(self):
         preds = {i: [] for i in range(1, self.N + 1)}
@@ -226,6 +239,9 @@ class PrefabScheduler:
                 earliest = max(earliest, fixed_arrival)
             if tau is not None:
                 earliest = max(earliest, tau)
+            earliest_lb = self.earliest_installation_starts.get(i)
+            if earliest_lb is not None:
+                earliest = max(earliest, earliest_lb)
             es_x[i] = earliest
 
         # Installation, backward pass. A leaf must also finish before the dummy
@@ -256,12 +272,18 @@ class PrefabScheduler:
                     es_p[i] = max(es_p[i], fixed_prod + D[i] + L[i])
                 if tau is not None:
                     es_p[i] = max(es_p[i], tau)
+                earliest_arr = self.earliest_arrival_times.get(i)
+                if earliest_arr is not None:
+                    es_p[i] = max(es_p[i], earliest_arr)
                 ls_p[i] = ls_x[i]
 
             if fixed_prod is not None:
                 es_q[i] = ls_q[i] = fixed_prod
             else:
                 es_q[i] = 1 if tau is None else max(1, tau)
+                earliest_prod = self.earliest_production_starts.get(i)
+                if earliest_prod is not None:
+                    es_q[i] = max(es_q[i], earliest_prod)
                 ls_q[i] = ls_p[i] - D[i] - L[i]
 
         windows = {

@@ -22,7 +22,7 @@ class ScheduleDataManager:
         self.ensure_schema()
 
     def ensure_schema(self):
-        """全局只建一次的公共表结构"""
+        """sharedtemplate"""
         with self.engine.begin() as conn:
             conn.exec_driver_sql("""
             CREATE TABLE IF NOT EXISTS projects (
@@ -61,7 +61,7 @@ class ScheduleDataManager:
                 params,
             )
 
-    # --------- 各类表名约定（一个 project_id 对应一套表） ---------
+    # --------- table names ---------
 
     @staticmethod
     def raw_table_name(project_id: int) -> str:
@@ -99,17 +99,17 @@ class ScheduleDataManager:
         return f"optimization_versions_{project_id}"
 
 
-    # --------- 第一次导入：用 CSV 建 raw 表 + 建该项目的其余表 ---------
+    # --------- first import: create raw table + other tables for the project ---------
 
     def create_project_from_csv(self, project_name: str, csv_path: str) -> int:
         """
         Create a new project from a CSV file.
-        - 在 projects 表中创建一条项目记录并获得 project_id
-        - 创建该项目的 raw_schedule_{project_id} 表并导入 CSV
-        - 创建该项目的 solution/summary/factory/site 等子表（先是空表骨架）
-        - 将 raw 表设为只读
+        - Insert a project row and obtain project_id
+        - Create raw_schedule_{project_id} and import the CSV
+        - Create empty solution/summary/factory/site tables for the project
+        - Make the raw table read-only
         """
-        # 1) 在 projects 表注册项目，获得 project_id
+        # 1) Register the project and obtain project_id
         with self.engine.begin() as conn:
             conn.exec_driver_sql(
                 "INSERT INTO projects(project_name) VALUES (:n)",
@@ -119,7 +119,7 @@ class ScheduleDataManager:
                 "SELECT project_id FROM projects WHERE project_name=:n"
             ), {"n": project_name}).scalar_one()
 
-        # 2) 建 raw 表并导入 CSV
+        # 2) Create the raw table and import the CSV
         raw = ScheduleDataManager.raw_table_name(project_id)
         df = pd.read_csv(csv_path)
         df.to_sql(
@@ -131,7 +131,7 @@ class ScheduleDataManager:
             chunksize=1000,
         )
 
-        # 3 把 raw 设成只读（通过 SQLite 触发器）
+        # 3) Make the raw table read-only via SQLite triggers
         with self.engine.begin() as conn:
             for op in ("INSERT", "UPDATE", "DELETE"):
                 conn.exec_driver_sql(f"""
@@ -142,7 +142,7 @@ class ScheduleDataManager:
                 END;
                 """)
         
-        # 4) 创建延迟和版本管理表
+        # 4) Create delay and version tables
         self._ensure_delay_and_version_tables(project_id)
 
         return project_id
@@ -199,7 +199,7 @@ class ScheduleDataManager:
                 ON "{versions_table}"(version_number);
             """)
 
-    # --------- 查询 / 元数据 ---------
+    # --------- queries / metadata ---------
 
     def list_projects(self):
         """Return all projects as a list of dicts sorted by project_id."""

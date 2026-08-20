@@ -9,6 +9,7 @@ This module contains all main page widgets for the application:
 - ComparisonPage: Schedule comparison page with Gantt charts and metrics
 """
 from functools import reduce
+from datetime import datetime
 from PyQt6.QtCore import Qt, pyqtSignal, QDate
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
@@ -25,6 +26,7 @@ from planning_tool.datamanager import ScheduleDataManager
 from planning_tool.ui.widgets import KpiCard, Card, FileDropArea, Chip
 from planning_tool.ui.components import DashboardTable, StatusCell
 from planning_tool.ui.dialogs import DelayInputDialog
+from planning_tool.rescheduler import allowed_delay_types, delay_type_hint
 import pandas as pd
 import matplotlib
 matplotlib.use('Qt5Agg')  # Use Qt5Agg backend for PyQt6
@@ -549,9 +551,20 @@ class SchedulePage(QWidget):
         
         module_id = module_id_item.text()
         phase = delay_columns[col]
-        
-        # Show delay input dialog
-        dialog = DelayInputDialog(module_id, phase, self)
+
+        def status_lookup(at_dt):
+            status = "NOT_STARTED"
+            if hasattr(self, "main_window") and self.main_window:
+                status = self.main_window.phase_status_at(module_id, phase, at_dt)
+            allowed = allowed_delay_types(phase, status)
+            return allowed, delay_type_hint(phase, status)
+
+        allowed_now, hint_now = status_lookup(datetime.now())
+        if not allowed_now:
+            QMessageBox.information(self, "Delay Not Allowed", hint_now or "A delay cannot be added to this phase.")
+            return
+
+        dialog = DelayInputDialog(module_id, phase, self, status_lookup=status_lookup)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             delay_info = dialog.get_delay_info()
             # Update the delay cell
@@ -1320,6 +1333,8 @@ class ComparisonPage(QWidget):
     """Schedule comparison page with Gantt charts and metrics comparison"""
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._last_upper_metrics = None
+        self._last_lower_metrics = None
         self._build_ui()
 
     def _build_ui(self):
@@ -1508,43 +1523,57 @@ class ComparisonPage(QWidget):
         return container
 
     def _build_metrics_section(self) -> QWidget:
-        """Build the right sidebar with metrics comparison"""
+        """Build the right sidebar with operational metrics and socio-economic impact."""
         container = QFrame()
         container.setObjectName("MetricsSidebar")
+        container.setMinimumWidth(280)
         container.setStyleSheet("""
             QFrame#MetricsSidebar {
                 background: #FFFFFF;
                 border: 1px solid #E5E7EB;
                 border-radius: 12px;
             }
+            QScrollArea#MetricsScroll {
+                background: transparent;
+                border: none;
+            }
         """)
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(20)
+        outer_layout = QVBoxLayout(container)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
 
-        # Title
+        scroll = QScrollArea()
+        scroll.setObjectName("MetricsScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(16)
+
         title = QLabel("Metrics Comparison")
         title.setStyleSheet("font-size: 20px; font-weight: 600; color: #111827;")
         subtitle = QLabel("Comparing key metrics between selected versions")
-        subtitle.setStyleSheet("font-size: 13px; color: #6B7280; margin-bottom: 8px;")
-        
+        subtitle.setStyleSheet("font-size: 13px; color: #6B7280;")
+        subtitle.setWordWrap(True)
+
         title_layout = QVBoxLayout()
         title_layout.setSpacing(4)
         title_layout.addWidget(title)
         title_layout.addWidget(subtitle)
         layout.addLayout(title_layout)
 
-        # KPI Comparison Cards - store references for later updates
         metric_names = [
             "Construction Hours",
             "Factory Storage Module Hours",
             "Site Storage Module Hours",
             "Transport Bunch Number"
         ]
-        
-        self.metric_cards = {}  # Store metric cards by name for later updates
+
+        self.metric_cards = {}
         for metric_name in metric_names:
-            # Initialize with empty/default values
             metric = {
                 "name": metric_name,
                 "v1_value": "N/A",
@@ -1557,22 +1586,129 @@ class ComparisonPage(QWidget):
             self.metric_cards[metric_name] = metric_card
             layout.addWidget(metric_card)
 
+        layout.addWidget(self._build_socio_economic_section())
         layout.addStretch(1)
 
+        scroll.setWidget(inner)
+        outer_layout.addWidget(scroll)
         return container
+
+    def _build_socio_economic_section(self) -> QWidget:
+        """User-filled coefficients and socio-economic comparison cards (display only for now)."""
+        section = QFrame()
+        section.setObjectName("SocioSection")
+        section.setStyleSheet("""
+            QFrame#SocioSection {
+                background: #F8FAFC;
+                border: 1px solid #E2E8F0;
+                border-radius: 8px;
+            }
+        """)
+        layout = QVBoxLayout(section)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
+
+        title = QLabel("Socio-economic Impact")
+        title.setStyleSheet("font-size: 16px; font-weight: 600; color: #0F172A;")
+        subtitle = QLabel(
+            "Fill the unit costs below."
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("font-size: 12px; color: #64748B;")
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        coeff_title = QLabel("Unit costs")
+        coeff_title.setStyleSheet("font-size: 12px; font-weight: 600; color: #334155;")
+        layout.addWidget(coeff_title)
+
+        self.socio_cost_per_truck = self._add_socio_coeff_row(
+            layout, "Cost per truck", "CHF / truck"
+        )
+        self.socio_cost_per_delay_day = self._add_socio_coeff_row(
+            layout, "Cost per delayed day", "CHF / working day"
+        )
+        self.socio_cost_per_truck.textChanged.connect(self._refresh_socio_cards)
+        self.socio_cost_per_delay_day.textChanged.connect(self._refresh_socio_cards)
+
+        socio_metrics = [
+            {
+                "name": "Handover Delay",
+                "hint": "Extra working days from start date to finish (working calendar, not hours) × cost per delayed day.",
+            },
+            {
+                "name": "Transportation Cost",
+                "hint": "Extra truck trips × cost per truck.",
+            },
+            {
+                "name": "Peak Site Occupancy",
+                "hint": "Peak number of modules on site.",
+            },
+        ]
+
+        self.socio_metric_cards = {}
+        for spec in socio_metrics:
+            metric = {
+                "name": spec["name"],
+                "hint": spec["hint"],
+                "socio": True,
+                "v1_value": "N/A",
+                "v2_value": "N/A",
+                "change": "N/A",
+                "change_percent": "N/A",
+                "trend": "neutral",
+            }
+            card = self._create_metric_card(metric)
+            self.socio_metric_cards[spec["name"]] = card
+            layout.addWidget(card)
+
+        return section
+
+    def _add_socio_coeff_row(self, parent_layout: QVBoxLayout, label_text: str, placeholder: str) -> QLineEdit:
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        label = QLabel(label_text)
+        label.setStyleSheet("font-size: 12px; color: #475569;")
+        label.setMinimumWidth(130)
+        field = QLineEdit()
+        field.setPlaceholderText(placeholder)
+        field.setStyleSheet("""
+            QLineEdit {
+                border: 1px solid #CBD5E1;
+                border-radius: 6px;
+                padding: 6px 10px;
+                font-size: 13px;
+                background: #FFFFFF;
+            }
+        """)
+        row.addWidget(label)
+        row.addWidget(field, 1)
+        parent_layout.addLayout(row)
+        return field
 
     def _create_metric_card(self, metric: dict) -> QFrame:
         """Create a metric comparison card with updatable labels"""
         card = QFrame()
-        card.setObjectName("MetricCard")
-        card.setStyleSheet("""
-            QFrame#MetricCard {
-                background: #F9FAFB;
-                border: 1px solid #E5E7EB;
-                border-radius: 8px;
-                padding: 12px;
-            }
-        """)
+        is_socio = bool(metric.get("socio"))
+        card.setObjectName("SocioMetricCard" if is_socio else "MetricCard")
+        if is_socio:
+            card.setStyleSheet("""
+                QFrame#SocioMetricCard {
+                    background: #FFFFFF;
+                    border: 1px solid #CBD5E1;
+                    border-radius: 8px;
+                    padding: 12px;
+                }
+            """)
+        else:
+            card.setStyleSheet("""
+                QFrame#MetricCard {
+                    background: #F9FAFB;
+                    border: 1px solid #E5E7EB;
+                    border-radius: 8px;
+                    padding: 12px;
+                }
+            """)
         layout = QVBoxLayout(card)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
@@ -1625,6 +1761,13 @@ class ComparisonPage(QWidget):
         change_layout.addStretch(1)
         layout.addLayout(change_layout)
 
+        hint_text = metric.get("hint")
+        if hint_text:
+            hint = QLabel(hint_text)
+            hint.setWordWrap(True)
+            hint.setStyleSheet("font-size: 11px; color: #94A3B8;")
+            layout.addWidget(hint)
+
         # Store references to updatable widgets in the card
         card.v1_value_label = v1_value
         card.v2_value_label = v2_value
@@ -1633,7 +1776,102 @@ class ComparisonPage(QWidget):
 
         return card
     
-    def _calculate_metrics(self, solution_df: pd.DataFrame) -> dict:
+    def _parse_socio_coeff(self, line_edit: QLineEdit) -> Optional[float]:
+        raw = (line_edit.text() or "").strip().replace("'", "").replace(",", "")
+        for token in ("CHF", "chf", "€", "$"):
+            raw = raw.replace(token, "")
+        raw = raw.strip()
+        if not raw:
+            return None
+        try:
+            value = float(raw)
+        except ValueError:
+            return None
+        if value < 0:
+            return None
+        return value
+
+    @staticmethod
+    def _format_money(amount: float) -> str:
+        if abs(amount - round(amount)) < 1e-9:
+            return f"{int(round(amount)):,} CHF"
+        return f"{amount:,.2f} CHF"
+
+    @staticmethod
+    def _parse_project_start_date(start_datetime_str: Optional[str], settings: Optional[dict]) -> Optional[date]:
+        candidates = [start_datetime_str]
+        if settings:
+            candidates.append(settings.get("start_datetime"))
+        for src in candidates:
+            if not src or str(src).strip().lower() in ("", "mm/dd/yyyy"):
+                continue
+            try:
+                return datetime.strptime(str(src).strip(), "%m/%d/%Y").date()
+            except ValueError:
+                continue
+        return None
+
+    def _count_handover_working_days(
+        self,
+        solution_df: pd.DataFrame,
+        settings: Optional[dict],
+        start_date: Optional[date],
+    ) -> Optional[int]:
+        """Working days from project start through latest installation finish (calendar days, not hours)."""
+        if solution_df.empty or start_date is None or not settings:
+            return None
+        if "Installation_Finish" not in solution_df.columns:
+            return None
+        finishes = solution_df["Installation_Finish"].dropna()
+        if finishes.empty:
+            return None
+        finish_idx = int(float(finishes.max()))
+        if finish_idx < 1:
+            return None
+        if not hasattr(self, "main_window") or not self.main_window:
+            return None
+        try:
+            slots = self.main_window._build_working_calendar_slots(settings, start_date, finish_idx)
+        except Exception:
+            return None
+        if finish_idx >= len(slots) or slots[finish_idx] is None:
+            return None
+        used_dates = {
+            slots[idx].date()
+            for idx in range(1, finish_idx + 1)
+            if idx < len(slots) and slots[idx] is not None
+        }
+        return len(used_dates)
+
+    @staticmethod
+    def _peak_site_occupancy(solution_df: pd.DataFrame) -> int:
+        """Peak modules waiting on site (arrived, installation not yet started)."""
+        if solution_df.empty:
+            return 0
+        events = []
+        for _, row in solution_df.iterrows():
+            arrival = row.get("Arrival_Time")
+            install_start = row.get("Installation_Start")
+            if pd.isna(arrival) or pd.isna(install_start):
+                continue
+            events.append((int(float(arrival)), 1))
+            events.append((int(float(install_start)), -1))
+        if not events:
+            return 0
+        events.sort(key=lambda item: (item[0], item[1]))
+        occupancy = 0
+        peak = 0
+        for _, delta in events:
+            occupancy += delta
+            peak = max(peak, occupancy)
+        return peak
+
+    def _calculate_metrics(
+        self,
+        solution_df: pd.DataFrame,
+        settings: Optional[dict] = None,
+        start_date: Optional[date] = None,
+    ) -> dict:
         """
         Calculate metrics from solution dataframe.
         
@@ -1642,14 +1880,19 @@ class ComparisonPage(QWidget):
         - factory_storage_module_days: Sum of Factory_Wait_Duration
         - site_storage_module_days: Sum of Onsite_Wait_Duration  
         - transport_bunch_number: Number of unique Transport_Start times
+        - handover_working_days: Working days from start date to finish
+        - peak_site_occupancy: Peak modules waiting on site
         """
+        empty_metrics = {
+            "construction_days": 0,
+            "factory_storage_module_days": 0,
+            "site_storage_module_days": 0,
+            "transport_bunch_number": 0,
+            "handover_working_days": None,
+            "peak_site_occupancy": 0,
+        }
         if solution_df.empty:
-            return {
-                "construction_days": 0,
-                "factory_storage_module_days": 0,
-                "site_storage_module_days": 0,
-                "transport_bunch_number": 0
-            }
+            return empty_metrics
         
         # Construction Days: from earliest Production_Start to latest Installation_Finish
         prod_start_col = solution_df.get('Production_Start')
@@ -1694,7 +1937,11 @@ class ComparisonPage(QWidget):
             "construction_days": round(construction_days, 1),
             "factory_storage_module_days": round(factory_storage_module_days, 1),
             "site_storage_module_days": round(site_storage_module_days, 1),
-            "transport_bunch_number": transport_bunch_number
+            "transport_bunch_number": transport_bunch_number,
+            "handover_working_days": self._count_handover_working_days(
+                solution_df, settings, start_date
+            ),
+            "peak_site_occupancy": self._peak_site_occupancy(solution_df),
         }
     
     def _update_metric_card(self, card: QFrame, metric_name: str, v1_value: float, v2_value: float):
@@ -1710,12 +1957,14 @@ class ComparisonPage(QWidget):
             v1_str = str(v1_value) if v1_value > 0 else "0"
             v2_str = str(v2_value) if v2_value > 0 else "0"
         
-        # Calculate change
+        # Calculate change. Percent is relative to the lower version; undefined when that baseline is 0.
         change = v1_value - v2_value
         if v2_value != 0:
-            change_percent = abs(change / v2_value * 100)
+            change_percent_str = f"{abs(change / v2_value * 100):.1f}%"
+        elif change == 0:
+            change_percent_str = "0.0%"
         else:
-            change_percent = 0 if change == 0 else 100
+            change_percent_str = "n/a"
         
         # Determine trend and color
         if change > 0:
@@ -1730,7 +1979,6 @@ class ComparisonPage(QWidget):
         
         # Format change string
         change_str = f"{change:+.1f}" if isinstance(change, float) else f"{change:+d}"
-        change_percent_str = f"{change_percent:.1f}%"
         
         # Update labels
         card.v1_value_label.setText(v1_str)
@@ -1746,6 +1994,111 @@ class ComparisonPage(QWidget):
         else:
             card.trend_icon.setText("→")
         card.trend_icon.setStyleSheet(f"font-size: 14px; color: {color};")
+
+    def _update_socio_metric_card(
+        self,
+        card: QFrame,
+        v1_text: str,
+        v2_text: str,
+        change_value: Optional[float],
+        change_text: str,
+    ):
+        if change_value is None:
+            color = "#6B7280"
+            icon = "→"
+        elif change_value > 1e-9:
+            color = "#DC2626"
+            icon = "↗"
+        elif change_value < -1e-9:
+            color = "#10B981"
+            icon = "↘"
+        else:
+            color = "#6B7280"
+            icon = "→"
+        card.v1_value_label.setText(v1_text)
+        card.v2_value_label.setText(v2_text)
+        card.change_label.setText(change_text)
+        card.change_label.setStyleSheet(f"font-size: 12px; color: {color}; font-weight: 500;")
+        card.trend_icon.setText(icon)
+        card.trend_icon.setStyleSheet(f"font-size: 14px; color: {color};")
+
+    def _format_signed_money(self, amount: float) -> str:
+        sign = "+" if amount > 0 else ""
+        return f"{sign}{self._format_money(amount)}"
+
+    def _refresh_socio_cards(self):
+        if not hasattr(self, "socio_metric_cards"):
+            return
+        upper = self._last_upper_metrics
+        lower = self._last_lower_metrics
+        if not upper or not lower:
+            return
+
+        delay_rate = self._parse_socio_coeff(self.socio_cost_per_delay_day)
+        truck_rate = self._parse_socio_coeff(self.socio_cost_per_truck)
+
+        upper_days = upper.get("handover_working_days")
+        lower_days = lower.get("handover_working_days")
+
+        def days_text(days: Optional[int]) -> str:
+            if days is None:
+                return "N/A"
+            text = f"{days} days"
+            if delay_rate is not None:
+                text = f"{text} ({self._format_money(days * delay_rate)})"
+            return text
+
+        if upper_days is None or lower_days is None:
+            extra_days = None
+            change_text = "Change: N/A"
+            change_value = None
+        else:
+            extra_days = upper_days - lower_days
+            change_text = f"Change: {extra_days:+d} days"
+            change_value = float(extra_days)
+            if delay_rate is not None:
+                extra_cost = extra_days * delay_rate
+                change_text = f"Change: {extra_days:+d} days ({self._format_signed_money(extra_cost)})"
+                change_value = extra_cost
+        self._update_socio_metric_card(
+            self.socio_metric_cards["Handover Delay"],
+            days_text(upper_days),
+            days_text(lower_days),
+            change_value,
+            change_text,
+        )
+
+        upper_trucks = int(upper.get("transport_bunch_number") or 0)
+        lower_trucks = int(lower.get("transport_bunch_number") or 0)
+        extra_trucks = upper_trucks - lower_trucks
+        v1_text = f"{upper_trucks} trucks"
+        v2_text = f"{lower_trucks} trucks"
+        change_text = f"Change: {extra_trucks:+d} trucks"
+        change_value = float(extra_trucks)
+        if truck_rate is not None:
+            v1_text = f"{v1_text} ({self._format_money(upper_trucks * truck_rate)})"
+            v2_text = f"{v2_text} ({self._format_money(lower_trucks * truck_rate)})"
+            extra_cost = extra_trucks * truck_rate
+            change_text = f"Change: {extra_trucks:+d} trucks ({self._format_signed_money(extra_cost)})"
+            change_value = extra_cost
+        self._update_socio_metric_card(
+            self.socio_metric_cards["Transportation Cost"],
+            v1_text,
+            v2_text,
+            change_value,
+            change_text,
+        )
+
+        upper_peak = int(upper.get("peak_site_occupancy") or 0)
+        lower_peak = int(lower.get("peak_site_occupancy") or 0)
+        extra_peak = upper_peak - lower_peak
+        self._update_socio_metric_card(
+            self.socio_metric_cards["Peak Site Occupancy"],
+            f"{upper_peak} modules",
+            f"{lower_peak} modules",
+            float(extra_peak),
+            f"Change: {extra_peak:+d} modules",
+        )
     
     def _create_gantt_canvas(self) -> FigureCanvas:
         """Create a matplotlib canvas for Gantt chart"""
@@ -2201,13 +2554,13 @@ class ComparisonPage(QWidget):
             
             # Determine project_start_datetime (use upper version's if available, otherwise lower's)
             project_start_datetime = upper_start_datetime or lower_start_datetime
-            
-            # Build working calendar slots if we have settings and start date
-            # We'll build it dynamically in _draw_gantt_chart based on actual data max index
-            
+            start_date = self._parse_project_start_date(project_start_datetime, settings)
+
             # Calculate metrics for both versions
-            upper_metrics = self._calculate_metrics(upper_df)
-            lower_metrics = self._calculate_metrics(lower_df)
+            upper_metrics = self._calculate_metrics(upper_df, settings=settings, start_date=start_date)
+            lower_metrics = self._calculate_metrics(lower_df, settings=settings, start_date=start_date)
+            self._last_upper_metrics = upper_metrics
+            self._last_lower_metrics = lower_metrics
             
             # Update metric cards
             if hasattr(self, 'metric_cards'):
@@ -2235,6 +2588,7 @@ class ComparisonPage(QWidget):
                     upper_metrics["transport_bunch_number"],
                     lower_metrics["transport_bunch_number"]
                 )
+            self._refresh_socio_cards()
             
             # Draw charts with date annotations
             print(f"[DEBUG] Drawing charts...")

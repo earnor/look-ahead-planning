@@ -28,6 +28,8 @@ from planning_tool.rescheduler import (
     DelayApplier,
     FixedConstraintsBuilder,
     remaining_periods_after_tau,
+    allowed_delay_types,
+    delay_type_hint,
 )
 from datetime import datetime, time, timedelta
 import traceback
@@ -205,7 +207,21 @@ class MainWindow(QMainWindow):
             if tau is None:
                 # If detected_at_dt is after all slots, use the last slot index
                 tau = len(working_calendar_slots) - 1
-            
+
+            df_sol = self._load_latest_solution_df()
+            if df_sol is not None and not df_sol.empty:
+                identifier = TaskStateIdentifier(df_sol, tau, working_calendar_slots)
+                states = identifier.identify_all_states()
+                phase_states = states.get(str(delay_info["module_id"]), [])
+                status = next((s.status for s in phase_states if s.phase == delay_info["phase"]), "NOT_STARTED")
+                allowed = allowed_delay_types(delay_info["phase"], status)
+                if delay_info["delay_type"] not in allowed:
+                    hint = delay_type_hint(delay_info["phase"], status) or (
+                        "This delay type is not allowed for the phase at the detected time."
+                    )
+                    QMessageBox.warning(self, "Delay Not Allowed", hint)
+                    return
+
             # Save to database
             delay_table = ScheduleDataManager.delay_updates_table_name(self.current_project_id)
             with self.engine.begin() as conn:
@@ -227,6 +243,51 @@ class MainWindow(QMainWindow):
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save delay: {str(e)}")
+
+    def _load_latest_solution_df(self) -> pd.DataFrame | None:
+        """Latest saved schedule for the current project, or None."""
+        if self.current_project_id is None:
+            return None
+        solution_table = self.mgr.solution_table_name(self.current_project_id)
+        inspector = inspect(self.engine)
+        if solution_table not in inspector.get_table_names():
+            return None
+        columns = [col["name"] for col in inspector.get_columns(solution_table)]
+        if "version_id" in columns:
+            query = f'''
+                SELECT * FROM "{solution_table}"
+                WHERE version_id = (SELECT MAX(version_id) FROM "{solution_table}" WHERE version_id IS NOT NULL)
+                   OR (version_id IS NULL AND NOT EXISTS (SELECT 1 FROM "{solution_table}" WHERE version_id IS NOT NULL))
+            '''
+            return pd.read_sql(query, self.engine)
+        return pd.read_sql_table(solution_table, self.engine)
+
+    def phase_status_at(self, module_id: str, phase: str, at_datetime: datetime) -> str:
+        """NOT_STARTED / IN_PROGRESS / COMPLETED for this module phase at at_datetime."""
+        df_sol = self._load_latest_solution_df()
+        if df_sol is None or df_sol.empty:
+            return "NOT_STARTED"
+        settings = self._get_active_settings() or {}
+        start_str = settings.get("start_datetime", "")
+        try:
+            start_date = self._parse_settings_date(start_str)
+        except ValueError:
+            return "NOT_STARTED"
+        max_slot = 10000
+        slots = self._build_working_calendar_slots(settings, start_date, max_slot)
+        tau = None
+        for idx, slot_dt in enumerate(slots[1:], start=1):
+            if slot_dt >= at_datetime:
+                tau = idx
+                break
+        if tau is None:
+            tau = len(slots) - 1
+        identifier = TaskStateIdentifier(df_sol, tau, slots)
+        states = identifier.identify_all_states().get(str(module_id), [])
+        for state in states:
+            if state.phase == phase:
+                return state.status
+        return "NOT_STARTED"
 
     @staticmethod
     def _read_duration_column(df: pd.DataFrame, column: str) -> dict[int, int]:
@@ -876,7 +937,10 @@ class MainWindow(QMainWindow):
                     fixed_production_starts=fixed_constraints.get('fixed_production_starts'),
                     fixed_arrival_times=fixed_constraints.get('fixed_arrival_times'),
                     fixed_durations=fixed_constraints.get('fixed_durations'),
-                    reoptimize_from_time=current_time
+                    reoptimize_from_time=current_time,
+                    earliest_production_starts=fixed_constraints.get('earliest_production_starts'),
+                    earliest_arrival_times=fixed_constraints.get('earliest_arrival_times'),
+                    earliest_installation_starts=fixed_constraints.get('earliest_installation_starts'),
                 )
                 
                 QApplication.processEvents()

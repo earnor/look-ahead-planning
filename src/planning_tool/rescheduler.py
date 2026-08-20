@@ -202,6 +202,48 @@ class TaskStateIdentifier:
         )
 
 
+def allowed_delay_types(phase: str, status: str) -> list[str]:
+    """
+    Delay types the planner may enter for this phase at the detected time.
+
+    Transport is special because a truck is shared: not-yet-departed modules
+    may only be postponed (and then rebatched); a truck already on the road
+    may only have its travel time extended, for every module on that truck.
+    """
+    phase = (phase or "").upper()
+    status = (status or "").upper()
+    if status == "COMPLETED":
+        return []
+    if phase == "TRANSPORT":
+        if status == "IN_PROGRESS":
+            return ["DURATION_EXTENSION"]
+        if status == "NOT_STARTED":
+            return ["START_POSTPONEMENT"]
+        return []
+    return ["DURATION_EXTENSION", "START_POSTPONEMENT"]
+
+
+def delay_type_hint(phase: str, status: str) -> str:
+    """Short explanation shown in the delay dialog."""
+    phase = (phase or "").upper()
+    status = (status or "").upper()
+    if status == "COMPLETED":
+        return "This phase is already finished, so a delay cannot be added."
+    if phase == "TRANSPORT":
+        if status == "IN_PROGRESS":
+            return "This truck is already on the road. Only a duration extension is allowed, and it applies to the whole truck."
+        if status == "NOT_STARTED":
+            return "This truck has not left. Only a start postponement is allowed; the module will be batched with later loads."
+    return ""
+
+
+def _phase_state(task_states: Dict[str, List[TaskState]], module_id: str, phase: str) -> Optional[TaskState]:
+    for state in task_states.get(str(module_id), []):
+        if state.phase == phase:
+            return state
+    return None
+
+
 def _remaining_of_phase(state: Optional[TaskState], total_duration: int, current_time: int) -> int:
     """Periods of this phase still occupying the calendar after tau."""
     if state is None or state.status == "COMPLETED":
@@ -319,17 +361,24 @@ class DelayApplier:
             modified_df['Earliest_Installation_Start'] = None
         
         for delay in self.delays:
-            module_id = delay.module_id
+            module_id = str(delay.module_id)
             if module_id not in self._module_id_to_index:
                 continue
-            
-            # Get current row
+
             row_idx = modified_df[modified_df['Module_ID'] == module_id].index
             if len(row_idx) == 0:
                 continue
             idx = row_idx[0]
-            
-            # Apply delay based on type and phase
+
+            if delay.phase == "TRANSPORT":
+                transport = _phase_state(self.task_states, module_id, "TRANSPORT")
+                status = transport.status if transport else "NOT_STARTED"
+                if delay.delay_type not in allowed_delay_types("TRANSPORT", status):
+                    continue
+                if delay.delay_type == "DURATION_EXTENSION":
+                    self._apply_transport_duration_to_truck(modified_df, module_id, delay)
+                    continue
+
             if delay.delay_type == "DURATION_EXTENSION":
                 self._apply_duration_extension(modified_df, idx, delay)
             elif delay.delay_type == "START_POSTPONEMENT":
@@ -342,6 +391,32 @@ class DelayApplier:
         
         return modified_df
     
+    def _original_truck_module_ids(self, module_id: str) -> List[str]:
+        """Modules that share the delayed module's planned arrival in the base schedule."""
+        rows = self.solution_df[self.solution_df['Module_ID'].astype(str) == str(module_id)]
+        if rows.empty:
+            return [str(module_id)]
+        arrival = rows.iloc[0].get('Arrival_Time')
+        if pd.isna(arrival):
+            return [str(module_id)]
+        mates = self.solution_df[self.solution_df['Arrival_Time'] == arrival]
+        return [str(mid) for mid in mates['Module_ID'].tolist()]
+
+    def _apply_transport_duration_to_truck(self, df: pd.DataFrame, module_id: str, delay: DelayInfo):
+        """A truck already on the road shares one travel time; extend every module on it."""
+        extra = delay.delay_hours
+        for mate_id in self._original_truck_module_ids(module_id):
+            mate_rows = df[df['Module_ID'].astype(str) == mate_id].index
+            if len(mate_rows) == 0:
+                continue
+            mate_idx = mate_rows[0]
+            current = df.at[mate_idx, 'Transport_Duration']
+            new_duration = current + extra
+            df.at[mate_idx, 'Transport_Duration'] = new_duration
+            start = df.at[mate_idx, 'Transport_Start']
+            if pd.notna(start) and pd.notna(new_duration):
+                df.at[mate_idx, 'Arrival_Time'] = int(start) + int(new_duration)
+
     def _apply_duration_extension(self, df: pd.DataFrame, idx: int, delay: DelayInfo):
         """
         Apply duration extension delay.
@@ -436,6 +511,9 @@ class FixedConstraintsBuilder:
         - fixed_production_starts: {module_index: start_time}
         - fixed_arrival_times: {module_index: arrival_time}
         - fixed_durations: {module_index: {phase: duration}}
+        - earliest_production_starts: {module_index: start_time}
+        - earliest_arrival_times: {module_index: arrival_time}
+        - earliest_installation_starts: {module_index: start_time}
         
         Logic:
         - COMPLETED: Fix start time, duration = original (not used by optimizer)
@@ -447,6 +525,9 @@ class FixedConstraintsBuilder:
         fixed_production_starts = {}
         fixed_arrival_times = {}
         fixed_durations = {}
+        earliest_production_starts = {}
+        earliest_arrival_times = {}
+        earliest_installation_starts = {}
         
         for module_id, states in self.task_states.items():
             if module_id not in self._module_id_to_index:
@@ -472,125 +553,117 @@ class FixedConstraintsBuilder:
                 if state.phase == "FABRICATION":
                     self._handle_fabrication_phase(
                         state, module_index, row, original_row,
-                        fixed_production_starts, fixed_durations
+                        fixed_production_starts, fixed_durations,
+                        earliest_production_starts,
                     )
                 elif state.phase == "TRANSPORT":
                     self._handle_transport_phase(
                         state, module_index, row, original_row,
-                        fixed_arrival_times, fixed_durations
+                        fixed_arrival_times, fixed_durations,
+                        earliest_arrival_times,
                     )
                 elif state.phase == "INSTALLATION":
                     self._handle_installation_phase(
                         state, module_index, row, original_row,
-                        fixed_installation_starts, fixed_durations
+                        fixed_installation_starts, fixed_durations,
+                        earliest_installation_starts,
                     )
         
         return {
             'fixed_installation_starts': fixed_installation_starts,
             'fixed_production_starts': fixed_production_starts,
             'fixed_arrival_times': fixed_arrival_times,
-            'fixed_durations': fixed_durations
+            'fixed_durations': fixed_durations,
+            'earliest_production_starts': earliest_production_starts,
+            'earliest_arrival_times': earliest_arrival_times,
+            'earliest_installation_starts': earliest_installation_starts,
         }
     
     def _handle_fabrication_phase(self, state: TaskState, module_index: int,
                                   row: pd.Series, original_row: pd.Series,
                                   fixed_production_starts: Dict[int, int],
-                                  fixed_durations: Dict[int, Dict[str, float]]):
+                                  fixed_durations: Dict[int, Dict[str, float]],
+                                  earliest_production_starts: Dict[int, int]):
         """Handle fabrication phase constraints"""
         if state.status == "COMPLETED":
-            # Fix start time (for historical record)
             if state.start_time:
                 fixed_production_starts[module_index] = state.start_time
-            # Duration = original (optimizer doesn't need it, but record for completeness)
             fixed_durations.setdefault(module_index, {})['FABRICATION'] = original_row.get('Production_Duration', 0)
-            
+
         elif state.status == "IN_PROGRESS":
-            # Fix start time (task has started)
             actual_start = state.actual_start_time if state.actual_start_time else state.start_time
             if actual_start:
                 fixed_production_starts[module_index] = actual_start
-            
-            # Calculate remaining duration
-            # Total duration after DURATION_EXTENSION
             total_duration = row.get('Production_Duration', 0)
-            # Elapsed time = current_time - actual_start
             elapsed = max(0, self.current_time - actual_start) if actual_start else 0
-            # Remaining duration = total - elapsed
             remaining_duration = max(0, total_duration - elapsed)
             fixed_durations.setdefault(module_index, {})['FABRICATION'] = remaining_duration
-            
+
         elif state.status == "NOT_STARTED":
-            # No fixed start time (may have lower bound from START_POSTPONEMENT via Earliest_Production_Start)
-            # Duration = modified total duration (after DURATION_EXTENSION)
             modified_duration = row.get('Production_Duration', 0)
             fixed_durations.setdefault(module_index, {})['FABRICATION'] = modified_duration
-    
+            earliest = row.get('Earliest_Production_Start')
+            if pd.notna(earliest):
+                earliest_production_starts[module_index] = int(earliest)
+
     def _handle_transport_phase(self, state: TaskState, module_index: int,
                                row: pd.Series, original_row: pd.Series,
                                fixed_arrival_times: Dict[int, int],
-                               fixed_durations: Dict[int, Dict[str, float]]):
+                               fixed_durations: Dict[int, Dict[str, float]],
+                               earliest_arrival_times: Dict[int, int]):
         """Handle transport phase constraints"""
         if state.status == "COMPLETED":
-            # Fix arrival time (transport completed)
             arrival = row.get('Arrival_Time')
             if arrival is None and state.finish_time:
                 arrival = state.finish_time
             if arrival:
                 fixed_arrival_times[module_index] = arrival
-            # Duration = original (optimizer doesn't need it)
             fixed_durations.setdefault(module_index, {})['TRANSPORT'] = original_row.get('Transport_Duration', 0)
-            
+
         elif state.status == "IN_PROGRESS":
-            # Fix start time indirectly via arrival time calculation
-            # For transport, we fix the start time by ensuring the relationship is maintained
-            # But we use remaining duration
+            # The truck has left: pin arrival at departure plus the (possibly extended) travel time.
             actual_start = state.actual_start_time if state.actual_start_time else state.start_time
-            
-            # Calculate remaining duration
             total_duration = row.get('Transport_Duration', 0)
             elapsed = max(0, self.current_time - actual_start) if actual_start else 0
-            remaining_duration = max(0, total_duration - elapsed)
+            remaining_duration = max(0, int(total_duration or 0) - elapsed)
             fixed_durations.setdefault(module_index, {})['TRANSPORT'] = remaining_duration
-            
-            # Note: Transport start is fixed via precedence constraints and production finish
-            # We don't directly fix transport start here, but the remaining duration ensures
-            # the transport completion time is correctly calculated
-            
+            if actual_start is not None and pd.notna(total_duration):
+                fixed_arrival_times[module_index] = int(actual_start) + int(total_duration)
+
         elif state.status == "NOT_STARTED":
-            # No fixed start time
-            # Duration = modified total duration (after DURATION_EXTENSION)
             modified_duration = row.get('Transport_Duration', 0)
             fixed_durations.setdefault(module_index, {})['TRANSPORT'] = modified_duration
-    
+            earliest_start = row.get('Earliest_Transport_Start')
+            if pd.notna(earliest_start):
+                lead = int(modified_duration or 0)
+                earliest_arrival_times[module_index] = int(earliest_start) + lead
+
     def _handle_installation_phase(self, state: TaskState, module_index: int,
                                   row: pd.Series, original_row: pd.Series,
                                   fixed_installation_starts: Dict[int, int],
-                                  fixed_durations: Dict[int, Dict[str, float]]):
+                                  fixed_durations: Dict[int, Dict[str, float]],
+                                  earliest_installation_starts: Dict[int, int]):
         """Handle installation phase constraints"""
         if state.status == "COMPLETED":
-            # Fix start time (for historical record)
             if state.start_time:
                 fixed_installation_starts[module_index] = state.start_time
-            # Duration = original (optimizer doesn't need it)
             fixed_durations.setdefault(module_index, {})['INSTALLATION'] = original_row.get('Installation_Duration', 0)
-            
+
         elif state.status == "IN_PROGRESS":
-            # Fix start time (task has started)
             actual_start = state.actual_start_time if state.actual_start_time else state.start_time
             if actual_start:
                 fixed_installation_starts[module_index] = actual_start
-            
-            # Calculate remaining duration
             total_duration = row.get('Installation_Duration', 0)
             elapsed = max(0, self.current_time - actual_start) if actual_start else 0
             remaining_duration = max(0, total_duration - elapsed)
             fixed_durations.setdefault(module_index, {})['INSTALLATION'] = remaining_duration
-            
+
         elif state.status == "NOT_STARTED":
-            # No fixed start time (may have lower bound from START_POSTPONEMENT via Earliest_Installation_Start)
-            # Duration = modified total duration (after DURATION_EXTENSION)
             modified_duration = row.get('Installation_Duration', 0)
             fixed_durations.setdefault(module_index, {})['INSTALLATION'] = modified_duration
+            earliest = row.get('Earliest_Installation_Start')
+            if pd.notna(earliest):
+                earliest_installation_starts[module_index] = int(earliest)
 
 
 def load_delays_from_db(engine: Engine, project_id: int, version_id: Optional[int] = None) -> List[DelayInfo]:
