@@ -34,7 +34,7 @@ from planning_tool.rescheduler import (
 from datetime import datetime, time, timedelta
 import traceback
 from planning_tool.ui import (
-    DashboardPage, SchedulePage, UploadPage, SettingsPage, ComparisonPage,
+    DashboardPage, SchedulePage, UploadPage, SettingsPage, ComparisonPage, CostsPage,
     TopBar, Sidebar, DashboardTable, StatusCell,
     DelayInputDialog, Card, FileDropArea, Chip
 )
@@ -111,10 +111,19 @@ class MainWindow(QMainWindow):
             page_comparison = QLabel("Comparison"); page_comparison.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.page_comparison = None
 
+        try:
+            page_costs = CostsPage()
+            self.page_costs = page_costs
+            page_costs.main_window = self
+        except NameError:
+            page_costs = QLabel("Costs"); page_costs.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.page_costs = None
+
         self.page_index = {
             "dashboard": self.stack.addWidget(page_dashboard),
             "schedule":  self.stack.addWidget(page_schedule),
             "comparison": self.stack.addWidget(page_comparison),
+            "costs": self.stack.addWidget(page_costs),
             "upload":    self.stack.addWidget(page_upload),
             "settings":  self.stack.addWidget(page_settings),
         }
@@ -1034,7 +1043,7 @@ class MainWindow(QMainWindow):
                 reference=reference,
             )
                 QApplication.processEvents()
-                status = scheduler.solve()
+                status = scheduler.solve(heuristic=heuristic_solution)
 
                 if scheduler.get_solution_dict() is None:
                     self._abort_calculation(
@@ -1658,6 +1667,9 @@ class MainWindow(QMainWindow):
             if name == "comparison" and hasattr(self, "page_comparison") and self.page_comparison:
                 if self.current_project_id is not None:
                     self.page_comparison.load_version_list(self.engine, self.current_project_id)
+            elif name == "costs" and hasattr(self, "page_costs") and self.page_costs:
+                if self.current_project_id is not None:
+                    self.page_costs.load_version_list(self.engine, self.current_project_id)
             # Load version list for schedule page when it's shown
             elif name == "schedule" and hasattr(self, "page_schedule") and self.page_schedule:
                 if self.current_project_id is not None:
@@ -1672,6 +1684,7 @@ class MainWindow(QMainWindow):
         self.sidebar.btn_dash.setChecked(False)
         self.sidebar.btn_sched.setChecked(False)
         self.sidebar.btn_comparison.setChecked(False)
+        self.sidebar.btn_costs.setChecked(False)
         self.sidebar.btn_upload.setChecked(False)
         self.sidebar.btn_settings.setChecked(False)
         
@@ -1682,6 +1695,8 @@ class MainWindow(QMainWindow):
             self.sidebar.btn_sched.setChecked(True)
         elif page_name == "comparison":
             self.sidebar.btn_comparison.setChecked(True)
+        elif page_name == "costs":
+            self.sidebar.btn_costs.setChecked(True)
         elif page_name == "upload":
             self.sidebar.btn_upload.setChecked(True)
         elif page_name == "settings":
@@ -1724,6 +1739,10 @@ class MainWindow(QMainWindow):
                 current_idx = self.stack.currentIndex()
                 if current_idx == self.page_index.get("comparison"):
                     self.page_comparison.load_version_list(self.engine, self.current_project_id)
+            if hasattr(self, "page_costs") and self.page_costs:
+                current_idx = self.stack.currentIndex()
+                if current_idx == self.page_index.get("costs"):
+                    self.page_costs.load_version_list(self.engine, self.current_project_id)
             # Refresh schedule page version list if currently viewing it
             if hasattr(self, "page_schedule") and self.page_schedule:
                 current_idx = self.stack.currentIndex()
@@ -1742,6 +1761,10 @@ class MainWindow(QMainWindow):
                 current_idx = self.stack.currentIndex()
                 if current_idx == self.page_index.get("comparison"):
                     self.page_comparison.load_version_list(self.engine, None)
+            if hasattr(self, "page_costs") and self.page_costs:
+                current_idx = self.stack.currentIndex()
+                if current_idx == self.page_index.get("costs"):
+                    self.page_costs.load_version_list(self.engine, None)
             # Clear schedule page if currently viewing it
             if hasattr(self, "page_schedule") and self.page_schedule:
                 current_idx = self.stack.currentIndex()

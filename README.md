@@ -4,13 +4,13 @@
 
 This repository is a research prototype. It is not a production product, has not been certified for operational use, and may change without notice.
 
-The mixed-integer program is solved with **Gurobi Optimizer** under a **Gurobi Educational / Academic license**. You must have a valid Gurobi educational license installed on the machine that runs the solver. Commercial use of Gurobi requires a separate commercial license from Gurobi Optimization, LLC.
+The mixed-integer program is solved with **SCIP** through [PySCIPOpt](https://github.com/scipopt/PySCIPOpt). SCIP is open source (Apache 2.0 from SCIP 8 onward); no commercial solver licence is required.
 
 ---
 
 ## Overview
 
-The tool supports **look-ahead scheduling** of prefabricated building modules: factory production, factory storage, truck transport, on-site storage, and installation. Given module durations, installation precedence, resource capacities, and a working calendar, it builds a time-indexed MIP, solves it with Gurobi, and shows the resulting schedule in a desktop UI.
+The tool supports **look-ahead scheduling** of prefabricated building modules: factory production, factory storage, truck transport, on-site storage, and installation. Given module durations, installation precedence, resource capacities, and a working calendar, it builds a time-indexed MIP, solves it with SCIP, and shows the resulting schedule in a desktop UI.
 
 When delays are recorded against a live schedule, the tool can **re-optimize from a detection time τ**, keeping completed and in-progress work fixed and planning the remainder.
 
@@ -21,7 +21,8 @@ When delays are recorded against a live schedule, the tool can **re-optimize fro
 - Optimize a weighted objective (project duration, transport trips, on-site storage, factory storage)
 - Display the schedule (production → factory wait → transport → site wait → installation)
 - Record fabrication, transport, or installation delays and re-optimize
-- Compare two plan versions (Gantt charts, operational metrics, socio-economic indicators)
+- Compare two plan versions (Gantt charts and operational metrics)
+- Monetise a chosen schedule against the original plan (construction, transport batches, occupant disruption, biodiversity)
 - Export the current schedule to Excel
 
 ## Requirements
@@ -30,7 +31,7 @@ When delays are recorded against a live schedule, the tool can **re-optimize fro
 | --- | --- |
 | Python | 3.11 or newer |
 | OS | Windows, macOS, or Linux with a desktop session |
-| Solver | [Gurobi](https://www.gurobi.com/) with a **valid educational/academic license** |
+| Solver | [SCIP](https://www.scipopt.org/) via `pyscipopt` |
 | GUI | PyQt6 |
 
 Python packages used by the application:
@@ -41,25 +42,19 @@ pandas
 sqlalchemy
 matplotlib
 numpy
-gurobipy
+pyscipopt
 openpyxl          # required for Excel export
 ```
 
-`gurobipy` only works after Gurobi and its license file are installed. Confirm with:
+Confirm SCIP is available with:
 
 ```bash
-python -c "import gurobipy; print(gurobipy.gurobi.version())"
+python -c "from pyscipopt import Model; print('pyscipopt ok')"
 ```
 
 ## Installation
 
-### 1. Gurobi educational license
-
-1. Install Gurobi from [https://www.gurobi.com/downloads/](https://www.gurobi.com/downloads/).
-2. Request an academic/educational license and activate it (`grbgetkey`, or follow Gurobi’s current academic instructions).
-3. Verify that `gurobi_cl` (or the Gurobi Python API) starts without a license error.
-
-### 2. Clone and create a virtual environment
+### 1. Clone and create a virtual environment
 
 ```bash
 git clone <repository-url>
@@ -80,10 +75,10 @@ macOS / Linux:
 source .venv/bin/activate
 ```
 
-### 3. Install Python dependencies
+### 2. Install Python dependencies
 
 ```bash
-pip install PyQt6 pandas sqlalchemy matplotlib numpy openpyxl gurobipy
+pip install PyQt6 pandas sqlalchemy matplotlib numpy openpyxl pyscipopt
 ```
 
 The application package lives under `src/planning_tool`. Set `PYTHONPATH` to `src` (see below), or install the project in editable mode if you use Poetry:
@@ -152,7 +147,7 @@ The solver:
 
 1. Builds a working-hour calendar from Settings.
 2. Runs a constructive heuristic to size the horizon \(T\) and to obtain objective reference values.
-3. Solves the MIP with Gurobi (default time limit 120 s, MIP gap 20%).
+3. Solves the MIP with SCIP (default time limit 600 s, MIP gap 1%).
 4. Stores the result as **Version 0**.
 
 If no feasible solution is found, no version is written. Check capacities, precedence, and the start date.
@@ -195,15 +190,25 @@ Operational metrics (hours / truck bunches):
 - Site storage module hours
 - Transport bunch number
 
-**Socio-economic impact** (coefficients are typed on this page; they are not saved to the database):
-
-| Indicator | How it is computed |
-| --- | --- |
-| Handover delay | Working days from project start to latest installation finish (working calendar, not hours ÷ 8). If “cost per delayed day” is set, days are also shown as CHF. |
-| Transportation cost | Number of truck trips × “cost per truck” |
-| Peak site occupancy | Peak number of modules waiting on site (arrived, installation not yet started). Not converted to money. |
-
 Percentage change on operational cards is relative to the **Lower** version. If Lower is zero, the percentage is shown as `n/a`.
+
+### 7. Costs
+
+Schedule Gantt comparison stays on **Comparison**. **Costs** only compares money.
+
+1. Open **Costs**.
+2. Enter unit rates once (they apply to both schedules). Rates stay on this page; they are not saved.
+3. The **upper** panel is the chosen (new) schedule — pick a version there.
+4. The **lower** panel is always **Version 0** (the original plan, before disruption).
+
+| Category | Quantity from the schedule | User input | Formula |
+| --- | --- | --- | --- |
+| Construction | Working days (start date through latest installation finish, working calendar) | Crane CHF/day, crew CHF/day, optional extra daily terms | days × (crane + crew + extra terms) |
+| Batch | Number of truck trips (unique transport batches) | Cost per truck | trucks × cost per truck |
+| Disruption to occupants | Working days | Cost per resident per day, number of nearby residents | days × cost/resident/day × residents |
+| Biodiversity | Working days | Occupied area (m²), price per m² per day | area × days × price |
+
+Each version panel lists the four categories and a total. The chosen panel also shows the difference versus Version 0.
 
 ## Input format
 
@@ -237,7 +242,7 @@ look-ahead-planning/
 │   └── test_input.csv         # small example
 ├── src/planning_tool/
 │   ├── main.py                # application entry
-│   ├── model.py               # Gurobi MIP
+│   ├── model.py               # SCIP MIP (PySCIPOpt)
 │   ├── warm_start.py          # constructive heuristic (horizon + references)
 │   ├── rescheduler.py         # delay application and re-opt constraints
 │   ├── datamanager.py         # SQLite schema and project tables
@@ -250,14 +255,14 @@ look-ahead-planning/
 
 - One time period is one **working hour** on the calendar from Settings (weekends and non-working days are skipped).
 - Truck loads are batched (typically 3–5 modules; one partial load is allowed).
-- The heuristic is used to choose \(T\) and objective reference values.
-- Default Gurobi limits: `TimeLimit = 120` seconds, `MIPGap = 0.2`. A run may stop at the time limit with a feasible but not proven-optimal solution.
+- The heuristic chooses \(T\) (so branch-and-bound searches a shorter horizon) and is also given to SCIP as a feasible incumbent.
+- Default SCIP limits: time 600 seconds, relative gap 0.01. Emphasis is feasibility, with aggressive primal heuristics and light cutting, so the time is spent improving the incumbent rather than only proving a bound.
 
 ## Disclaimer
 
 This software is a **prototype** prepared at ETH Zurich in the context of **RENOMIZE**. It is provided for research and demonstration. ETH Zurich, the authors, and project partners accept no liability for decisions made on the basis of its output.
 
-Use of Gurobi is subject to the [Gurobi End User License Agreement](https://www.gurobi.com/eula/). This prototype was developed with a Gurobi educational license and does not grant you any Gurobi rights.
+SCIP is used under the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0) (SCIP 8 and later). See [scipopt.org](https://www.scipopt.org/) for details.
 
 ## Contact
 

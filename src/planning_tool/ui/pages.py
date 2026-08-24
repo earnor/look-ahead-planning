@@ -6,7 +6,7 @@ This module contains all main page widgets for the application:
 - SchedulePage: Module schedule display and management
 - UploadPage: File upload interface
 - SettingsPage: Project settings configuration
-- ComparisonPage: Schedule comparison page with Gantt charts and metrics
+- ComparisonPage: Schedule comparison page with Gantt charts and operational metrics
 """
 from functools import reduce
 from datetime import datetime
@@ -1523,7 +1523,7 @@ class ComparisonPage(QWidget):
         return container
 
     def _build_metrics_section(self) -> QWidget:
-        """Build the right sidebar with operational metrics and socio-economic impact."""
+        """Build the right sidebar with operational metrics."""
         container = QFrame()
         container.setObjectName("MetricsSidebar")
         container.setMinimumWidth(280)
@@ -1586,105 +1586,11 @@ class ComparisonPage(QWidget):
             self.metric_cards[metric_name] = metric_card
             layout.addWidget(metric_card)
 
-        layout.addWidget(self._build_socio_economic_section())
         layout.addStretch(1)
 
         scroll.setWidget(inner)
         outer_layout.addWidget(scroll)
         return container
-
-    def _build_socio_economic_section(self) -> QWidget:
-        """User-filled coefficients and socio-economic comparison cards (display only for now)."""
-        section = QFrame()
-        section.setObjectName("SocioSection")
-        section.setStyleSheet("""
-            QFrame#SocioSection {
-                background: #F8FAFC;
-                border: 1px solid #E2E8F0;
-                border-radius: 8px;
-            }
-        """)
-        layout = QVBoxLayout(section)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(12)
-
-        title = QLabel("Socio-economic Impact")
-        title.setStyleSheet("font-size: 16px; font-weight: 600; color: #0F172A;")
-        subtitle = QLabel(
-            "Fill the unit costs below."
-        )
-        subtitle.setWordWrap(True)
-        subtitle.setStyleSheet("font-size: 12px; color: #64748B;")
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
-
-        coeff_title = QLabel("Unit costs")
-        coeff_title.setStyleSheet("font-size: 12px; font-weight: 600; color: #334155;")
-        layout.addWidget(coeff_title)
-
-        self.socio_cost_per_truck = self._add_socio_coeff_row(
-            layout, "Cost per truck", "CHF / truck"
-        )
-        self.socio_cost_per_delay_day = self._add_socio_coeff_row(
-            layout, "Cost per delayed day", "CHF / working day"
-        )
-        self.socio_cost_per_truck.textChanged.connect(self._refresh_socio_cards)
-        self.socio_cost_per_delay_day.textChanged.connect(self._refresh_socio_cards)
-
-        socio_metrics = [
-            {
-                "name": "Handover Delay",
-                "hint": "Extra working days from start date to finish (working calendar, not hours) × cost per delayed day.",
-            },
-            {
-                "name": "Transportation Cost",
-                "hint": "Extra truck trips × cost per truck.",
-            },
-            {
-                "name": "Peak Site Occupancy",
-                "hint": "Peak number of modules on site.",
-            },
-        ]
-
-        self.socio_metric_cards = {}
-        for spec in socio_metrics:
-            metric = {
-                "name": spec["name"],
-                "hint": spec["hint"],
-                "socio": True,
-                "v1_value": "N/A",
-                "v2_value": "N/A",
-                "change": "N/A",
-                "change_percent": "N/A",
-                "trend": "neutral",
-            }
-            card = self._create_metric_card(metric)
-            self.socio_metric_cards[spec["name"]] = card
-            layout.addWidget(card)
-
-        return section
-
-    def _add_socio_coeff_row(self, parent_layout: QVBoxLayout, label_text: str, placeholder: str) -> QLineEdit:
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        label = QLabel(label_text)
-        label.setStyleSheet("font-size: 12px; color: #475569;")
-        label.setMinimumWidth(130)
-        field = QLineEdit()
-        field.setPlaceholderText(placeholder)
-        field.setStyleSheet("""
-            QLineEdit {
-                border: 1px solid #CBD5E1;
-                border-radius: 6px;
-                padding: 6px 10px;
-                font-size: 13px;
-                background: #FFFFFF;
-            }
-        """)
-        row.addWidget(label)
-        row.addWidget(field, 1)
-        parent_layout.addLayout(row)
-        return field
 
     def _create_metric_card(self, metric: dict) -> QFrame:
         """Create a metric comparison card with updatable labels"""
@@ -1775,21 +1681,6 @@ class ComparisonPage(QWidget):
         card.trend_icon = trend_icon
 
         return card
-    
-    def _parse_socio_coeff(self, line_edit: QLineEdit) -> Optional[float]:
-        raw = (line_edit.text() or "").strip().replace("'", "").replace(",", "")
-        for token in ("CHF", "chf", "€", "$"):
-            raw = raw.replace(token, "")
-        raw = raw.strip()
-        if not raw:
-            return None
-        try:
-            value = float(raw)
-        except ValueError:
-            return None
-        if value < 0:
-            return None
-        return value
 
     @staticmethod
     def _format_money(amount: float) -> str:
@@ -1995,111 +1886,6 @@ class ComparisonPage(QWidget):
             card.trend_icon.setText("→")
         card.trend_icon.setStyleSheet(f"font-size: 14px; color: {color};")
 
-    def _update_socio_metric_card(
-        self,
-        card: QFrame,
-        v1_text: str,
-        v2_text: str,
-        change_value: Optional[float],
-        change_text: str,
-    ):
-        if change_value is None:
-            color = "#6B7280"
-            icon = "→"
-        elif change_value > 1e-9:
-            color = "#DC2626"
-            icon = "↗"
-        elif change_value < -1e-9:
-            color = "#10B981"
-            icon = "↘"
-        else:
-            color = "#6B7280"
-            icon = "→"
-        card.v1_value_label.setText(v1_text)
-        card.v2_value_label.setText(v2_text)
-        card.change_label.setText(change_text)
-        card.change_label.setStyleSheet(f"font-size: 12px; color: {color}; font-weight: 500;")
-        card.trend_icon.setText(icon)
-        card.trend_icon.setStyleSheet(f"font-size: 14px; color: {color};")
-
-    def _format_signed_money(self, amount: float) -> str:
-        sign = "+" if amount > 0 else ""
-        return f"{sign}{self._format_money(amount)}"
-
-    def _refresh_socio_cards(self):
-        if not hasattr(self, "socio_metric_cards"):
-            return
-        upper = self._last_upper_metrics
-        lower = self._last_lower_metrics
-        if not upper or not lower:
-            return
-
-        delay_rate = self._parse_socio_coeff(self.socio_cost_per_delay_day)
-        truck_rate = self._parse_socio_coeff(self.socio_cost_per_truck)
-
-        upper_days = upper.get("handover_working_days")
-        lower_days = lower.get("handover_working_days")
-
-        def days_text(days: Optional[int]) -> str:
-            if days is None:
-                return "N/A"
-            text = f"{days} days"
-            if delay_rate is not None:
-                text = f"{text} ({self._format_money(days * delay_rate)})"
-            return text
-
-        if upper_days is None or lower_days is None:
-            extra_days = None
-            change_text = "Change: N/A"
-            change_value = None
-        else:
-            extra_days = upper_days - lower_days
-            change_text = f"Change: {extra_days:+d} days"
-            change_value = float(extra_days)
-            if delay_rate is not None:
-                extra_cost = extra_days * delay_rate
-                change_text = f"Change: {extra_days:+d} days ({self._format_signed_money(extra_cost)})"
-                change_value = extra_cost
-        self._update_socio_metric_card(
-            self.socio_metric_cards["Handover Delay"],
-            days_text(upper_days),
-            days_text(lower_days),
-            change_value,
-            change_text,
-        )
-
-        upper_trucks = int(upper.get("transport_bunch_number") or 0)
-        lower_trucks = int(lower.get("transport_bunch_number") or 0)
-        extra_trucks = upper_trucks - lower_trucks
-        v1_text = f"{upper_trucks} trucks"
-        v2_text = f"{lower_trucks} trucks"
-        change_text = f"Change: {extra_trucks:+d} trucks"
-        change_value = float(extra_trucks)
-        if truck_rate is not None:
-            v1_text = f"{v1_text} ({self._format_money(upper_trucks * truck_rate)})"
-            v2_text = f"{v2_text} ({self._format_money(lower_trucks * truck_rate)})"
-            extra_cost = extra_trucks * truck_rate
-            change_text = f"Change: {extra_trucks:+d} trucks ({self._format_signed_money(extra_cost)})"
-            change_value = extra_cost
-        self._update_socio_metric_card(
-            self.socio_metric_cards["Transportation Cost"],
-            v1_text,
-            v2_text,
-            change_value,
-            change_text,
-        )
-
-        upper_peak = int(upper.get("peak_site_occupancy") or 0)
-        lower_peak = int(lower.get("peak_site_occupancy") or 0)
-        extra_peak = upper_peak - lower_peak
-        self._update_socio_metric_card(
-            self.socio_metric_cards["Peak Site Occupancy"],
-            f"{upper_peak} modules",
-            f"{lower_peak} modules",
-            float(extra_peak),
-            f"Change: {extra_peak:+d} modules",
-        )
-    
     def _create_gantt_canvas(self) -> FigureCanvas:
         """Create a matplotlib canvas for Gantt chart"""
         fig = Figure(figsize=(12, 6), facecolor='white')
@@ -2588,8 +2374,7 @@ class ComparisonPage(QWidget):
                     upper_metrics["transport_bunch_number"],
                     lower_metrics["transport_bunch_number"]
                 )
-            self._refresh_socio_cards()
-            
+
             # Draw charts with date annotations
             print(f"[DEBUG] Drawing charts...")
             self._draw_gantt_chart(self.upper_gantt_canvas, upper_df, upper_label,

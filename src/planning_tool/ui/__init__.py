@@ -38,6 +38,7 @@ from .pages import (
     SettingsPage,
     ComparisonPage
 )
+from .costs_page import CostsPage
 
 __all__ = [
     # Widgets
@@ -63,5 +64,6 @@ __all__ = [
     'UploadPage',
     'SettingsPage',
     'ComparisonPage',
+    'CostsPage',
 ]
 

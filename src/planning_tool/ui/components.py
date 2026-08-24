@@ -130,19 +130,28 @@ class Sidebar(QFrame):
         self.btn_dash = SidebarButton("Dashboard")
         self.btn_sched = SidebarButton("Schedule")
         self.btn_comparison = SidebarButton("Comparison")
+        self.btn_costs = SidebarButton("Costs")
         self.btn_upload = SidebarButton("Upload Data")
         self.btn_settings = SidebarButton("Settings")
         self.btn_dash.setChecked(True)
 
         group = QButtonGroup(self)
         group.setExclusive(True)
-        for b in (self.btn_dash, self.btn_sched, self.btn_comparison, self.btn_upload, self.btn_settings):
+        for b in (
+            self.btn_dash,
+            self.btn_sched,
+            self.btn_comparison,
+            self.btn_costs,
+            self.btn_upload,
+            self.btn_settings,
+        ):
             b.setCheckable(True)
             group.addButton(b)
 
         self.btn_dash.clicked.connect(lambda: self.pageRequested.emit("dashboard"))
         self.btn_sched.clicked.connect(lambda: self.pageRequested.emit("schedule"))
         self.btn_comparison.clicked.connect(lambda: self.pageRequested.emit("comparison"))
+        self.btn_costs.clicked.connect(lambda: self.pageRequested.emit("costs"))
         self.btn_upload.clicked.connect(lambda: self.pageRequested.emit("upload"))
         self.btn_settings.clicked.connect(lambda: self.pageRequested.emit("settings"))
 
@@ -156,6 +165,7 @@ class Sidebar(QFrame):
         lay.addWidget(self.btn_dash)
         lay.addWidget(self.btn_sched)
         lay.addWidget(self.btn_comparison)
+        lay.addWidget(self.btn_costs)
         lay.addWidget(self.btn_upload)
         lay.addWidget(self.btn_settings)
         lay.addStretch(1)

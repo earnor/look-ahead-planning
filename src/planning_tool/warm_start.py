@@ -5,8 +5,9 @@ The three-stage scheduling logic
 (just-in-time truck arrival, backward production, forward installation) is kept
 as-is; the precedence source is the planning tool's own arc list.
 
-Every schedule produced here satisfies the MIP constraints in `model.py`, so it
-can be handed to Gurobi as a MIP start without being rejected.
+The makespan of this schedule chooses a tight horizon T for the time-indexed
+MIP. The same schedule is also handed to SCIP as a feasible incumbent, because
+generic MIP heuristics almost never construct a valid time-indexed plan.
 """
 from __future__ import annotations
 
@@ -142,9 +143,11 @@ def topological_order(
     L: Dict[int, int],
 ) -> List[int]:
     """
-    Construction order. Among modules that become eligible at the same time:
-    longest downstream chain first, then longest installation, then longest
-    production + transport, then module index for stability.
+    Construction order. Modules are taken by precedence depth first (all
+    currently independent roots before any of their successors), so several
+    installation crews can start in parallel. Within a depth layer: longest
+    downstream chain, then longest installation, then longest production +
+    transport, then module index for stability.
     """
     node_ids = list(node_ids)
     succ: Dict[int, List[int]] = defaultdict(list)
@@ -170,8 +173,13 @@ def topological_order(
     for u in reversed(plain_order):
         downstream[u] = max((1 + downstream[v] for v in succ[u]), default=0)
 
+    depth = {n: 0 for n in node_ids}
+    for u in plain_order:
+        for v in succ[u]:
+            depth[v] = max(depth[v], depth[u] + 1)
+
     def key(n: int) -> Tuple:
-        return (-downstream[n], -d[n], -(D[n] + L[n]), n)
+        return (depth[n], -downstream[n], -d[n], -(D[n] + L[n]), n)
 
     heap: List[Tuple[Tuple, int]] = []
     work_indeg = dict(indeg)
@@ -420,7 +428,15 @@ def construct_solution(
     for p, s in E:
         predecessors[s].add(p)
 
-    sizes = choose_batch_sizes(len(order), min_batch_size, max_batch_size)
+    # Ship every independent root on the first truck so parallel crews can
+    # start together. Remaining modules keep the usual 3-5 packing and a
+    # single leftover load.
+    n_roots = sum(1 for i in order if not predecessors[i])
+    rest_n = len(order) - n_roots
+    if min_batch_size <= n_roots <= max_batch_size and rest_n > 0:
+        sizes = [n_roots] + choose_batch_sizes(rest_n, min_batch_size, max_batch_size)
+    else:
+        sizes = choose_batch_sizes(len(order), min_batch_size, max_batch_size)
     batches: List[Batch] = []
     batch_of_module: Dict[int, int] = {}
     cursor = 0

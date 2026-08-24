@@ -1,8 +1,32 @@
-from gurobipy import Model, GRB, quicksum
+from collections import Counter
+from pyscipopt import (
+    Model,
+    quicksum,
+    Heur,
+    SCIP_PARAMEMPHASIS,
+    SCIP_PARAMSETTING,
+    SCIP_RESULT,
+    SCIP_HEURTIMING,
+)
 import math
 import pandas as pd
 from sqlalchemy import Engine, text
 from typing import Optional, Dict, Any
+
+def _add_cons(m, expr, name: str):
+    """Named constraint helper so the MIP body stays solver-agnostic."""
+    return m.addCons(expr, name=name)
+
+
+class _ScheduleStartHeur(Heur):
+    """Submits the constructive schedule in original variable space (avoids presolve aggregations)."""
+
+    def heurexec(self, heurtiming, nodeinfeasible):
+        if getattr(self, "_injected", False):
+            return {"result": SCIP_RESULT.DIDNOTRUN}
+        self._injected = True
+        ok = self.scheduler._inject_heuristic_sol(self)
+        return {"result": SCIP_RESULT.FOUNDSOL if ok else SCIP_RESULT.DIDNOTFIND}
 
 
 class PrefabScheduler:
@@ -93,6 +117,9 @@ class PrefabScheduler:
         self.F = {}
         self.u = {}
         self.time_windows = None
+        self._n_binaries = 0
+        self._n_live_binaries = 0
+        self._heuristic_start = None
         
         # Fixed constraints for re-optimization
         self.fixed_installation_starts = {}
@@ -318,16 +345,36 @@ class PrefabScheduler:
         windows["dummy_end"] = (max(1, min(dummy_end_earliest, T)), T)
         return windows
 
+    def _add_bin(self, m, name: str, ub: float):
+        """Binary variable; ub=0 is how time-window tightening removes a start time."""
+        ubf = float(ub)
+        self._n_binaries += 1
+        if ubf >= 0.5:
+            self._n_live_binaries += 1
+        return m.addVar(vtype="B", lb=0.0, ub=ubf, name=name)
+
+    def _configure_solver(self, m, time_limit=600.0, mip_gap=0.01):
+        """
+        Search for better incumbents: feasibility emphasis and aggressive
+        primal heuristics. Cuts stay light so the time is not spent only at
+        the root. Gap 1% is a stop criterion; the time limit is the usual exit.
+        """
+        m.setEmphasis(SCIP_PARAMEMPHASIS.FEASIBILITY, True)
+        m.setPresolve(SCIP_PARAMSETTING.FAST)
+        m.setSeparating(SCIP_PARAMSETTING.FAST)
+        m.setHeuristics(SCIP_PARAMSETTING.AGGRESSIVE)
+        m.setParam("limits/time", time_limit)
+        m.setParam("limits/gap", mip_gap)
+        m.setParam("separating/maxroundsroot", 2)
+        m.setParam("separating/maxstallroundsroot", 1)
+        m.setParam("branching/relpscost/sbiterofs", 0)
+        m.setParam("branching/relpscost/sbiterquot", 0.0)
+
     def build_model(self):
         m = Model("prefab_with_factory_buffer")
-        m.Params.TimeLimit = 120      # 兜底：到 20% 间隙或到时限，先到为准
-        m.Params.MIPGap    = 0.2     # 允许 20% 最优间隙
-        m.Params.MIPFocus  = 1        # 更关注找可行解
-        m.Params.Heuristics = 0.2     # 增强启发式（默认 0.05 左右）
-        m.Params.Cuts = 0             # 如果节点过多，可以适当减弱 cuts
-        # 利用多核
-        m.Params.Threads = 0
-        m.setParam("Seed", 0)         # 设置随机种子为0   
+        self._configure_solver(m)
+        self._n_binaries = 0
+        self._n_live_binaries = 0
 
         N, T = self.N, self.T
         d = self.d
@@ -360,7 +407,7 @@ class PrefabScheduler:
                     ub = 1.0 if windows is None or windows["dummy_end"][0] <= t <= windows["dummy_end"][1] else 0.0
                 else:
                     ub = bound("install", i, t)
-                x[i, t] = m.addVar(vtype=GRB.BINARY, ub=ub, name=f"x_{i}_{t}")
+                x[i, t] = self._add_bin(m, f"x_{i}_{t}", ub)
 
         # y[i,t] installing (only real activities)
         y = {}
@@ -371,13 +418,13 @@ class PrefabScheduler:
                 else:
                     lo, hi = windows["install"][i]
                     ub = 1.0 if lo <= t <= hi + d[i] - 1 else 0.0
-                y[i, t] = m.addVar(vtype=GRB.BINARY, ub=ub, name=f"y_{i}_{t}")
+                y[i, t] = self._add_bin(m, f"y_{i}_{t}", ub)
 
         # p[i,t] arrival at site
         p = {}
         for i in range(1, N + 1):
             for t in range(1, T + 1):
-                p[i, t] = m.addVar(vtype=GRB.BINARY, ub=bound("arrival", i, t), name=f"p_{i}_{t}")
+                p[i, t] = self._add_bin(m, f"p_{i}_{t}", bound("arrival", i, t))
 
         # site inventory: a module only occupies the yard between its earliest
         # arrival and its latest installation start
@@ -385,16 +432,16 @@ class PrefabScheduler:
         for i in range(1, N + 1):
             for t in range(1, T + 1):
                 if windows is None:
-                    ub = GRB.INFINITY
+                    ub = None
                 else:
                     ub = 1.0 if windows["arrival"][i][0] <= t < windows["install"][i][1] else 0.0
-                I[i, t] = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, ub=ub, name=f"I_{i}_{t}")
+                I[i, t] = m.addVar(vtype="C", lb=0.0, ub=ub, name=f"I_{i}_{t}")
 
         # factory production start
         q = {}
         for i in range(1, N + 1):
             for t in range(1, T + 1):
-                q[i, t] = m.addVar(vtype=GRB.BINARY, ub=bound("production", i, t), name=f"q_{i}_{t}")
+                q[i, t] = self._add_bin(m, f"q_{i}_{t}", bound("production", i, t))
 
         # order per time (batch): no delivery can happen outside the periods in
         # which some module is able to arrive
@@ -407,14 +454,12 @@ class PrefabScheduler:
         z = {}
         for t in range(1, T + 1):
             ub = 1.0 if delivery_lo <= t <= delivery_hi else 0.0
-            z[t] = m.addVar(vtype=GRB.BINARY, ub=ub, name=f"z_{t}")
+            z[t] = self._add_bin(m, f"z_{t}", ub)
 
         # factory inventory
         F = {}
         for s in range(1, T + 1):
-            F[s] = m.addVar(vtype=GRB.CONTINUOUS, lb=0.0, name=f"F_{s}")
-
-        m.update()
+            F[s] = m.addVar(vtype="C", lb=0.0, name=f"F_{s}")
 
         # ============ 4. constraints ============
 
@@ -423,14 +468,14 @@ class PrefabScheduler:
         if self.reoptimize_from_time is not None:
             start_time = max(1, self.reoptimize_from_time)
         
-        m.addConstr(x[dummy_start, start_time] == 1, "dummy_start_fix")
+        _add_cons(m, x[dummy_start, start_time] == 1, "dummy_start_fix")
         for t in range(1, T + 1):
             if t != start_time:
-                m.addConstr(x[dummy_start, t] == 0, f"dummy_start_zero_{t}")
+                _add_cons(m, x[dummy_start, t] == 0, f"dummy_start_zero_{t}")
 
         # (2) each real activity starts once
         for i in range(1, N + 1):
-            m.addConstr(quicksum(x[i, t] for t in range(1, T + 1)) == 1,
+            _add_cons(m, quicksum(x[i, t] for t in range(1, T + 1)) == 1,
                         f"start_once_{i}")
         
         # (2a) Fixed installation starts (for re-optimization)
@@ -438,21 +483,21 @@ class PrefabScheduler:
         # automatically forces all other x[i, t] = 0
         for i, fixed_start in self.fixed_installation_starts.items():
             if 1 <= i <= N and 1 <= fixed_start <= T:
-                m.addConstr(x[i, fixed_start] == 1, f"fixed_install_start_{i}")
+                _add_cons(m, x[i, fixed_start] == 1, f"fixed_install_start_{i}")
         
         # (2b) Fixed production starts
         # Note: Since we have sum(q[i, t]) = 1, fixing q[i, fixed_start] = 1
         # automatically forces all other q[i, t] = 0
         for i, fixed_start in self.fixed_production_starts.items():
             if 1 <= i <= N and 1 <= fixed_start <= T:
-                m.addConstr(q[i, fixed_start] == 1, f"fixed_prod_start_{i}")
+                _add_cons(m, q[i, fixed_start] == 1, f"fixed_prod_start_{i}")
         
         # (2c) Fixed arrival times
         # Note: Since we have sum(p[i, t]) = 1, fixing p[i, fixed_arrival] = 1
         # automatically forces all other p[i, t] = 0
         for i, fixed_arrival in self.fixed_arrival_times.items():
             if 1 <= i <= N and 1 <= fixed_arrival <= T:
-                m.addConstr(p[i, fixed_arrival] == 1, f"fixed_arrival_{i}")
+                _add_cons(m, p[i, fixed_arrival] == 1, f"fixed_arrival_{i}")
         
         # (2d) Fixed durations
         # Note: Duration extensions are handled by updating self.D, self.d, self.L dictionaries
@@ -472,65 +517,65 @@ class PrefabScheduler:
                     pass
 
         # (3) dummy end starts once
-        m.addConstr(quicksum(x[dummy_end, t] for t in range(1, T + 1)) == 1,
+        _add_cons(m, quicksum(x[dummy_end, t] for t in range(1, T + 1)) == 1,
                     "dummy_end_once")
 
         # (4) precedence between real activities
         for (i, j) in self.E:
             start_i = quicksum(t * x[i, t] for t in range(1, T + 1))
             start_j = quicksum(t * x[j, t] for t in range(1, T + 1))
-            m.addConstr(start_i + d[i] <= start_j, f"prec_{i}_{j}")
+            _add_cons(m, start_i + d[i] <= start_j, f"prec_{i}_{j}")
 
         # (5) roots after dummy start
         for i in self.roots:
             start_i = quicksum(t * x[i, t] for t in range(1, T + 1))
-            m.addConstr(1 <= start_i, f"root_after_dummy_{i}")
+            _add_cons(m, 1 <= start_i, f"root_after_dummy_{i}")
 
         # (6) leaves before dummy end
         for i in self.leaves:
             start_i = quicksum(t * x[i, t] for t in range(1, T + 1))
             end_d = quicksum(t * x[dummy_end, t] for t in range(1, T + 1))
-            m.addConstr(start_i + d[i] <= end_d, f"leaf_before_dummy_end_{i}")
+            _add_cons(m, start_i + d[i] <= end_d, f"leaf_before_dummy_end_{i}")
 
         # (7) installation state
         for i in range(1, N + 1):
             for t in range(1, T + 1):
                 tau_min = max(1, t - d[i] + 1)
-                m.addConstr(
+                _add_cons(m, 
                     y[i, t] == quicksum(x[i, tau] for tau in range(tau_min, t + 1)),
                     f"in_install_{i}_{t}"
                 )
 
         # (8) installation crew capacity
         for t in range(1, T + 1):
-            m.addConstr(quicksum(y[i, t] for i in range(1, N + 1)) <= self.C_install,
+            _add_cons(m, quicksum(y[i, t] for i in range(1, N + 1)) <= self.C_install,
                         f"crew_{t}")
 
         # (9) arrival once
         for i in range(1, N + 1):
-            m.addConstr(quicksum(p[i, t] for t in range(1, T + 1)) == 1,
+            _add_cons(m, quicksum(p[i, t] for t in range(1, T + 1)) == 1,
                         f"arrive_once_{i}")
 
         # (10) arrival no later than installation start
         for i in range(1, N + 1):
             arr = quicksum(t * p[i, t] for t in range(1, T + 1))
             sta = quicksum(t * x[i, t] for t in range(1, T + 1))
-            m.addConstr(arr <= sta, f"arrive_before_install_{i}")
+            _add_cons(m, arr <= sta, f"arrive_before_install_{i}")
 
         # (11) site inventory balance
         for i in range(1, N + 1):
             # t = 1
-            m.addConstr(I[i, 1] == p[i, 1] - x[i, 1], f"site_inv_init_{i}")
+            _add_cons(m, I[i, 1] == p[i, 1] - x[i, 1], f"site_inv_init_{i}")
             # t >= 2
             for t in range(2, T + 1):
-                m.addConstr(
+                _add_cons(m, 
                     I[i, t] == I[i, t - 1] + p[i, t] - x[i, t],
                     f"site_inv_bal_{i}_{t}"
                 )
 
         # (12) site warehouse capacity
         for t in range(1, T + 1):
-            m.addConstr(
+            _add_cons(m, 
                 quicksum(I[i, t] for i in range(1, N + 1)) <= self.S_site,
                 f"site_cap_{t}"
             )
@@ -540,17 +585,17 @@ class PrefabScheduler:
             for t in range(1, T + 1):
                 latest_prod = t - D[i] - L[i]
                 if latest_prod >= 1:
-                    m.addConstr(
+                    _add_cons(m, 
                         p[i, t] <= quicksum(q[i, tau] for tau in range(1, latest_prod + 1)),
                         f"prod_to_arrive_{i}_{t}"
                     )
                 else:
                     # cannot arrive this early
-                    m.addConstr(p[i, t] == 0, f"too_early_arrive_{i}_{t}")
+                    _add_cons(m, p[i, t] == 0, f"too_early_arrive_{i}_{t}")
 
         # (14) factory machine capacity
         for t in range(1, T + 1):
-            m.addConstr(
+            _add_cons(m, 
                 quicksum(
                     q[i, tau]
                     for i in range(1, N + 1)
@@ -562,7 +607,7 @@ class PrefabScheduler:
         # (15) order bundling
         for t in range(1, T + 1):
             for i in range(1, N + 1):
-                m.addConstr(p[i, t] <= z[t], f"link_order_{i}_{t}")
+                _add_cons(m, p[i, t] <= z[t], f"link_order_{i}_{t}")
 
         # (15b) truck load size: a delivery carries between min_batch_size and
         # max_batch_size modules. u[t] marks the single partial load that the
@@ -570,21 +615,21 @@ class PrefabScheduler:
         u = {}
         for t in range(1, T + 1):
             ub = 1.0 if delivery_lo <= t <= delivery_hi else 0.0
-            u[t] = m.addVar(vtype=GRB.BINARY, ub=ub, name=f"u_{t}")
+            u[t] = self._add_bin(m, f"u_{t}", ub)
 
-        m.addConstr(quicksum(u[t] for t in range(1, T + 1)) <= 1, "single_partial_load")
+        _add_cons(m, quicksum(u[t] for t in range(1, T + 1)) <= 1, "single_partial_load")
         for t in range(1, T + 1):
             load = quicksum(p[i, t] for i in range(1, N + 1))
-            m.addConstr(u[t] <= z[t], f"partial_load_needs_delivery_{t}")
-            m.addConstr(load >= z[t], f"delivery_not_empty_{t}")
-            m.addConstr(load <= self.max_batch_size * z[t], f"load_max_{t}")
-            m.addConstr(
+            _add_cons(m, u[t] <= z[t], f"partial_load_needs_delivery_{t}")
+            _add_cons(m, load >= z[t], f"delivery_not_empty_{t}")
+            _add_cons(m, load <= self.max_batch_size * z[t], f"load_max_{t}")
+            _add_cons(m, 
                 load >= self.min_batch_size * z[t] - self.min_batch_size * u[t],
                 f"load_min_{t}"
             )
 
         # (16) factory inventory: F1 = 0
-        m.addConstr(F[1] == 0, "factory_init")
+        _add_cons(m, F[1] == 0, "factory_init")
 
         # (17) factory inventory recursion
         for s in range(2, T + 1):
@@ -594,14 +639,14 @@ class PrefabScheduler:
             shipped_here = quicksum(
                 p[i, s + L[i]] for i in range(1, N + 1) if s + L[i] <= T
             )
-            m.addConstr(
+            _add_cons(m, 
                 F[s] == F[s - 1] + finished_here - shipped_here,
                 f"factory_inv_bal_{s}"
             )
 
         # (18) factory buffer capacity
         for s in range(1, T + 1):
-            m.addConstr(F[s] <= self.S_fac, f"factory_cap_{s}")
+            _add_cons(m, F[s] <= self.S_fac, f"factory_cap_{s}")
 
         # ============ 5. objective ============
         # Duration and transport are different units, so each keeps its own
@@ -619,7 +664,7 @@ class PrefabScheduler:
             + self.w_transport * deliveries / ref["ref_transport"]
             + self.w_site_storage * site_storage / ref["ref_storage"]
             + self.w_factory_storage * factory_storage / ref["ref_storage"],
-            GRB.MINIMIZE,
+            "minimize",
         )
 
         # 保存对象
@@ -635,17 +680,148 @@ class PrefabScheduler:
 
         return m
 
-    def solve(self, time_limit=None, mip_gap=None):
+    def hide_output(self, quiet: bool = True):
+        if self.m is not None:
+            self.m.hideOutput(quiet)
+
+    def binary_counts(self):
+        """(declared binaries, binaries that time windows did not fix to zero)."""
+        return self._n_binaries, self._n_live_binaries
+
+    def n_constraints(self) -> int:
+        return 0 if self.m is None else self.m.getNConss()
+
+    def n_sols(self) -> int:
+        return 0 if self.m is None else self.m.getNSols()
+
+    def solver_status(self) -> Optional[str]:
+        return None if self.m is None else self.m.getStatus()
+
+    def obj_value(self) -> float:
+        return self.m.getObjVal()
+
+    def dual_bound(self) -> float:
+        return self.m.getDualbound()
+
+    def mip_gap(self) -> float:
+        return self.m.getGap()
+
+    def val(self, var) -> float:
+        return self.m.getVal(var)
+
+    def load_heuristic_start(self, heur) -> bool:
+        """
+        Register the constructive schedule as a SCIP primal heuristic.
+
+        The horizon T still comes from this schedule. Submitting it as well
+        gives SCIP an incumbent immediately; generic MIP heuristics rarely
+        construct a feasible time-indexed plan on their own.
+        """
+        if self.m is None or heur is None:
+            return False
+        self._heuristic_start = heur
+        plugin = _ScheduleStartHeur()
+        plugin.scheduler = self
+        self.m.includeHeur(
+            plugin,
+            "heurschedule",
+            "inject constructive look-ahead schedule",
+            "S",
+            priority=1000000,
+            freq=1,
+            timingmask=SCIP_HEURTIMING.BEFORENODE,
+        )
+        return True
+
+    def _inject_heuristic_sol(self, plugin) -> bool:
+        """Fill original-space values so presolve aggregations cannot block the start."""
+        heur = self._heuristic_start
+        if self.m is None or heur is None:
+            return False
+        m = self.m
+        N, T = self.N, self.T
+        d, D, L = self.d, self.D, self.L
+        sol = m.createOrigSol(plugin)
+
+        start_time = 1 if self.reoptimize_from_time is None else max(1, self.reoptimize_from_time)
+        m.setSolVal(sol, self.x[self.dummy_start, start_time], 1.0)
+
+        dummy_end_t = max(int(heur.install_start[i]) + d[i] for i in range(1, N + 1))
+        if self.time_windows is not None:
+            lo, hi = self.time_windows["dummy_end"]
+            dummy_end_t = min(max(dummy_end_t, lo), hi)
+        dummy_end_t = min(max(int(dummy_end_t), 1), T)
+        m.setSolVal(sol, self.x[self.dummy_end, dummy_end_t], 1.0)
+
+        arrival_counts = Counter()
+        try:
+            for i in range(1, N + 1):
+                xs = int(heur.install_start[i])
+                qs = int(heur.prod_start[i])
+                ps = int(heur.arrival_time[i])
+                if not (1 <= xs <= T and 1 <= qs <= T and 1 <= ps <= T):
+                    raise ValueError(f"heuristic times for module {i} outside 1..{T}")
+                m.setSolVal(sol, self.x[i, xs], 1.0)
+                m.setSolVal(sol, self.q[i, qs], 1.0)
+                m.setSolVal(sol, self.p[i, ps], 1.0)
+                arrival_counts[ps] += 1
+                last_install = min(T, xs + d[i] - 1)
+                for t in range(xs, last_install + 1):
+                    m.setSolVal(sol, self.y[i, t], 1.0)
+                for t in range(1, T + 1):
+                    m.setSolVal(sol, self.I[i, t], 1.0 if ps <= t < xs else 0.0)
+
+            for t in arrival_counts:
+                m.setSolVal(sol, self.z[t], 1.0)
+            partial = [t for t, c in arrival_counts.items() if c < self.min_batch_size]
+            if partial:
+                m.setSolVal(sol, self.u[partial[0]], 1.0)
+
+            m.setSolVal(sol, self.F[1], 0.0)
+            factory = 0.0
+            for s in range(2, T + 1):
+                finished = sum(
+                    1 for i in range(1, N + 1)
+                    if s - D[i] >= 1 and int(heur.prod_start[i]) == s - D[i]
+                )
+                shipped = sum(
+                    1 for i in range(1, N + 1)
+                    if s + L[i] <= T and int(heur.arrival_time[i]) == s + L[i]
+                )
+                factory = factory + finished - shipped
+                m.setSolVal(sol, self.F[s], factory)
+        except Exception as exc:
+            print(f"[MIP start] Could not assemble the heuristic solution: {exc}")
+            return False
+
+        accepted = m.trySol(
+            sol,
+            printreason=True,
+            completely=False,
+            checkbounds=True,
+            checkintegrality=True,
+            checklprows=True,
+        )
+        if accepted:
+            print("[MIP start] Heuristic schedule accepted as a primal solution.")
+        else:
+            print("[MIP start] Heuristic schedule was rejected; SCIP will search from scratch.")
+        return bool(accepted)
+
+    def solve(self, time_limit=None, mip_gap=None, heuristic=None):
         if self.m is None:
             self.build_model()
 
-        if time_limit is not None: # consider the possible change later
-            self.m.Params.TimeLimit = time_limit
+        if heuristic is not None:
+            self.load_heuristic_start(heuristic)
+
+        if time_limit is not None:
+            self.m.setParam("limits/time", time_limit)
         if mip_gap is not None:
-            self.m.Params.MIPGap = mip_gap
+            self.m.setParam("limits/gap", mip_gap)
 
         self.m.optimize()
-        return self.m.Status
+        return self.m.getStatus()
 
     def get_solution_dict(self) -> Optional[Dict[str, Any]]:
         """
@@ -654,18 +830,12 @@ class PrefabScheduler:
         """
         if self.m is None:
             return None
-        
-        if self.m.Status not in [GRB.OPTIMAL, GRB.TIME_LIMIT, GRB.SUBOPTIMAL]:
+        if self.m.getNSols() == 0:
             return None
-
-        # A run can stop on the time limit before any feasible solution was found;
-        # reading variable values in that case raises inside gurobipy.
-        if self.m.SolCount == 0:
-            return None
-        
+        status = self.m.getStatus() 
         solution = {
-            'objective': self.m.ObjVal, # just the objective value, not the total cost
-            'status': self.m.Status,
+            'objective': self.m.getObjVal(),
+            'status': status,
             'installation_start': {},  # {module_id: time}
             'arrival_time': {},        # {module_id: time}
             'production_start': {},    # {module_id: time}
@@ -678,47 +848,50 @@ class PrefabScheduler:
         N, T = self.N, self.T
         x, p, q, F, z = self.x, self.p, self.q, self.F, self.z
         dummy_end = self.dummy_end
+        getVal = self.m.getVal
         
         # Extract installation start times
         for i in range(1, N + 1):
             for t in range(1, T + 1):
-                if x[i, t].X > 0.5:
+                if getVal(x[i, t]) > 0.5:
                     solution['installation_start'][i] = t
                     break
         
         # Extract arrival times
         for i in range(1, N + 1):
             for t in range(1, T + 1):
-                if p[i, t].X > 0.5:
+                if getVal(p[i, t]) > 0.5:
                     solution['arrival_time'][i] = t
                     break
         
         # Extract production start times
         for i in range(1, N + 1):
             for t in range(1, T + 1):
-                if q[i, t].X > 0.5:
+                if getVal(q[i, t]) > 0.5:
                     solution['production_start'][i] = t
                     break
         
         # Extract order times
         for t in range(1, T + 1):
-            if z[t].X > 0.5:
+            if getVal(z[t]) > 0.5:
                 solution['order_times'].append(t)
         
         # Extract factory inventory
         for s in range(1, T + 1):
-            if F[s].X > 1e-6:
-                solution['factory_inventory'][s] = F[s].X
+            val = getVal(F[s])
+            if val > 1e-6:
+                solution['factory_inventory'][s] = val
         
         # Extract site inventory
         for i in range(1, N + 1):
             for t in range(1, T + 1):
-                if self.I[i, t].X > 1e-6:
-                    solution['site_inventory'][(i, t)] = self.I[i, t].X
+                val = getVal(self.I[i, t])
+                if val > 1e-6:
+                    solution['site_inventory'][(i, t)] = val
         
         # Extract project finish time
         for t in range(1, T + 1):
-            if x[dummy_end, t].X > 0.5:
+            if getVal(x[dummy_end, t]) > 0.5:
                 solution['project_finish_time'] = t
                 break
         
