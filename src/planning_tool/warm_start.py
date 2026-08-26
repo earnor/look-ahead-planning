@@ -5,9 +5,9 @@ The three-stage scheduling logic
 (just-in-time truck arrival, backward production, forward installation) is kept
 as-is; the precedence source is the planning tool's own arc list.
 
-The makespan of this schedule chooses a tight horizon T for the time-indexed
-MIP. The same schedule is also handed to SCIP as a feasible incumbent, because
-generic MIP heuristics almost never construct a valid time-indexed plan.
+The makespan of this schedule chooses a tight horizon T for the CP-SAT model.
+The same schedule is also handed to CP-SAT as a solution hint, so search
+starts from a feasible incumbent instead of from scratch.
 """
 from __future__ import annotations
 
@@ -22,8 +22,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 MIN_BATCH_SIZE = 3
 MAX_BATCH_SIZE = 5
 
-# Extra room given to the MIP on top of the heuristic makespan, so it can move
-# work around instead of only reproducing the schedule it was handed.
+# Extra room given to the solver on top of the heuristic makespan, so it can
+# move work around instead of only reproducing the schedule it was handed.
 HORIZON_SLACK_RATIO = 0.25
 
 
@@ -344,7 +344,7 @@ def trivial_horizon_bound(N: int, d: Dict[int, int], D: Dict[int, int], L: Dict[
 
 
 def horizon_from_makespan(cmax: int, slack_ratio: float = HORIZON_SLACK_RATIO) -> int:
-    """Time horizon handed to the MIP, derived from the heuristic makespan."""
+    """Time horizon handed to the solver, derived from the heuristic makespan."""
     return max(1, int(math.ceil(cmax * (1.0 + slack_ratio))) + 1)
 
 
@@ -370,8 +370,8 @@ def reference_values(
     """
     Size of each objective term in the heuristic schedule.
 
-    Duration and transport keep their own scale in the MIP. The two storage
-    numbers are stored separately for diagnostics; the MIP divides both
+    Duration and transport keep their own scale in the model. The two storage
+    numbers are stored separately for diagnostics; the model divides both
     inventory terms by their sum, so a JIT heuristic (factory wait = 0)
     cannot make factory storage look more expensive than site storage.
     """
@@ -410,7 +410,7 @@ def construct_solution(
     construction order, each load arrives just in time for its first module and
     is produced backwards from that arrival, then modules are installed forwards.
 
-    Time indices follow the MIP: the first period is 1 and everything must
+    Time indices follow the planner: the first period is 1 and everything must
     finish by T.
     """
     modules = list(range(1, N + 1))

@@ -56,10 +56,6 @@ class TopBar(QFrame):
         """)
         self.delete_project_btn.hide()
 
-        search = QLineEdit()
-        search.setPlaceholderText("Search tasks, resources…")
-        search.setClearButtonEnabled(True)
-        search.setMinimumWidth(420)
 
         left = QHBoxLayout()
         left.addWidget(title)
@@ -70,7 +66,6 @@ class TopBar(QFrame):
         lay = QHBoxLayout(self)
         lay.addLayout(left)
         lay.addStretch(1)
-        lay.addWidget(search)
         lay.setContentsMargins(16, 10, 16, 10)
         lay.setSpacing(12)
 
@@ -132,7 +127,7 @@ class Sidebar(QFrame):
         self.btn_comparison = SidebarButton("Comparison")
         self.btn_costs = SidebarButton("Costs")
         self.btn_upload = SidebarButton("Upload Data")
-        self.btn_settings = SidebarButton("Settings")
+        self.btn_settings = SidebarButton("Project Variables")
         self.btn_dash.setChecked(True)
 
         group = QButtonGroup(self)

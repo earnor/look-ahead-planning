@@ -11,6 +11,21 @@ from typing import Optional
 
 import pandas as pd
 from PyQt6.QtCore import Qt
+from planning_tool.costs import (
+    DEFAULT_BIODIVERSITY_PER_M2,
+    DEFAULT_COST_PER_TRUCK,
+    DEFAULT_CRANE_PER_DAY,
+    DEFAULT_CREW_PER_DAY,
+    DEFAULT_OCCUPANT_PER_HOUSEHOLD_DAY,
+    CostRates,
+    ScheduleQuantities,
+    compute_monetised_costs,
+    crew_count,
+    merge_settings,
+    parse_project_start_date,
+    quantities_from_solution,
+)
+from planning_tool.datamanager import ScheduleDataManager
 from PyQt6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -47,6 +62,22 @@ COMBO_STYLE = """
     }
 """
 
+CURRENCY_COMBO_STYLE = """
+    QComboBox {
+        border: 1px solid #D1D5DB;
+        border-radius: 6px;
+        padding: 6px 12px;
+        font-size: 13px;
+        background: #FFFFFF;
+        min-width: 96px;
+    }
+"""
+
+UNIT_LABEL_STYLE = "font-size: 12px; color: #64748B;"
+
+DEFAULT_CURRENCY = "CHF"
+CURRENCY_CHOICES = (("CHF", "CHF"), ("EUR", "EUR"))
+
 BUTTON_STYLE = """
     QPushButton {
         background: #FFFFFF;
@@ -79,7 +110,7 @@ REMOVE_BUTTON_STYLE = """
 
 def parse_non_negative_number(raw: str) -> Optional[float]:
     text = (raw or "").strip().replace("'", "").replace(",", "")
-    for token in ("CHF", "chf", "€", "$"):
+    for token in ("CHF", "chf", "EURO", "euro", "EUR", "eur", "€", "$"):
         text = text.replace(token, "")
     text = text.strip()
     if not text:
@@ -93,90 +124,19 @@ def parse_non_negative_number(raw: str) -> Optional[float]:
     return value
 
 
-def format_chf(amount: float) -> str:
+def format_money(amount: float, currency: str = DEFAULT_CURRENCY) -> str:
     if abs(amount - round(amount)) < 1e-9:
-        return f"{int(round(amount)):,} CHF"
-    return f"{amount:,.2f} CHF"
+        return f"{int(round(amount)):,} {currency}"
+    return f"{amount:,.2f} {currency}"
 
 
-def format_signed_chf(amount: float) -> str:
+def format_signed_money(amount: float, currency: str = DEFAULT_CURRENCY) -> str:
     sign = "+" if amount > 0 else ""
-    return f"{sign}{format_chf(amount)}"
+    return f"{sign}{format_money(amount, currency)}"
 
 
-def _rate(value: Optional[float]) -> float:
-    return 0.0 if value is None else float(value)
-
-
-def compute_monetised_costs(
-    chosen_days: Optional[int],
-    original_days: Optional[int],
-    chosen_trucks: int,
-    original_trucks: int,
-    crane_per_day: Optional[float],
-    crew_per_day: Optional[float],
-    custom_per_day: list[float],
-    cost_per_truck: Optional[float],
-    occupant_cost_per_day: Optional[float],
-    residents: Optional[float],
-    area_m2: Optional[float],
-    biodiversity_per_m2_day: Optional[float],
-) -> dict:
-    """Pure cost arithmetic used by the Costs page (and tests)."""
-    daily_construction = (
-        _rate(crane_per_day)
-        + _rate(crew_per_day)
-        + sum(_rate(v) for v in custom_per_day)
-    )
-
-    def times_days(days: Optional[int], unit: float) -> Optional[float]:
-        if days is None:
-            return None
-        return days * unit
-
-    construction_chosen = times_days(chosen_days, daily_construction)
-    construction_original = times_days(original_days, daily_construction)
-    batch_chosen = chosen_trucks * _rate(cost_per_truck)
-    batch_original = original_trucks * _rate(cost_per_truck)
-    occupants_chosen = times_days(
-        chosen_days, _rate(occupant_cost_per_day) * _rate(residents)
-    )
-    occupants_original = times_days(
-        original_days, _rate(occupant_cost_per_day) * _rate(residents)
-    )
-    biodiversity_chosen = times_days(
-        chosen_days, _rate(area_m2) * _rate(biodiversity_per_m2_day)
-    )
-    biodiversity_original = times_days(
-        original_days, _rate(area_m2) * _rate(biodiversity_per_m2_day)
-    )
-
-    def add_total(*parts: Optional[float]) -> float:
-        return sum(0.0 if part is None else part for part in parts)
-
-    return {
-        "construction_chosen": construction_chosen,
-        "construction_original": construction_original,
-        "batch_chosen": batch_chosen,
-        "batch_original": batch_original,
-        "occupants_chosen": occupants_chosen,
-        "occupants_original": occupants_original,
-        "biodiversity_chosen": biodiversity_chosen,
-        "biodiversity_original": biodiversity_original,
-        "total_chosen": add_total(
-            construction_chosen, batch_chosen, occupants_chosen, biodiversity_chosen
-        ),
-        "total_original": add_total(
-            construction_original,
-            batch_original,
-            occupants_original,
-            biodiversity_original,
-        ),
-    }
-
-
-def _money_text(amount: Optional[float]) -> str:
-    return "—" if amount is None else format_chf(amount)
+def _money_text(amount: Optional[float], currency: str = DEFAULT_CURRENCY) -> str:
+    return "—" if amount is None else format_money(amount, currency)
 
 
 def _days_text(days: Optional[int]) -> str:
@@ -285,7 +245,12 @@ class _CostPanel(QFrame):
     def set_heading(self, text: str):
         self.heading_label.setText(text)
 
-    def set_delta(self, chosen_total: Optional[float], original_total: Optional[float]):
+    def set_delta(
+        self,
+        chosen_total: Optional[float],
+        original_total: Optional[float],
+        currency: str = DEFAULT_CURRENCY,
+    ):
         if chosen_total is None or original_total is None:
             self.delta_label.setVisible(False)
             return
@@ -296,7 +261,7 @@ class _CostPanel(QFrame):
             color = "#DC2626"
         else:
             color = "#10B981"
-        self.delta_label.setText(f"{format_signed_chf(change)} vs original")
+        self.delta_label.setText(f"{format_signed_money(change, currency)} vs lower")
         self.delta_label.setStyleSheet(
             f"font-size: 12px; font-weight: 600; color: {color};"
         )
@@ -311,30 +276,36 @@ class _CostPanel(QFrame):
         occupants: Optional[float],
         biodiversity: Optional[float],
         total: Optional[float],
-        residents: Optional[float] = None,
+        households: Optional[float] = None,
         area_m2: Optional[float] = None,
+        crews: Optional[int] = None,
+        currency: str = DEFAULT_CURRENCY,
     ):
-        self.total_label.setText(_money_text(total))
+        self.total_label.setText(_money_text(total, currency))
         day_txt = _days_text(days)
-        self._rows["construction"][0].setText(day_txt)
-        self._rows["construction"][1].setText(_money_text(construction))
+        construction_qty = day_txt
+        if crews is not None:
+            crew_label = "crew" if crews == 1 else "crews"
+            construction_qty = f"{day_txt} · {crews} {crew_label}"
+        self._rows["construction"][0].setText(construction_qty)
+        self._rows["construction"][1].setText(_money_text(construction, currency))
         self._rows["batch"][0].setText(f"{trucks} trucks")
-        self._rows["batch"][1].setText(_money_text(batch))
+        self._rows["batch"][1].setText(_money_text(batch, currency))
         occupant_qty = day_txt
-        if residents is not None:
-            occupant_qty = f"{day_txt} · {residents:g} residents"
+        if households is not None:
+            occupant_qty = f"{day_txt} · {households:g} households"
         self._rows["occupants"][0].setText(occupant_qty)
-        self._rows["occupants"][1].setText(_money_text(occupants))
-        bio_qty = day_txt
+        self._rows["occupants"][1].setText(_money_text(occupants, currency))
+        bio_qty = "—"
         if area_m2 is not None:
-            bio_qty = f"{day_txt} · {area_m2:g} m²"
+            bio_qty = f"{area_m2:g} m²"
         self._rows["biodiversity"][0].setText(bio_qty)
-        self._rows["biodiversity"][1].setText(_money_text(biodiversity))
-        self._rows["total"][1].setText(_money_text(total))
+        self._rows["biodiversity"][1].setText(_money_text(biodiversity, currency))
+        self._rows["total"][1].setText(_money_text(total, currency))
 
 
 class CostsPage(QWidget):
-    """Compare monetised costs of a chosen schedule against Version 0."""
+    """Compare monetised costs of two selected schedules."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -342,12 +313,10 @@ class CostsPage(QWidget):
         self.project_id = None
         self.main_window = None
         self.version_id_map = {}
-        self.original_version_id = None
         self.custom_term_rows: list[dict] = []
-        self.chosen_days: Optional[int] = None
-        self.original_days: Optional[int] = None
-        self.chosen_trucks = 0
-        self.original_trucks = 0
+        self._currency_unit_labels: list[tuple[QLabel, str]] = []
+        self.chosen_qty = ScheduleQuantities()
+        self.original_qty = ScheduleQuantities()
         self._build_ui()
 
     def _build_ui(self):
@@ -368,7 +337,8 @@ class CostsPage(QWidget):
         title = QLabel("Costs")
         title.setStyleSheet("font-size: 24px; font-weight: 600; color: #111827;")
         subtitle = QLabel(
-            "Compare monetised costs of a chosen schedule against the original plan "
+            "Compare monetised costs of two schedules. "
+            "The upper panel shows the change relative to the lower one."
         )
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet("font-size: 13px; color: #6B7280;")
@@ -380,13 +350,15 @@ class CostsPage(QWidget):
         self.chosen_panel = _CostPanel("Chosen schedule")
         self.chosen_version_combo = QComboBox()
         self.chosen_version_combo.setStyleSheet(COMBO_STYLE)
-        self.chosen_version_combo.currentIndexChanged.connect(self._on_chosen_version_changed)
+        self.chosen_version_combo.currentIndexChanged.connect(self._on_version_selection_changed)
         self.chosen_panel.add_selector(self.chosen_version_combo)
         layout.addWidget(self.chosen_panel)
 
-        self.original_panel = _CostPanel(
-            "Original schedule",
-        )
+        self.original_panel = _CostPanel("Lower schedule")
+        self.original_version_combo = QComboBox()
+        self.original_version_combo.setStyleSheet(COMBO_STYLE)
+        self.original_version_combo.currentIndexChanged.connect(self._on_version_selection_changed)
+        self.original_panel.add_selector(self.original_version_combo)
         layout.addWidget(self.original_panel)
         layout.addStretch(1)
 
@@ -399,21 +371,59 @@ class CostsPage(QWidget):
         return label
 
     def _add_input_row(
-        self, parent_layout: QVBoxLayout, caption: str, placeholder: str
+        self,
+        parent_layout: QVBoxLayout,
+        caption: str,
+        unit: str,
+        default: Optional[str] = None,
+        currency_template: Optional[str] = None,
+        tooltip: Optional[str] = None,
     ) -> QLineEdit:
         row = QHBoxLayout()
         row.setSpacing(8)
         label = QLabel(caption)
         label.setStyleSheet("font-size: 12px; color: #475569;")
         label.setMinimumWidth(170)
+        if tooltip:
+            label.setToolTip(tooltip)
+            label.setCursor(Qt.CursorShape.WhatsThisCursor)
         field = QLineEdit()
-        field.setPlaceholderText(placeholder)
+        if default is not None:
+            field.setText(default)
         field.setStyleSheet(INPUT_STYLE)
         field.textChanged.connect(self._refresh_cost_display)
+        unit_lbl = QLabel(unit)
+        unit_lbl.setStyleSheet(UNIT_LABEL_STYLE)
+        unit_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         row.addWidget(label)
         row.addWidget(field, 1)
+        row.addWidget(unit_lbl)
         parent_layout.addLayout(row)
+        if currency_template:
+            self._register_currency_unit(unit_lbl, currency_template)
         return field
+
+    def _register_currency_unit(self, label: QLabel, template: str):
+        self._currency_unit_labels.append((label, template))
+        label.setText(template.format(currency=self._current_currency()))
+
+    def _current_currency(self) -> str:
+        if not hasattr(self, "currency_combo"):
+            return DEFAULT_CURRENCY
+        data = self.currency_combo.currentData()
+        return str(data) if data else DEFAULT_CURRENCY
+
+    def _on_currency_changed(self, _index: int = 0):
+        currency = self._current_currency()
+        alive: list[tuple[QLabel, str]] = []
+        for label, template in self._currency_unit_labels:
+            try:
+                label.setText(template.format(currency=currency))
+            except RuntimeError:
+                continue
+            alive.append((label, template))
+        self._currency_unit_labels = alive
+        self._refresh_cost_display()
 
     def _build_rates_card(self) -> QWidget:
         frame = QFrame()
@@ -429,14 +439,28 @@ class CostsPage(QWidget):
         layout.setContentsMargins(20, 16, 20, 16)
         layout.setSpacing(10)
 
+        heading_row = QHBoxLayout()
+        heading_row.setSpacing(12)
         heading = QLabel("Unit rates")
         heading.setStyleSheet("font-size: 16px; font-weight: 600; color: #0F172A;")
+        heading_row.addWidget(heading, 1)
+        currency_caption = QLabel("Currency")
+        currency_caption.setStyleSheet("font-size: 12px; font-weight: 600; color: #334155;")
+        self.currency_combo = QComboBox()
+        self.currency_combo.setStyleSheet(CURRENCY_COMBO_STYLE)
+        for label, code in CURRENCY_CHOICES:
+            self.currency_combo.addItem(label, code)
+        self.currency_combo.setCurrentIndex(0)
+        self.currency_combo.currentIndexChanged.connect(self._on_currency_changed)
+        heading_row.addWidget(currency_caption)
+        heading_row.addWidget(self.currency_combo)
         note = QLabel(
-            "The same rates are applied to both schedules. "
+            "The same unit rates are applied to both schedules. "
+            "Working-crew counts come from the Project Variables used when each version was calculated."
         )
         note.setWordWrap(True)
         note.setStyleSheet("font-size: 12px; color: #64748B;")
-        layout.addWidget(heading)
+        layout.addLayout(heading_row)
         layout.addWidget(note)
 
         columns = QHBoxLayout()
@@ -446,10 +470,19 @@ class CostsPage(QWidget):
         construction.setSpacing(8)
         construction.addWidget(self._section_label("1. Construction"))
         self.crane_cost_input = self._add_input_row(
-            construction, "Crane cost / day", "CHF / day"
+            construction,
+            "Crane cost",
+            "CHF / day",
+            default=str(int(DEFAULT_CRANE_PER_DAY)),
+            currency_template="{currency} / day",
         )
         self.crew_cost_input = self._add_input_row(
-            construction, "Working crew cost / day", "CHF / day"
+            construction,
+            "Working crew cost",
+            "CHF / crew / day",
+            default=str(int(DEFAULT_CREW_PER_DAY)),
+            currency_template="{currency} / crew / day",
+            tooltip="one crew = one foreman + three workers",
         )
         custom_title = QLabel("Additional daily cost terms")
         custom_title.setStyleSheet("font-size: 12px; font-weight: 600; color: #334155;")
@@ -470,19 +503,31 @@ class CostsPage(QWidget):
         other.setSpacing(8)
         other.addWidget(self._section_label("2. Batch"))
         self.cost_per_truck_input = self._add_input_row(
-            other, "Cost per truck", "CHF / truck"
+            other,
+            "Cost per truck",
+            "CHF / truck",
+            default=str(int(DEFAULT_COST_PER_TRUCK)),
+            currency_template="{currency} / truck",
         )
         other.addWidget(self._section_label("3. Disruption to occupants"))
         self.occupant_cost_input = self._add_input_row(
-            other, "Cost / resident / day", "CHF / person / day"
+            other,
+            "Occupant cost",
+            "CHF / household / day",
+            default=str(int(DEFAULT_OCCUPANT_PER_HOUSEHOLD_DAY)),
+            currency_template="{currency} / household / day",
         )
         self.residents_input = self._add_input_row(
-            other, "Nearby residents", "number of people"
+            other, "Nearby households", "households"
         )
         other.addWidget(self._section_label("4. Biodiversity"))
         self.area_input = self._add_input_row(other, "Occupied area", "m²")
         self.biodiversity_price_input = self._add_input_row(
-            other, "Price / m² / day", "CHF / m² / day"
+            other,
+            "Biodiversity restore price",
+            "CHF / m²",
+            default=str(int(DEFAULT_BIODIVERSITY_PER_M2)),
+            currency_template="{currency} / m²",
         )
         other.addStretch(1)
 
@@ -502,8 +547,9 @@ class CostsPage(QWidget):
         name_edit.setPlaceholderText("Term name")
         name_edit.setStyleSheet(INPUT_STYLE)
         rate_edit = QLineEdit()
-        rate_edit.setPlaceholderText("CHF / day")
         rate_edit.setStyleSheet(INPUT_STYLE)
+        unit_lbl = QLabel()
+        unit_lbl.setStyleSheet(UNIT_LABEL_STYLE)
         remove_btn = QPushButton("Remove")
         remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         remove_btn.setStyleSheet(REMOVE_BUTTON_STYLE)
@@ -516,47 +562,59 @@ class CostsPage(QWidget):
 
         row.addWidget(name_edit, 2)
         row.addWidget(rate_edit, 2)
+        row.addWidget(unit_lbl)
         row.addWidget(remove_btn)
 
         self.custom_terms_layout.addWidget(row_widget)
         self.custom_term_rows.append(
-            {"widget": row_widget, "name": name_edit, "rate": rate_edit}
+            {"widget": row_widget, "name": name_edit, "rate": rate_edit, "unit": unit_lbl}
         )
+        self._register_currency_unit(unit_lbl, "{currency} / day")
         self._refresh_cost_display()
 
     def _remove_custom_term(self, row_widget: QWidget):
+        removed_units = {
+            row.get("unit")
+            for row in self.custom_term_rows
+            if row["widget"] is row_widget
+        }
         self.custom_term_rows = [
             row for row in self.custom_term_rows if row["widget"] is not row_widget
+        ]
+        self._currency_unit_labels = [
+            item for item in self._currency_unit_labels if item[0] not in removed_units
         ]
         self.custom_terms_layout.removeWidget(row_widget)
         row_widget.deleteLater()
         self._refresh_cost_display()
 
     def load_version_list(self, engine, project_id: Optional[int]):
-        """Populate the chosen-schedule combo and refresh both cost panels."""
+        """Populate both version combos and refresh the cost panels."""
         self.engine = engine
         self.project_id = project_id
-        self.original_version_id = None
         self.version_id_map = {}
 
         self.chosen_version_combo.blockSignals(True)
+        self.original_version_combo.blockSignals(True)
         self.chosen_version_combo.clear()
+        self.original_version_combo.clear()
 
         if project_id is None or engine is None:
             self.chosen_version_combo.blockSignals(False)
-            self._set_quantities(None, None, 0, 0)
+            self.original_version_combo.blockSignals(False)
+            self._set_quantities(ScheduleQuantities(), ScheduleQuantities())
             self.chosen_panel.set_heading("Chosen schedule")
-            self.original_panel.set_heading("Original schedule (Version 0)")
+            self.original_panel.set_heading("Lower schedule")
             return
 
-        from planning_tool.datamanager import ScheduleDataManager
-
         mgr = ScheduleDataManager(engine)
+        mgr.ensure_delay_and_version_tables(project_id)
         versions_table = mgr.optimization_versions_table_name(project_id)
         inspector = inspect(engine)
         if versions_table not in inspector.get_table_names():
             self.chosen_version_combo.blockSignals(False)
-            self._set_quantities(None, None, 0, 0)
+            self.original_version_combo.blockSignals(False)
+            self._set_quantities(ScheduleQuantities(), ScheduleQuantities())
             return
 
         try:
@@ -565,69 +623,66 @@ class CostsPage(QWidget):
                 f"ORDER BY version_id DESC"
             )
             versions_df = pd.read_sql(text(query), engine)
+            version_0_index = None
             for _, row in versions_df.iterrows():
                 version_id = int(row["version_id"])
                 version_number = row["version_number"]
                 index = self.chosen_version_combo.count()
-                self.chosen_version_combo.addItem(f"Version {version_number}")
+                label = f"Version {version_number}"
+                self.chosen_version_combo.addItem(label)
+                self.original_version_combo.addItem(label)
                 self.version_id_map[index] = version_id
                 if int(version_number) == 0:
-                    self.original_version_id = version_id
+                    version_0_index = index
             if self.chosen_version_combo.count() > 0:
                 self.chosen_version_combo.setCurrentIndex(0)
+                lower_index = (
+                    version_0_index
+                    if version_0_index is not None
+                    else self.original_version_combo.count() - 1
+                )
+                self.original_version_combo.setCurrentIndex(lower_index)
         except Exception as exc:
             print(f"Error loading Costs version list: {exc}")
 
         self.chosen_version_combo.blockSignals(False)
+        self.original_version_combo.blockSignals(False)
         self._reload_schedules()
 
-    def _on_chosen_version_changed(self, _index: int = 0):
+    def _on_version_selection_changed(self, _index: int = 0):
         self._reload_schedules()
+
+    def _selected_version_id(self, combo: QComboBox) -> Optional[int]:
+        return self.version_id_map.get(combo.currentIndex())
 
     def _reload_schedules(self):
-        from planning_tool.ui.pages import ComparisonPage
-
         if self.engine is None or self.project_id is None:
-            self._set_quantities(None, None, 0, 0)
+            self._set_quantities(ScheduleQuantities(), ScheduleQuantities())
             return
 
-        settings = {}
-        if self.main_window:
-            settings = self.main_window._get_active_settings() or {}
-
-        chosen_id = self.version_id_map.get(self.chosen_version_combo.currentIndex())
+        chosen_id = self._selected_version_id(self.chosen_version_combo)
+        lower_id = self._selected_version_id(self.original_version_combo)
         chosen_df, chosen_label, chosen_start = self._load_version_dataframe(
             chosen_id, role="chosen"
         )
-        original_df, original_label, original_start = self._load_version_dataframe(
-            self.original_version_id, role="original"
+        lower_df, lower_label, lower_start = self._load_version_dataframe(
+            lower_id, role="lower"
         )
-        if self.original_version_id is None:
-            original_label = "Original schedule (Version 0 — not found)"
-
-        project_start = chosen_start or original_start
-        start_date = ComparisonPage._parse_project_start_date(project_start, settings)
 
         self.chosen_panel.set_heading(chosen_label)
-        self.original_panel.set_heading(original_label)
-
-        chosen_days, chosen_trucks = self._quantities_from_df(
-            chosen_df, settings, start_date
+        self.original_panel.set_heading(lower_label)
+        self._set_quantities(
+            self._quantities_for_version(chosen_id, chosen_df, chosen_start),
+            self._quantities_for_version(lower_id, lower_df, lower_start),
         )
-        original_days, original_trucks = self._quantities_from_df(
-            original_df, settings, start_date
-        )
-        self._set_quantities(chosen_days, original_days, chosen_trucks, original_trucks)
 
     def _load_version_dataframe(self, version_id: Optional[int], role: str = "chosen"):
         empty_label = (
-            "Chosen schedule" if role == "chosen" else "Original schedule (Version 0)"
+            "Chosen schedule" if role == "chosen" else "Lower schedule"
         )
         empty = (pd.DataFrame(), empty_label, None)
         if version_id is None or self.engine is None or self.project_id is None:
             return empty
-
-        from planning_tool.datamanager import ScheduleDataManager
 
         mgr = ScheduleDataManager(self.engine)
         solution_table = mgr.solution_table_name(self.project_id)
@@ -671,10 +726,10 @@ class CostsPage(QWidget):
             )
             if not v_result.empty:
                 version_number = v_result.iloc[0]["version_number"]
-                if role == "original":
-                    label = f"Original schedule (Version {version_number})"
-                else:
+                if role == "chosen":
                     label = f"Chosen schedule (Version {version_number})"
+                else:
+                    label = f"Lower schedule (Version {version_number})"
                 if pd.notna(v_result.iloc[0]["project_start_datetime"]):
                     start_datetime = v_result.iloc[0]["project_start_datetime"]
                 base_version_id = v_result.iloc[0].get("base_version_id")
@@ -690,30 +745,68 @@ class CostsPage(QWidget):
                     df = self.main_window._merge_solution_for_display(df, df_base)
         return df, label, start_datetime
 
-    def _quantities_from_df(self, solution_df: pd.DataFrame, settings, start_date):
-        from planning_tool.ui.pages import ComparisonPage
+    def _live_settings(self) -> dict:
+        if self.main_window:
+            return self.main_window._get_active_settings() or {}
+        return {}
 
-        trucks = 0
-        if not solution_df.empty:
-            transport_start = solution_df.get("Transport_Start")
-            if transport_start is not None:
-                trucks = len(transport_start.dropna().unique())
-        days = ComparisonPage._count_handover_working_days(
-            self, solution_df, settings, start_date
+    def _build_slots(self):
+        if not self.main_window:
+            return None
+        return self.main_window._build_working_calendar_slots
+
+    def _quantities_for_version(
+        self,
+        version_id: Optional[int],
+        solution_df: pd.DataFrame,
+        start_datetime: Optional[str],
+    ) -> ScheduleQuantities:
+        stored = self._load_version_settings(version_id)
+        settings = merge_settings(self._live_settings(), stored)
+        start_date = parse_project_start_date(start_datetime, settings)
+        qty = quantities_from_solution(
+            solution_df, settings, start_date, self._build_slots()
         )
-        return days, trucks
+        # Crew count is per-version. Never use the live Settings page, or
+        # editing Settings for a later Calculate would rewrite Version 0's costs.
+        qty.crews = crew_count(stored, default=1)
+        return qty
+
+    def _load_version_settings(self, version_id: Optional[int]) -> dict:
+        if version_id is None or self.engine is None or self.project_id is None:
+            return {}
+        mgr = ScheduleDataManager(self.engine)
+        versions_table = mgr.optimization_versions_table_name(self.project_id)
+        inspector = inspect(self.engine)
+        if versions_table not in inspector.get_table_names():
+            return {}
+        columns = [col["name"] for col in inspector.get_columns(versions_table)]
+        if "settings_json" not in columns:
+            return {}
+        try:
+            result = pd.read_sql(
+                text(
+                    f'SELECT settings_json FROM "{versions_table}" '
+                    f"WHERE version_id = :version_id"
+                ),
+                self.engine,
+                params={"version_id": version_id},
+            )
+        except Exception:
+            return {}
+        if result.empty:
+            return {}
+        return ScheduleDataManager.parse_calculate_settings(
+            result.iloc[0]["settings_json"]
+        )
 
     def _set_quantities(
         self,
-        chosen_days: Optional[int],
-        original_days: Optional[int],
-        chosen_trucks: int,
-        original_trucks: int,
+        chosen: ScheduleQuantities,
+        original: ScheduleQuantities,
     ):
-        self.chosen_days = chosen_days
-        self.original_days = original_days
-        self.chosen_trucks = chosen_trucks
-        self.original_trucks = original_trucks
+        self.chosen_qty = chosen
+        self.original_qty = original
         self._refresh_cost_display()
 
     def _collect_custom_rates(self) -> list[float]:
@@ -724,50 +817,58 @@ class CostsPage(QWidget):
                 rates.append(parsed)
         return rates
 
+    def _current_rates(self) -> CostRates:
+        return CostRates(
+            crane_per_day=parse_non_negative_number(self.crane_cost_input.text()),
+            crew_per_day=parse_non_negative_number(self.crew_cost_input.text()),
+            cost_per_truck=parse_non_negative_number(self.cost_per_truck_input.text()),
+            occupant_per_household_day=parse_non_negative_number(
+                self.occupant_cost_input.text()
+            ),
+            biodiversity_per_m2=parse_non_negative_number(
+                self.biodiversity_price_input.text()
+            ),
+            extra_per_day=self._collect_custom_rates(),
+        )
+
     def _refresh_cost_display(self):
         if not hasattr(self, "original_panel"):
             return
 
-        residents = parse_non_negative_number(self.residents_input.text())
+        households = parse_non_negative_number(self.residents_input.text())
         area_m2 = parse_non_negative_number(self.area_input.text())
+        chosen = getattr(self, "chosen_qty", ScheduleQuantities())
+        original = getattr(self, "original_qty", ScheduleQuantities())
+        currency = self._current_currency()
         costs = compute_monetised_costs(
-            chosen_days=self.chosen_days,
-            original_days=self.original_days,
-            chosen_trucks=self.chosen_trucks,
-            original_trucks=self.original_trucks,
-            crane_per_day=parse_non_negative_number(self.crane_cost_input.text()),
-            crew_per_day=parse_non_negative_number(self.crew_cost_input.text()),
-            custom_per_day=self._collect_custom_rates(),
-            cost_per_truck=parse_non_negative_number(self.cost_per_truck_input.text()),
-            occupant_cost_per_day=parse_non_negative_number(
-                self.occupant_cost_input.text()
-            ),
-            residents=residents,
-            area_m2=area_m2,
-            biodiversity_per_m2_day=parse_non_negative_number(
-                self.biodiversity_price_input.text()
-            ),
+            chosen, original, self._current_rates(), households, area_m2
         )
         self.chosen_panel.set_breakdown(
-            days=self.chosen_days,
-            trucks=self.chosen_trucks,
+            days=chosen.working_days,
+            trucks=chosen.trucks,
             construction=costs["construction_chosen"],
             batch=costs["batch_chosen"],
             occupants=costs["occupants_chosen"],
             biodiversity=costs["biodiversity_chosen"],
             total=costs["total_chosen"],
-            residents=residents,
+            households=households,
             area_m2=area_m2,
+            crews=chosen.crews,
+            currency=currency,
         )
-        self.chosen_panel.set_delta(costs["total_chosen"], costs["total_original"])
+        self.chosen_panel.set_delta(
+            costs["total_chosen"], costs["total_original"], currency
+        )
         self.original_panel.set_breakdown(
-            days=self.original_days,
-            trucks=self.original_trucks,
+            days=original.working_days,
+            trucks=original.trucks,
             construction=costs["construction_original"],
             batch=costs["batch_original"],
             occupants=costs["occupants_original"],
             biodiversity=costs["biodiversity_original"],
             total=costs["total_original"],
-            residents=residents,
+            households=households,
             area_m2=area_m2,
+            crews=original.crews,
+            currency=currency,
         )

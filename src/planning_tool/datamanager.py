@@ -1,7 +1,8 @@
 # data_manager.py
 from __future__ import annotations
+import json
 import pandas as pd
-from sqlalchemy import text, Engine
+from sqlalchemy import text, Engine, inspect
 
 class ScheduleDataManager:
     # The objective weights are priorities, so each term is divided by a reference
@@ -37,6 +38,10 @@ class ScheduleDataManager:
             for column in self.NORMALIZATION_COLUMNS:
                 if column not in existing:
                     conn.exec_driver_sql(f"ALTER TABLE projects ADD COLUMN {column} REAL")
+            if "start_datetime" not in existing:
+                conn.exec_driver_sql(
+                    "ALTER TABLE projects ADD COLUMN start_datetime TEXT"
+                )
 
     def get_normalization_reference(self, project_id: int) -> dict | None:
         """Stored reference values, or None if this project has never been optimized."""
@@ -59,6 +64,32 @@ class ScheduleDataManager:
             conn.execute(
                 text(f"UPDATE projects SET {assignments} WHERE project_id = :pid"),
                 params,
+            )
+
+    def get_project_start_date(self, project_id: int) -> str | None:
+        """Stored start date for this project, or None if it has not been set."""
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT start_datetime FROM projects WHERE project_id = :pid"
+                ),
+                {"pid": project_id},
+            ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        value = str(row[0]).strip()
+        if not value or value.lower() == "mm/dd/yyyy":
+            return None
+        return value
+
+    def set_project_start_date(self, project_id: int, start_str: str) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE projects SET start_datetime = :start_datetime "
+                    "WHERE project_id = :pid"
+                ),
+                {"start_datetime": start_str, "pid": project_id},
             )
 
     # --------- table names ---------
@@ -146,7 +177,136 @@ class ScheduleDataManager:
         self._ensure_delay_and_version_tables(project_id)
 
         return project_id
-    
+
+    def _raw_column_map(self, project_id: int) -> dict[str, str]:
+        raw = self.raw_table_name(project_id)
+        inspector = inspect(self.engine)
+        if raw not in inspector.get_table_names():
+            raise ValueError("This project has no input table. Upload a CSV first.")
+        columns = [col["name"] for col in inspector.get_columns(raw)]
+
+        def pick(*names: str) -> str | None:
+            for name in names:
+                if name in columns:
+                    return name
+            return None
+
+        id_col = pick("Module_ID", "Module ID")
+        install_col = pick("Installation Duration")
+        prod_col = pick("Production Duration")
+        trans_col = pick("Transportation Duration")
+        pred_col = pick("Installation Precedence")
+        missing = [
+            label
+            for label, col in (
+                ("Module ID", id_col),
+                ("Installation Duration", install_col),
+                ("Production Duration", prod_col),
+                ("Transportation Duration", trans_col),
+            )
+            if col is None
+        ]
+        if missing:
+            raise ValueError(
+                "The input table is missing required columns:\n"
+                + "\n".join(f"    - {name}" for name in missing)
+            )
+        return {
+            "raw": raw,
+            "module_id": id_col,
+            "installation": install_col,
+            "production": prod_col,
+            "transport": trans_col,
+            "precedence": pred_col,
+        }
+
+    def list_raw_module_ids(self, project_id: int) -> list[str]:
+        mapping = self._raw_column_map(project_id)
+        raw = mapping["raw"]
+        id_col = mapping["module_id"]
+        df = pd.read_sql_table(raw, self.engine)
+        ids = []
+        for value in df[id_col].tolist():
+            if pd.isna(value):
+                continue
+            text_id = str(value).strip()
+            if text_id:
+                ids.append(text_id)
+        return ids
+
+    def add_raw_module(
+        self,
+        project_id: int,
+        *,
+        module_id: str,
+        installation_duration: int,
+        production_duration: int,
+        transportation_duration: int,
+        precedence: str | None = None,
+    ) -> None:
+        """Append one module to the project's input table for the next Calculate."""
+        module_id = (module_id or "").strip()
+        if not module_id:
+            raise ValueError("Module name cannot be empty.")
+        for label, value in (
+            ("Installation Duration", installation_duration),
+            ("Production Duration", production_duration),
+            ("Transportation Duration", transportation_duration),
+        ):
+            if int(value) < 1:
+                raise ValueError(f"{label} must be a positive whole number.")
+
+        mapping = self._raw_column_map(project_id)
+        existing = self.list_raw_module_ids(project_id)
+        if module_id in existing:
+            raise ValueError(f'Module "{module_id}" already exists.')
+
+        preds = [p.strip() for p in str(precedence or "").split(",") if p.strip()]
+        if module_id in preds:
+            raise ValueError("A module cannot precede itself.")
+        unknown = [p for p in preds if p not in existing]
+        if unknown:
+            raise ValueError(
+                "These predecessor IDs are not in the project:\n"
+                + "\n".join(f"    - {p}" for p in unknown)
+            )
+        precedence_value = ", ".join(preds) if preds else None
+
+        raw = mapping["raw"]
+        columns = [
+            mapping["module_id"],
+            mapping["installation"],
+            mapping["production"],
+            mapping["transport"],
+        ]
+        params = {
+            "module_id": module_id,
+            "installation": int(installation_duration),
+            "production": int(production_duration),
+            "transport": int(transportation_duration),
+        }
+        placeholders = [":module_id", ":installation", ":production", ":transport"]
+        if mapping["precedence"]:
+            columns.append(mapping["precedence"])
+            placeholders.append(":precedence")
+            params["precedence"] = precedence_value
+
+        quoted_cols = ", ".join(f'"{col}"' for col in columns)
+        insert_sql = f'INSERT INTO "{raw}" ({quoted_cols}) VALUES ({", ".join(placeholders)})'
+        trigger = f"trg_no_insert_{raw}"
+        with self.engine.begin() as conn:
+            conn.exec_driver_sql(f"DROP TRIGGER IF EXISTS {trigger}")
+            conn.execute(text(insert_sql), params)
+            conn.exec_driver_sql(
+                f"""
+                CREATE TRIGGER IF NOT EXISTS {trigger}
+                BEFORE INSERT ON "{raw}"
+                BEGIN
+                    SELECT RAISE(ABORT, 'raw table is read-only');
+                END;
+                """
+            )
+
     def _ensure_delay_and_version_tables(self, project_id: int):
         """Create delay_updates and optimization_versions tables for a project"""
         delay_table = ScheduleDataManager.delay_updates_table_name(project_id)
@@ -182,6 +342,7 @@ class ScheduleDataManager:
                     objective_value REAL,
                     status INTEGER,
                     project_start_datetime TEXT,
+                    settings_json TEXT,
                     FOREIGN KEY (base_version_id) REFERENCES "{versions_table}"(version_id)
                 );
             """)
@@ -192,12 +353,60 @@ class ScheduleDataManager:
             except Exception:
                 # Column already exists, ignore
                 pass
+
+            self._ensure_column(conn, versions_table, "settings_json", "TEXT")
             
             # Create index on version_number for faster queries (UNIQUE constraint already creates an index, but keep this for clarity)
             conn.exec_driver_sql(f"""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_version_number_{project_id} 
                 ON "{versions_table}"(version_number);
             """)
+
+    @staticmethod
+    def _ensure_column(conn, table_name: str, column: str, ddl: str) -> None:
+        existing = {
+            row[1] for row in conn.exec_driver_sql(f'PRAGMA table_info("{table_name}")').fetchall()
+        }
+        if column not in existing:
+            conn.exec_driver_sql(f'ALTER TABLE "{table_name}" ADD COLUMN {column} {ddl}')
+
+    def ensure_delay_and_version_tables(self, project_id: int) -> None:
+        """Public wrapper so Calculate / Costs can migrate existing projects."""
+        self._ensure_delay_and_version_tables(project_id)
+
+    @staticmethod
+    def serialize_calculate_settings(settings: dict | None) -> str:
+        return json.dumps(dict(settings or {}), default=str)
+
+    @staticmethod
+    def parse_calculate_settings(raw) -> dict:
+        if raw is None:
+            return {}
+        try:
+            if pd.isna(raw):
+                return {}
+        except (TypeError, ValueError):
+            pass
+        if isinstance(raw, dict):
+            return raw
+        text_value = str(raw).strip()
+        if not text_value:
+            return {}
+        try:
+            data = json.loads(text_value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def crew_count_from_settings(settings: dict | None, default: int = 1) -> int:
+        if not settings:
+            return default
+        raw = settings.get("crew_count", default)
+        try:
+            return max(0, int(float(raw)))
+        except (TypeError, ValueError):
+            return default
 
     # --------- queries / metadata ---------
 

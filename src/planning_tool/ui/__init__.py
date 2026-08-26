@@ -28,7 +28,8 @@ from .components import (
 )
 
 from .dialogs import (
-    DelayInputDialog
+    DelayInputDialog,
+    AddModuleDialog,
 )
 
 from .pages import (
@@ -58,6 +59,7 @@ __all__ = [
     'StatusCell',
     # Dialogs
     'DelayInputDialog',
+    'AddModuleDialog',
     # Pages
     'DashboardPage',
     'SchedulePage',

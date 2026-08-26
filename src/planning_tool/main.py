@@ -99,8 +99,11 @@ class MainWindow(QMainWindow):
 
         try:
             page_settings = SettingsPage()
+            self.page_settings = page_settings
+            page_settings.main_window = self
         except NameError:
-            page_settings = QLabel("Settings"); page_settings.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            page_settings = QLabel("Project Variables"); page_settings.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.page_settings = None
 
         try:
             page_comparison = ComparisonPage()
@@ -128,6 +131,7 @@ class MainWindow(QMainWindow):
             "settings":  self.stack.addWidget(page_settings),
         }
         self.stack.setCurrentIndex(self.page_index["dashboard"])
+        self._refresh_start_date_widget()
 
         # wire calculate button (SchedulePage) -> MainWindow handler
         if isinstance(page_schedule, SchedulePage):
@@ -185,7 +189,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(
                     self,
                     "Error",
-                    "Project start date is not configured. Please set it in Settings.",
+                    "Project start date is not configured. Please set it in Project Variables.",
                 )
                 return
 
@@ -361,9 +365,227 @@ class MainWindow(QMainWindow):
         if idx is None:
             return None
         widget = self.stack.widget(idx)
-        if isinstance(widget, SettingsPage):
-            return widget._save_settings()
+        if not isinstance(widget, SettingsPage):
+            return None
+        settings = widget._save_settings()
+        if self._project_has_calculated_schedule():
+            stored = self._stored_project_start_date()
+            if stored:
+                settings["start_datetime"] = stored
+        return settings
+
+    def _settings_page(self) -> SettingsPage | None:
+        idx = self.page_index.get("settings")
+        if idx is None:
+            return None
+        widget = self.stack.widget(idx)
+        return widget if isinstance(widget, SettingsPage) else None
+
+    def _is_configured_start_date(self, value) -> bool:
+        if not value or str(value).strip().lower() == "mm/dd/yyyy":
+            return False
+        try:
+            datetime.strptime(str(value).strip(), "%m/%d/%Y")
+            return True
+        except ValueError:
+            return False
+
+    def _start_date_from_version_zero(self) -> str | None:
+        if self.current_project_id is None:
+            return None
+        versions_table = self.mgr.optimization_versions_table_name(self.current_project_id)
+        inspector = inspect(self.engine)
+        if versions_table not in inspector.get_table_names():
+            return None
+        with self.engine.begin() as conn:
+            value = conn.execute(
+                text(
+                    f'SELECT project_start_datetime FROM "{versions_table}" '
+                    f"WHERE version_number = 0 AND project_start_datetime IS NOT NULL "
+                    f"LIMIT 1"
+                )
+            ).scalar()
+        if value and self._is_configured_start_date(value):
+            return str(value).strip()
         return None
+
+    def _stored_project_start_date(self) -> str | None:
+        if self.current_project_id is None:
+            return None
+        stored = self.mgr.get_project_start_date(self.current_project_id)
+        if stored:
+            return stored
+        backfill = self._start_date_from_version_zero()
+        if backfill:
+            self.mgr.set_project_start_date(self.current_project_id, backfill)
+            return backfill
+        return None
+
+    def _project_has_calculated_schedule(self) -> bool:
+        if self.current_project_id is None:
+            return False
+        versions_table = self.mgr.optimization_versions_table_name(self.current_project_id)
+        inspector = inspect(self.engine)
+        if versions_table not in inspector.get_table_names():
+            return False
+        with self.engine.begin() as conn:
+            count = conn.execute(
+                text(f'SELECT COUNT(*) FROM "{versions_table}"')
+            ).scalar()
+        return (count or 0) > 0
+
+    def _commit_project_start_date(self, start_str: str | None) -> None:
+        if self.current_project_id is None:
+            return
+        if not self._is_configured_start_date(start_str):
+            return
+        if (
+            self._project_has_calculated_schedule()
+            and self.mgr.get_project_start_date(self.current_project_id)
+        ):
+            return
+        self.mgr.set_project_start_date(self.current_project_id, str(start_str).strip())
+        self._refresh_start_date_widget()
+
+    def _refresh_start_date_widget(self) -> None:
+        page = self._settings_page()
+        if page is None:
+            return
+        stored = self._stored_project_start_date()
+        locked = bool(stored) and self._project_has_calculated_schedule()
+        page.apply_project_start_date(stored, locked=locked)
+
+    def _on_project_variables_saved(self, settings: dict) -> None:
+        self._commit_project_start_date((settings or {}).get("start_datetime", ""))
+
+    def _calculate_settings_snapshot(
+        self,
+        settings: dict,
+        *,
+        crew_count: int,
+        machine_count: int,
+        site_storage: int,
+        factory_storage: int,
+    ) -> dict:
+        """Settings actually handed to the solver for this Calculate."""
+        snapshot = dict(settings or {})
+        snapshot["crew_count"] = int(crew_count)
+        snapshot["machine_count"] = int(machine_count)
+        snapshot["site_storage"] = int(site_storage)
+        snapshot["factory_storage"] = int(factory_storage)
+        return snapshot
+
+    def _save_version_settings(
+        self, versions_table: str, version_id: int, snapshot: dict
+    ) -> None:
+        if version_id is None:
+            return
+        payload = ScheduleDataManager.serialize_calculate_settings(snapshot)
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    f'UPDATE "{versions_table}" SET settings_json = :settings_json '
+                    f"WHERE version_id = :version_id"
+                ),
+                {"settings_json": payload, "version_id": version_id},
+            )
+
+    def _allocate_calculate_version(
+        self, versions_table: str, start_str: str
+    ) -> tuple[int, int]:
+        """Pick the version row for a Calculate that is not a delay re-opt.
+
+        First successful solve becomes Version 0. Later Calculates with new
+        Settings must not overwrite that baseline; they get the next version.
+        """
+        solution_table = self.mgr.solution_table_name(self.current_project_id)
+        inspector = inspect(self.engine)
+        solution_table_exists = solution_table in inspector.get_table_names()
+        with self.engine.begin() as conn:
+            version_0_id = conn.execute(
+                text(
+                    f'SELECT version_id FROM "{versions_table}" '
+                    f"WHERE version_number = 0"
+                )
+            ).scalar()
+            version_0_rows = 0
+            if version_0_id is not None and solution_table_exists:
+                version_0_rows = conn.execute(
+                    text(
+                        f'SELECT COUNT(*) FROM "{solution_table}" '
+                        f"WHERE version_id = :version_id"
+                    ),
+                    {"version_id": version_0_id},
+                ).scalar() or 0
+
+            if version_0_id is None or version_0_rows == 0:
+                if version_0_id is None:
+                    conn.execute(
+                        text(
+                            f'''
+                            INSERT OR IGNORE INTO "{versions_table}"
+                            (version_number, base_version_id, reoptimize_from_time,
+                             project_start_datetime)
+                            VALUES (0, NULL, :reoptimize_from_time, :project_start_datetime)
+                            '''
+                        ),
+                        {
+                            "reoptimize_from_time": None,
+                            "project_start_datetime": start_str,
+                        },
+                    )
+                    version_0_id = conn.execute(
+                        text(
+                            f'SELECT version_id FROM "{versions_table}" '
+                            f"WHERE version_number = 0"
+                        )
+                    ).scalar()
+                conn.execute(
+                    text(
+                        f'''
+                        UPDATE "{versions_table}"
+                        SET project_start_datetime = :project_start_datetime
+                        WHERE version_id = :version_id
+                          AND project_start_datetime IS NULL
+                        '''
+                    ),
+                    {
+                        "project_start_datetime": start_str,
+                        "version_id": version_0_id,
+                    },
+                )
+                return int(version_0_id), 0
+
+            latest_number = conn.execute(
+                text(f'SELECT MAX(version_number) FROM "{versions_table}"')
+            ).scalar()
+            new_number = int(latest_number or 0) + 1
+            conn.execute(
+                text(
+                    f'''
+                    INSERT INTO "{versions_table}"
+                    (version_number, base_version_id, reoptimize_from_time, delay_ids,
+                     project_start_datetime)
+                    VALUES (:version_number, :base_version_id, :reoptimize_from_time,
+                            :delay_ids, :project_start_datetime)
+                    '''
+                ),
+                {
+                    "version_number": new_number,
+                    "base_version_id": version_0_id,
+                    "reoptimize_from_time": None,
+                    "delay_ids": None,
+                    "project_start_datetime": start_str,
+                },
+            )
+            new_id = conn.execute(
+                text(
+                    f'SELECT version_id FROM "{versions_table}" '
+                    f"WHERE version_number = :version_number"
+                ),
+                {"version_number": new_number},
+            ).scalar()
+            return int(new_id), new_number
 
     def _merge_solution_for_display(
         self, new_df: pd.DataFrame, base_df: pd.DataFrame
@@ -501,6 +723,8 @@ class MainWindow(QMainWindow):
         try:
             # 1) get settings
             settings = self._get_active_settings() or {}  # return a dict of settings
+            if self.current_project_id is not None:
+                self.mgr.ensure_delay_and_version_tables(self.current_project_id)
             
             # parse dates (we use only the date part to anchor the schedule)
             fmt = "%m/%d/%Y"
@@ -512,9 +736,10 @@ class MainWindow(QMainWindow):
                 self._abort_calculation(
                     calc_dialog, calculate_btn, original_btn_text,
                     "Missing Start Date",
-                    "Project start date is not configured. Please set it in Settings before running Calculate.",
+                    "Project start date is not configured. Please set it in Project Variables before running Calculate.",
                 )
                 return
+            self._commit_project_start_date(start_str)
 
             # crew / machines / capacities / objective weights
             C_install = int(settings.get("crew_count", "1") or 1)
@@ -525,6 +750,13 @@ class MainWindow(QMainWindow):
             w_transport = float(settings.get("w_transport", "0") or 0)
             w_site_storage = float(settings.get("w_site_storage", "0") or 0)
             w_factory_storage = float(settings.get("w_factory_storage", "0") or 0)
+            settings_snapshot = self._calculate_settings_snapshot(
+                settings,
+                crew_count=C_install,
+                machine_count=M_machine,
+                site_storage=S_site,
+                factory_storage=S_fac,
+            )
 
             if w_duration + w_transport + w_site_storage + w_factory_storage <= 0:
                 self._abort_calculation(
@@ -1012,6 +1244,11 @@ class MainWindow(QMainWindow):
                             "project_start_datetime": reopt_start_datetime,
                             "version_id": new_version_id
                         })
+                    reopt_snapshot = dict(settings_snapshot)
+                    reopt_snapshot["start_datetime"] = reopt_start_datetime
+                    self._save_version_settings(
+                        versions_table, new_version_id, reopt_snapshot
+                    )
                 
                 # Close dialog and restore button state
                 calc_dialog.close()
@@ -1056,62 +1293,26 @@ class MainWindow(QMainWindow):
                     )
                     return
 
-                # 5) Create or get version 0 record for initial optimization (before saving results)
+                # 5) First Calculate writes Version 0. Later Calculates with new
+                # Settings must open a new version; overwriting Version 0 would
+                # destroy the original-plan baseline used on Costs / Comparison.
                 QApplication.processEvents()
                 versions_table = self.mgr.optimization_versions_table_name(self.current_project_id)
-                version_0_id = None
-                
-                with self.engine.begin() as conn:
-                    # Get or create version 0 record (use INSERT OR IGNORE to prevent duplicates)
-                    check_version_query = text(f'SELECT version_id FROM "{versions_table}" WHERE version_number = 0')
-                    version_0_id = conn.execute(check_version_query).scalar()
-                    
-                    if version_0_id is None:
-                        # Version 0 doesn't exist, create it (INSERT OR IGNORE ensures no duplicates even in concurrent scenarios)
-                        # Save the start_datetime used for this optimization
-                        insert_version_query = text(f'''
-                            INSERT OR IGNORE INTO "{versions_table}" 
-                            (version_number, base_version_id, reoptimize_from_time, project_start_datetime)
-                            VALUES (0, NULL, :reoptimize_from_time, :project_start_datetime)
-                        ''')
-                        conn.execute(insert_version_query, {
-                            # Version 0 is the initial run, so there is no time index to re-optimize from.
-                            "reoptimize_from_time": None,
-                            "project_start_datetime": start_str
-                        })
-                        
-                        # Get the version_id for version 0 (after insert or if it was created concurrently)
-                        get_version_id_query = text(f'SELECT version_id FROM "{versions_table}" WHERE version_number = 0')
-                        version_0_id = conn.execute(get_version_id_query).scalar()
-                    
-                    # Backfill project_start_datetime only when it is missing. Overwriting it
-                    # would desynchronise version 0 from the re-optimized versions, which
-                    # inherit their start date from the version they are based on.
-                    if version_0_id is not None:
-                        update_start_date_query = text(f'''
-                            UPDATE "{versions_table}" 
-                            SET project_start_datetime = :project_start_datetime
-                            WHERE version_id = :version_id 
-                              AND project_start_datetime IS NULL
-                        ''')
-                        conn.execute(update_start_date_query, {
-                            "project_start_datetime": start_str,
-                            "version_id": version_0_id
-                        })
+                target_version_id, target_version_number = self._allocate_calculate_version(
+                    versions_table, start_str
+                )
 
-                # 5.5) Save results to DB with version_0_id (preserving real Module IDs)
                 QApplication.processEvents()
                 scheduler.save_results_to_db(
                     self.engine,
                     self.current_project_id,
                     module_id_mapping=index_to_id,
-                    version_id=version_0_id
+                    version_id=target_version_id
                 )
 
-                # 5.6) Update version record with optimization results
                 QApplication.processEvents()
                 solution = scheduler.get_solution_dict()
-                if solution and version_0_id:
+                if solution and target_version_id:
                     with self.engine.begin() as conn:
                         update_version_query = text(f'''
                             UPDATE "{versions_table}" 
@@ -1123,8 +1324,18 @@ class MainWindow(QMainWindow):
                             "objective_value": solution.get('objective'),
                             "status": solution.get('status'),
                             "project_start_datetime": start_str,
-                            "version_id": version_0_id
+                            "version_id": target_version_id
                         })
+                    self._save_version_settings(
+                        versions_table, target_version_id, settings_snapshot
+                    )
+                    print(
+                        f"[Calculate] Saved Version {target_version_number} "
+                        f"(version_id={target_version_id}) with current Settings"
+                    )
+
+            self._commit_project_start_date(start_str)
+            self._refresh_start_date_widget()
 
             # 6) load solution table and map indices to real-world schedule using working calendar
             QApplication.processEvents()
@@ -1677,6 +1888,8 @@ class MainWindow(QMainWindow):
             # Load data for dashboard page when it's shown
             elif name == "dashboard" and hasattr(self, "page_dashboard") and self.page_dashboard:
                 self.load_dashboard_data()
+            elif name == "settings":
+                self._refresh_start_date_widget()
     
     def _update_sidebar_selection(self, page_name: str):
         """Update sidebar button selection based on current page"""
@@ -1748,6 +1961,7 @@ class MainWindow(QMainWindow):
                 current_idx = self.stack.currentIndex()
                 if current_idx == self.page_index.get("schedule"):
                     self.page_schedule.load_version_list(self.engine, self.current_project_id)
+            self._refresh_start_date_widget()
         else:
             self.current_project_id = None
             self.topbar.delete_project_btn.hide()  # Hide delete button when no project selected
@@ -1770,6 +1984,7 @@ class MainWindow(QMainWindow):
                 current_idx = self.stack.currentIndex()
                 if current_idx == self.page_index.get("schedule"):
                     self.page_schedule.load_version_list(self.engine, None)
+            self._refresh_start_date_widget()
 
     def _on_project_created(self, project_id: int, project_name: str):
         """Handler for when a new project is created - updates the project combo"""
@@ -1781,6 +1996,7 @@ class MainWindow(QMainWindow):
         combo.setCurrentText(project_name)
         self.current_project_id = project_id
         self.topbar.delete_project_btn.show()  # Show delete button when project exists
+        self._refresh_start_date_widget()
         
     
     def load_dashboard_data(self):
@@ -2007,13 +2223,20 @@ class MainWindow(QMainWindow):
             planned_vs_actual_pct = (completed_modules / total_modules * 100) if total_modules > 0 else 0
             planned_vs_actual_str = f"{planned_vs_actual_pct:.0f}%"
             
-            # 2. Critical Tasks: count of delays
+            # 2. Critical Tasks: unique modules that have been marked with a delay
+            # (pending and already applied, across all versions).
             critical_tasks_count = 0
             if delay_table in inspector.get_table_names():
                 try:
-                    delay_count_query = f'SELECT COUNT(*) FROM "{delay_table}" WHERE version_id = :version_id'
-                    delay_count_result = pd.read_sql(text(delay_count_query), self.engine, params={"version_id": max_version_id})
-                    critical_tasks_count = delay_count_result.iloc[0, 0] if not delay_count_result.empty else 0
+                    delay_count_query = (
+                        f'SELECT COUNT(DISTINCT module_id) FROM "{delay_table}"'
+                    )
+                    delay_count_result = pd.read_sql(text(delay_count_query), self.engine)
+                    critical_tasks_count = (
+                        int(delay_count_result.iloc[0, 0])
+                        if not delay_count_result.empty
+                        else 0
+                    )
                 except Exception:
                     pass
             
@@ -2026,7 +2249,7 @@ class MainWindow(QMainWindow):
             
             self.page_dashboard.card_critical_tasks.update(
                 value=str(critical_tasks_count),
-                subtitle="Requiring attention" if critical_tasks_count > 0 else "No delays"
+                subtitle="Modules with delays" if critical_tasks_count > 0 else "No delays"
             )
             
             # 3. Start Date: project start date from version record, formatted as "Dec, 15, 2025"

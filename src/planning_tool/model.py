@@ -1,32 +1,19 @@
 from collections import Counter
-from pyscipopt import (
-    Model,
-    quicksum,
-    Heur,
-    SCIP_PARAMEMPHASIS,
-    SCIP_PARAMSETTING,
-    SCIP_RESULT,
-    SCIP_HEURTIMING,
-)
 import math
 import pandas as pd
 from sqlalchemy import Engine, text
 from typing import Optional, Dict, Any
 
-def _add_cons(m, expr, name: str):
-    """Named constraint helper so the MIP body stays solver-agnostic."""
-    return m.addCons(expr, name=name)
+from ortools.sat.python import cp_model
 
 
-class _ScheduleStartHeur(Heur):
-    """Submits the constructive schedule in original variable space (avoids presolve aggregations)."""
+# Integer objective scale. CP-SAT wants integer coefficients; the true
+# weighted objective is recovered after solve from the schedule values.
+_OBJ_SCALE = 10_000
 
-    def heurexec(self, heurtiming, nodeinfeasible):
-        if getattr(self, "_injected", False):
-            return {"result": SCIP_RESULT.DIDNOTRUN}
-        self._injected = True
-        ok = self.scheduler._inject_heuristic_sol(self)
-        return {"result": SCIP_RESULT.FOUNDSOL if ok else SCIP_RESULT.DIDNOTFIND}
+
+def _to_int(value) -> int:
+    return int(round(float(value)))
 
 
 class PrefabScheduler:
@@ -83,7 +70,7 @@ class PrefabScheduler:
         self.w_factory_storage = w_factory_storage
         raw = {k: float(v) for k, v in reference.items()}
         # A zero divisor would blow up the term it scales. The two storage
-        # columns are kept separately for diagnostics; the MIP uses their sum
+        # columns are kept separately for diagnostics; the model uses their sum
         # so a JIT heuristic (factory wait = 0) cannot make factory storage
         # look a hundred times more expensive than site storage.
         self.reference = {
@@ -100,7 +87,7 @@ class PrefabScheduler:
         # smaller because the module count rarely fills every truck.
         self.min_batch_size = min_batch_size
         self.max_batch_size = max_batch_size
-        # dummies
+        # dummies (kept for compatibility with time-window / DB helpers)
         self.dummy_start = 0
         self.dummy_end = N + 1
         self.d[self.dummy_start] = 0
@@ -108,33 +95,41 @@ class PrefabScheduler:
 
         # placeholders: model & variables
         self.m = None
-        self.x = {}
-        self.y = {}
-        self.p = {}
-        self.I = {}
-        self.q = {}
-        self.z = {}
-        self.F = {}
-        self.u = {}
-        self.time_windows = None
+        self._solver = None
+        self._status = None
+        self._quiet = False
         self._n_binaries = 0
         self._n_live_binaries = 0
         self._heuristic_start = None
-        
+        self._cached_solution = None
+        self._true_obj = None
+        self._time_limit = 120.0
+        self._mip_gap = 0.2
+
+        self.prod_start = {}
+        self.arrival = {}
+        self.install_start = {}
+        self.finish_var = None
+        self.site_wait = {}
+        self.fac_wait = {}
+        self.z = {}
+        self.u = {}
+        self.time_windows = None
+
         # Fixed constraints for re-optimization
         self.fixed_installation_starts = {}
         self.fixed_production_starts = {}
-        self.fixed_arrival_times = {} 
-        self.fixed_durations = {} # any problem here?
-        self.reoptimize_from_time = None  # Current time (time index) from which to re-optimize
+        self.fixed_arrival_times = {}
+        self.fixed_durations = {}
+        self.reoptimize_from_time = None
         self.earliest_production_starts = {}
         self.earliest_arrival_times = {}
         self.earliest_installation_starts = {}
 
         # preprocessing roots / leaves
         self.roots, self.leaves = self._find_roots_and_leaves()
-    
-    def set_fixed_constraints(self, 
+
+    def set_fixed_constraints(self,
                              fixed_installation_starts: Optional[Dict[int, int]] = None,
                              fixed_production_starts: Optional[Dict[int, int]] = None,
                              fixed_arrival_times: Optional[Dict[int, int]] = None,
@@ -145,7 +140,7 @@ class PrefabScheduler:
                              earliest_installation_starts: Optional[Dict[int, int]] = None):
         """
         Set fixed constraints for re-optimization.
-        
+
         Args:
             fixed_installation_starts: {module_index: start_time}
             fixed_production_starts: {module_index: start_time}
@@ -178,7 +173,7 @@ class PrefabScheduler:
             succs[i].append(j)
             preds[j].append(i)
         roots = [i for i in range(1, self.N + 1) if len(preds[i]) == 0]
-        leaves = [i for i in range(1, self.N + 1) if len(succs[i]) == 0]    
+        leaves = [i for i in range(1, self.N + 1) if len(succs[i]) == 0]
         return roots, leaves
 
     def _topological_order(self) -> Optional[list]:
@@ -209,8 +204,7 @@ class PrefabScheduler:
         before its predecessors are done; and it cannot start so late that its
         successors no longer fit before T. Arrival and production windows follow
         from the installation window through the transport and production lead
-        times. Variables outside their window are created with an upper bound of
-        zero, so presolve drops them instead of leaving them to branch on.
+        times. Those bounds become the domains of the CP-SAT start variables.
 
         Returns None when no tightening can be justified, in which case the model
         keeps the full 1..T range for every activity.
@@ -333,8 +327,7 @@ class PrefabScheduler:
 
         # Every installation has to fit between the first possible start and the
         # end of the project, and the crews can only do so much per period. This
-        # bounds the project end far below what the precedence chains alone give,
-        # which is what the relaxation otherwise exploits to look cheap.
+        # bounds the project end far below what the precedence chains alone give.
         if es_x:
             total_install = sum(d[i] for i in range(1, N + 1))
             dummy_end_earliest = max(
@@ -345,414 +338,282 @@ class PrefabScheduler:
         windows["dummy_end"] = (max(1, min(dummy_end_earliest, T)), T)
         return windows
 
-    def _add_bin(self, m, name: str, ub: float):
-        """Binary variable; ub=0 is how time-window tightening removes a start time."""
-        ubf = float(ub)
-        self._n_binaries += 1
-        if ubf >= 0.5:
-            self._n_live_binaries += 1
-        return m.addVar(vtype="B", lb=0.0, ub=ubf, name=name)
+    def _domain(self, kind: str, i: int) -> tuple:
+        """Inclusive (lo, hi) for a start variable, clamped to 1..T."""
+        T = self.T
+        if self.time_windows is None:
+            tau = self.reoptimize_from_time
+            lo = 1 if tau is None else max(1, tau)
+            return lo, T
+        lo, hi = self.time_windows[kind][i]
+        return max(1, min(int(lo), T)), max(1, min(int(hi), T))
 
-    def _configure_solver(self, m, time_limit=600.0, mip_gap=0.01):
+    def _true_objective(self, finish: int, n_trucks: int, site: int, factory: int) -> float:
+        ref = self.reference
+        return (
+            self.w_duration * finish / ref["ref_duration"]
+            + self.w_transport * n_trucks / ref["ref_transport"]
+            + self.w_site_storage * site / ref["ref_storage"]
+            + self.w_factory_storage * factory / ref["ref_storage"]
+        )
+
+    def _status_name(self, status) -> str:
+        if status == cp_model.OPTIMAL:
+            return "optimal"
+        if status == cp_model.FEASIBLE:
+            return "feasible"
+        if status == cp_model.INFEASIBLE:
+            return "infeasible"
+        if status == cp_model.MODEL_INVALID:
+            return "infeasible"
+        return "unknown"
+
+    def _configure_solver(self, solver, time_limit=600.0, mip_gap=0.01):
         """
-        Search for better incumbents: feasibility emphasis and aggressive
-        primal heuristics. Cuts stay light so the time is not spent only at
-        the root. Gap 1% is a stop criterion; the time limit is the usual exit.
+        Search for better incumbents within the time limit. Gap 1% is a stop
+        criterion; the time limit is the usual exit.
         """
-        m.setEmphasis(SCIP_PARAMEMPHASIS.FEASIBILITY, True)
-        m.setPresolve(SCIP_PARAMSETTING.FAST)
-        m.setSeparating(SCIP_PARAMSETTING.FAST)
-        m.setHeuristics(SCIP_PARAMSETTING.AGGRESSIVE)
-        m.setParam("limits/time", time_limit)
-        m.setParam("limits/gap", mip_gap)
-        m.setParam("separating/maxroundsroot", 2)
-        m.setParam("separating/maxstallroundsroot", 1)
-        m.setParam("branching/relpscost/sbiterofs", 0)
-        m.setParam("branching/relpscost/sbiterquot", 0.0)
+        solver.parameters.max_time_in_seconds = float(time_limit)
+        solver.parameters.relative_gap_limit = float(mip_gap)
+        solver.parameters.log_search_progress = not self._quiet
+        solver.parameters.repair_hint = True
 
     def build_model(self):
-        m = Model("prefab_with_factory_buffer")
-        self._configure_solver(m)
+        m = cp_model.CpModel()
+        m.SetName("prefab_cp_sat")
         self._n_binaries = 0
         self._n_live_binaries = 0
+        self._cached_solution = None
+        self._true_obj = None
 
         N, T = self.N, self.T
-        d = self.d
-        D = self.D
-        L = self.L
-        dummy_start = self.dummy_start
-        dummy_end = self.dummy_end
+        d = {i: _to_int(self.d[i]) for i in range(1, N + 1)}
+        D = {i: _to_int(self.D[i]) for i in range(1, N + 1)}
+        L = {i: _to_int(self.L[i]) for i in range(1, N + 1)}
+        C_install = _to_int(self.C_install)
+        M_machine = _to_int(self.M_machine)
+        S_site = _to_int(self.S_site)
+        S_fac = _to_int(self.S_fac)
 
-        # ============ 3. variables ============
-        # Activities can only run inside their time window, so every variable
-        # outside it is fixed to zero and disappears in presolve.
         windows = self.compute_time_windows()
         self.time_windows = windows
 
-        def bound(kind: str, i: int, t: int) -> float:
-            if windows is None:
-                return 1.0
-            lo, hi = windows[kind][i]
-            return 1.0 if lo <= t <= hi else 0.0
+        def new_bool(name: str):
+            self._n_binaries += 1
+            self._n_live_binaries += 1
+            return m.new_bool_var(name)
 
-        start_time_dummy = 1 if self.reoptimize_from_time is None else max(1, self.reoptimize_from_time)
-
-        # x[i,t] start installation (including dummy)
-        x = {}
-        for i in range(0, N + 2):
-            for t in range(1, T + 1):
-                if i == dummy_start:
-                    ub = 1.0 if t == start_time_dummy else 0.0
-                elif i == dummy_end:
-                    ub = 1.0 if windows is None or windows["dummy_end"][0] <= t <= windows["dummy_end"][1] else 0.0
-                else:
-                    ub = bound("install", i, t)
-                x[i, t] = self._add_bin(m, f"x_{i}_{t}", ub)
-
-        # y[i,t] installing (only real activities)
-        y = {}
+        # ---- start variables (domains from time windows) ----
+        prod_start, arrival, install_start = {}, {}, {}
         for i in range(1, N + 1):
-            for t in range(1, T + 1):
-                if windows is None:
-                    ub = 1.0
-                else:
-                    lo, hi = windows["install"][i]
-                    ub = 1.0 if lo <= t <= hi + d[i] - 1 else 0.0
-                y[i, t] = self._add_bin(m, f"y_{i}_{t}", ub)
+            q_lo, q_hi = self._domain("production", i)
+            p_lo, p_hi = self._domain("arrival", i)
+            x_lo, x_hi = self._domain("install", i)
+            prod_start[i] = m.new_int_var(q_lo, q_hi, f"prod_{i}")
+            arrival[i] = m.new_int_var(p_lo, p_hi, f"arr_{i}")
+            install_start[i] = m.new_int_var(x_lo, x_hi, f"inst_{i}")
 
-        # p[i,t] arrival at site
-        p = {}
+        if windows is None:
+            finish_lo, finish_hi = 1, T
+        else:
+            finish_lo, finish_hi = windows["dummy_end"]
+            finish_lo = max(1, min(int(finish_lo), T))
+            finish_hi = max(1, min(int(finish_hi), T))
+        finish = m.new_int_var(finish_lo, finish_hi, "finish")
+
+        # ---- intervals ----
+        # Production occupies [prod_start, prod_start + D); installation
+        # occupies [install_start, install_start + d). Site storage occupies
+        # [arrival, install_start); factory storage occupies
+        # [prod_start + D, arrival - L).
+        prod_intervals, install_intervals = [], []
+        site_intervals, factory_intervals = [], []
+        site_wait, fac_wait = {}, {}
         for i in range(1, N + 1):
-            for t in range(1, T + 1):
-                p[i, t] = self._add_bin(m, f"p_{i}_{t}", bound("arrival", i, t))
+            prod_intervals.append(
+                m.new_fixed_size_interval_var(prod_start[i], D[i], f"prod_iv_{i}")
+            )
+            install_intervals.append(
+                m.new_fixed_size_interval_var(install_start[i], d[i], f"inst_iv_{i}")
+            )
 
-        # site inventory: a module only occupies the yard between its earliest
-        # arrival and its latest installation start
-        I = {}
+            max_site_wait = T
+            site_wait[i] = m.new_int_var(0, max_site_wait, f"site_wait_{i}")
+            site_intervals.append(
+                m.new_interval_var(
+                    arrival[i], site_wait[i], install_start[i], f"site_iv_{i}"
+                )
+            )
+
+            max_fac_wait = T
+            fac_wait[i] = m.new_int_var(0, max_fac_wait, f"fac_wait_{i}")
+            factory_intervals.append(
+                m.new_interval_var(
+                    prod_start[i] + D[i],
+                    fac_wait[i],
+                    arrival[i] - L[i],
+                    f"fac_iv_{i}",
+                )
+            )
+
+        ones = [1] * N
+        m.add_cumulative(prod_intervals, ones, M_machine)
+        m.add_cumulative(install_intervals, ones, C_install)
+        m.add_cumulative(site_intervals, ones, S_site)
+        m.add_cumulative(factory_intervals, ones, S_fac)
+
+        # ---- timing and precedence ----
         for i in range(1, N + 1):
-            for t in range(1, T + 1):
-                if windows is None:
-                    ub = None
-                else:
-                    ub = 1.0 if windows["arrival"][i][0] <= t < windows["install"][i][1] else 0.0
-                I[i, t] = m.addVar(vtype="C", lb=0.0, ub=ub, name=f"I_{i}_{t}")
+            m.add(prod_start[i] + D[i] + L[i] <= arrival[i])
+            m.add(arrival[i] <= install_start[i])
 
-        # factory production start
-        q = {}
-        for i in range(1, N + 1):
-            for t in range(1, T + 1):
-                q[i, t] = self._add_bin(m, f"q_{i}_{t}", bound("production", i, t))
+        for (i, j) in self.E:
+            m.add(install_start[j] >= install_start[i] + d[i])
 
-        # order per time (batch): no delivery can happen outside the periods in
-        # which some module is able to arrive
+        m.add_max_equality(finish, [install_start[i] + d[i] for i in range(1, N + 1)])
+
+        # ---- re-optimization pins ----
+        for i, t in self.fixed_installation_starts.items():
+            if 1 <= i <= N:
+                m.add(install_start[i] == _to_int(t))
+        for i, t in self.fixed_production_starts.items():
+            if 1 <= i <= N:
+                m.add(prod_start[i] == _to_int(t))
+        for i, t in self.fixed_arrival_times.items():
+            if 1 <= i <= N:
+                m.add(arrival[i] == _to_int(t))
+
+        # ---- truck channeling ----
+        # arrival[i] == t <=> arrival_at[i][t]. Load at t is the number of
+        # modules that share that arrival slot; z[t] marks a truck, u[t] the
+        # single allowed partial load (size below min_batch_size).
         if windows is None:
             delivery_lo, delivery_hi = 1, T
         else:
             delivery_lo = min(lo for lo, _ in windows["arrival"].values())
             delivery_hi = max(hi for _, hi in windows["arrival"].values())
+            delivery_lo = max(1, min(int(delivery_lo), T))
+            delivery_hi = max(1, min(int(delivery_hi), T))
 
-        z = {}
-        for t in range(1, T + 1):
-            ub = 1.0 if delivery_lo <= t <= delivery_hi else 0.0
-            z[t] = self._add_bin(m, f"z_{t}", ub)
-
-        # factory inventory
-        F = {}
-        for s in range(1, T + 1):
-            F[s] = m.addVar(vtype="C", lb=0.0, name=f"F_{s}")
-
-        # ============ 4. constraints ============
-
-        # (1) dummy start fixed at time 1 (or reoptimize_from_time (current_time) if set)
-        start_time = 1
-        if self.reoptimize_from_time is not None:
-            start_time = max(1, self.reoptimize_from_time)
-        
-        _add_cons(m, x[dummy_start, start_time] == 1, "dummy_start_fix")
-        for t in range(1, T + 1):
-            if t != start_time:
-                _add_cons(m, x[dummy_start, t] == 0, f"dummy_start_zero_{t}")
-
-        # (2) each real activity starts once
+        arrival_at = {i: {} for i in range(1, N + 1)}
         for i in range(1, N + 1):
-            _add_cons(m, quicksum(x[i, t] for t in range(1, T + 1)) == 1,
-                        f"start_once_{i}")
-        
-        # (2a) Fixed installation starts (for re-optimization)
-        # Note: Since we have sum(x[i, t]) = 1, fixing x[i, fixed_start] = 1 
-        # automatically forces all other x[i, t] = 0
-        for i, fixed_start in self.fixed_installation_starts.items():
-            if 1 <= i <= N and 1 <= fixed_start <= T:
-                _add_cons(m, x[i, fixed_start] == 1, f"fixed_install_start_{i}")
-        
-        # (2b) Fixed production starts
-        # Note: Since we have sum(q[i, t]) = 1, fixing q[i, fixed_start] = 1
-        # automatically forces all other q[i, t] = 0
-        for i, fixed_start in self.fixed_production_starts.items():
-            if 1 <= i <= N and 1 <= fixed_start <= T:
-                _add_cons(m, q[i, fixed_start] == 1, f"fixed_prod_start_{i}")
-        
-        # (2c) Fixed arrival times
-        # Note: Since we have sum(p[i, t]) = 1, fixing p[i, fixed_arrival] = 1
-        # automatically forces all other p[i, t] = 0
-        for i, fixed_arrival in self.fixed_arrival_times.items():
-            if 1 <= i <= N and 1 <= fixed_arrival <= T:
-                _add_cons(m, p[i, fixed_arrival] == 1, f"fixed_arrival_{i}")
-        
-        # (2d) Fixed durations
-        # Note: Duration extensions are handled by updating self.D, self.d, self.L dictionaries
-        # before creating PrefabScheduler. The fixed_durations here are mainly for documentation
-        # and ensuring consistency. The actual durations used in constraints come from D, d, L.
-        for i, phase_durations in self.fixed_durations.items():
-            if 1 <= i <= N:
-                if 'FABRICATION' in phase_durations:
-                    # Duration is stored in D[i] and used in constraints
-                    # No additional constraint needed - D[i] already reflects the delayed duration
-                    pass
-                if 'TRANSPORT' in phase_durations:
-                    # Transport duration is in L[i] and used in constraints
-                    pass
-                if 'INSTALLATION' in phase_durations:
-                    # Installation duration is in d[i] and used in constraints
-                    pass
+            p_lo, p_hi = self._domain("arrival", i)
+            bools = []
+            for t in range(p_lo, p_hi + 1):
+                b = new_bool(f"arr_eq_{i}_{t}")
+                arrival_at[i][t] = b
+                bools.append(b)
+            m.add_map_domain(arrival[i], bools, offset=p_lo)
 
-        # (3) dummy end starts once
-        _add_cons(m, quicksum(x[dummy_end, t] for t in range(1, T + 1)) == 1,
-                    "dummy_end_once")
+        z, u = {}, {}
+        for t in range(delivery_lo, delivery_hi + 1):
+            load_terms = [arrival_at[i][t] for i in range(1, N + 1) if t in arrival_at[i]]
+            if not load_terms:
+                continue
+            z[t] = new_bool(f"z_{t}")
+            u[t] = new_bool(f"u_{t}")
+            load = sum(load_terms)
+            m.add(load <= self.max_batch_size * z[t])
+            m.add(load >= z[t])
+            m.add(load >= self.min_batch_size * z[t] - self.min_batch_size * u[t])
+            m.add(u[t] <= z[t])
 
-        # (4) precedence between real activities
-        for (i, j) in self.E:
-            start_i = quicksum(t * x[i, t] for t in range(1, T + 1))
-            start_j = quicksum(t * x[j, t] for t in range(1, T + 1))
-            _add_cons(m, start_i + d[i] <= start_j, f"prec_{i}_{j}")
+        if u:
+            m.add(sum(u[t] for t in u) <= 1)
 
-        # (5) roots after dummy start
-        for i in self.roots:
-            start_i = quicksum(t * x[i, t] for t in range(1, T + 1))
-            _add_cons(m, 1 <= start_i, f"root_after_dummy_{i}")
-
-        # (6) leaves before dummy end
-        for i in self.leaves:
-            start_i = quicksum(t * x[i, t] for t in range(1, T + 1))
-            end_d = quicksum(t * x[dummy_end, t] for t in range(1, T + 1))
-            _add_cons(m, start_i + d[i] <= end_d, f"leaf_before_dummy_end_{i}")
-
-        # (7) installation state
-        for i in range(1, N + 1):
-            for t in range(1, T + 1):
-                tau_min = max(1, t - d[i] + 1)
-                _add_cons(m, 
-                    y[i, t] == quicksum(x[i, tau] for tau in range(tau_min, t + 1)),
-                    f"in_install_{i}_{t}"
-                )
-
-        # (8) installation crew capacity
-        for t in range(1, T + 1):
-            _add_cons(m, quicksum(y[i, t] for i in range(1, N + 1)) <= self.C_install,
-                        f"crew_{t}")
-
-        # (9) arrival once
-        for i in range(1, N + 1):
-            _add_cons(m, quicksum(p[i, t] for t in range(1, T + 1)) == 1,
-                        f"arrive_once_{i}")
-
-        # (10) arrival no later than installation start
-        for i in range(1, N + 1):
-            arr = quicksum(t * p[i, t] for t in range(1, T + 1))
-            sta = quicksum(t * x[i, t] for t in range(1, T + 1))
-            _add_cons(m, arr <= sta, f"arrive_before_install_{i}")
-
-        # (11) site inventory balance
-        for i in range(1, N + 1):
-            # t = 1
-            _add_cons(m, I[i, 1] == p[i, 1] - x[i, 1], f"site_inv_init_{i}")
-            # t >= 2
-            for t in range(2, T + 1):
-                _add_cons(m, 
-                    I[i, t] == I[i, t - 1] + p[i, t] - x[i, t],
-                    f"site_inv_bal_{i}_{t}"
-                )
-
-        # (12) site warehouse capacity
-        for t in range(1, T + 1):
-            _add_cons(m, 
-                quicksum(I[i, t] for i in range(1, N + 1)) <= self.S_site,
-                f"site_cap_{t}"
-            )
-
-        # (13) production -> arrival timing
-        for i in range(1, N + 1):
-            for t in range(1, T + 1):
-                latest_prod = t - D[i] - L[i]
-                if latest_prod >= 1:
-                    _add_cons(m, 
-                        p[i, t] <= quicksum(q[i, tau] for tau in range(1, latest_prod + 1)),
-                        f"prod_to_arrive_{i}_{t}"
-                    )
-                else:
-                    # cannot arrive this early
-                    _add_cons(m, p[i, t] == 0, f"too_early_arrive_{i}_{t}")
-
-        # (14) factory machine capacity
-        for t in range(1, T + 1):
-            _add_cons(m, 
-                quicksum(
-                    q[i, tau]
-                    for i in range(1, N + 1)
-                    for tau in range(max(1, t - D[i] + 1), t + 1)
-                ) <= self.M_machine,
-                f"machine_cap_{t}"
-            )
-
-        # (15) order bundling
-        for t in range(1, T + 1):
-            for i in range(1, N + 1):
-                _add_cons(m, p[i, t] <= z[t], f"link_order_{i}_{t}")
-
-        # (15b) truck load size: a delivery carries between min_batch_size and
-        # max_batch_size modules. u[t] marks the single partial load that the
-        # project is allowed to ship, since N rarely fills every truck exactly.
-        u = {}
-        for t in range(1, T + 1):
-            ub = 1.0 if delivery_lo <= t <= delivery_hi else 0.0
-            u[t] = self._add_bin(m, f"u_{t}", ub)
-
-        _add_cons(m, quicksum(u[t] for t in range(1, T + 1)) <= 1, "single_partial_load")
-        for t in range(1, T + 1):
-            load = quicksum(p[i, t] for i in range(1, N + 1))
-            _add_cons(m, u[t] <= z[t], f"partial_load_needs_delivery_{t}")
-            _add_cons(m, load >= z[t], f"delivery_not_empty_{t}")
-            _add_cons(m, load <= self.max_batch_size * z[t], f"load_max_{t}")
-            _add_cons(m, 
-                load >= self.min_batch_size * z[t] - self.min_batch_size * u[t],
-                f"load_min_{t}"
-            )
-
-        # (16) factory inventory: F1 = 0
-        _add_cons(m, F[1] == 0, "factory_init")
-
-        # (17) factory inventory recursion
-        for s in range(2, T + 1):
-            finished_here = quicksum(
-                q[i, s - D[i]] for i in range(1, N + 1) if s - D[i] >= 1
-            )
-            shipped_here = quicksum(
-                p[i, s + L[i]] for i in range(1, N + 1) if s + L[i] <= T
-            )
-            _add_cons(m, 
-                F[s] == F[s - 1] + finished_here - shipped_here,
-                f"factory_inv_bal_{s}"
-            )
-
-        # (18) factory buffer capacity
-        for s in range(1, T + 1):
-            _add_cons(m, F[s] <= self.S_fac, f"factory_cap_{s}")
-
-        # ============ 5. objective ============
-        # Duration and transport are different units, so each keeps its own
-        # reference. Site and factory storage are both module-periods and share
-        # one, so the weights 0.4 / 0.1 mean a factory wait is a quarter as
-        # costly as the same wait on site.
-        finish_time = quicksum(t * x[dummy_end, t] for t in range(1, T + 1))
-        deliveries = quicksum(z[t] for t in range(1, T + 1))
-        factory_storage = quicksum(F[s] for s in range(1, T + 1))
-        site_storage = quicksum(I[i, t] for i in range(1, N + 1) for t in range(1, T + 1))
-
+        # ---- objective ----
+        n_trucks = sum(z[t] for t in z) if z else 0
+        site_storage = sum(site_wait[i] for i in range(1, N + 1))
+        factory_storage = sum(fac_wait[i] for i in range(1, N + 1))
         ref = self.reference
-        m.setObjective(
-            self.w_duration * finish_time / ref["ref_duration"]
-            + self.w_transport * deliveries / ref["ref_transport"]
-            + self.w_site_storage * site_storage / ref["ref_storage"]
-            + self.w_factory_storage * factory_storage / ref["ref_storage"],
-            "minimize",
+        scale = _OBJ_SCALE
+        coeff_d = int(round(self.w_duration * scale / ref["ref_duration"]))
+        coeff_t = int(round(self.w_transport * scale / ref["ref_transport"]))
+        coeff_s = int(round(self.w_site_storage * scale / ref["ref_storage"]))
+        coeff_f = int(round(self.w_factory_storage * scale / ref["ref_storage"]))
+        if coeff_d == coeff_t == coeff_s == coeff_f == 0:
+            coeff_d = 1
+        m.minimize(
+            coeff_d * finish
+            + coeff_t * n_trucks
+            + coeff_s * site_storage
+            + coeff_f * factory_storage
         )
 
-        # 保存对象
         self.m = m
-        self.x = x
-        self.y = y
-        self.p = p
-        self.I = I
-        self.q = q
+        self.prod_start = prod_start
+        self.arrival = arrival
+        self.install_start = install_start
+        self.finish_var = finish
+        self.site_wait = site_wait
+        self.fac_wait = fac_wait
         self.z = z
-        self.F = F
         self.u = u
-
         return m
 
     def hide_output(self, quiet: bool = True):
-        if self.m is not None:
-            self.m.hideOutput(quiet)
+        self._quiet = bool(quiet)
 
     def binary_counts(self):
-        """(declared binaries, binaries that time windows did not fix to zero)."""
+        """(declared binaries, binaries that time windows did not drop)."""
         return self._n_binaries, self._n_live_binaries
 
     def n_constraints(self) -> int:
-        return 0 if self.m is None else self.m.getNConss()
+        if self.m is None:
+            return 0
+        return len(self.m.proto.constraints)
 
     def n_sols(self) -> int:
-        return 0 if self.m is None else self.m.getNSols()
+        if self._status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            return 1
+        return 0
 
     def solver_status(self) -> Optional[str]:
-        return None if self.m is None else self.m.getStatus()
+        if self._status is None:
+            return None
+        return self._status_name(self._status)
 
     def obj_value(self) -> float:
-        return self.m.getObjVal()
+        if self._true_obj is not None:
+            return self._true_obj
+        if self._solver is None:
+            return 0.0
+        return float(self._solver.objective_value) / _OBJ_SCALE
 
     def dual_bound(self) -> float:
-        return self.m.getDualbound()
+        if self._solver is None:
+            return 0.0
+        return float(self._solver.best_objective_bound) / _OBJ_SCALE
 
     def mip_gap(self) -> float:
-        return self.m.getGap()
-
-    def val(self, var) -> float:
-        return self.m.getVal(var)
+        if self._solver is None:
+            return 0.0
+        obj = float(self._solver.objective_value)
+        if abs(obj) < 1e-9:
+            return 0.0
+        return abs(obj - float(self._solver.best_objective_bound)) / abs(obj)
 
     def load_heuristic_start(self, heur) -> bool:
         """
-        Register the constructive schedule as a SCIP primal heuristic.
+        Register the constructive schedule as a CP-SAT solution hint.
 
-        The horizon T still comes from this schedule. Submitting it as well
-        gives SCIP an incumbent immediately; generic MIP heuristics rarely
-        construct a feasible time-indexed plan on their own.
+        The horizon T still comes from this schedule. Hinting the three start
+        times (and the truck indicators) gives CP-SAT an incumbent immediately.
         """
         if self.m is None or heur is None:
             return False
         self._heuristic_start = heur
-        plugin = _ScheduleStartHeur()
-        plugin.scheduler = self
-        self.m.includeHeur(
-            plugin,
-            "heurschedule",
-            "inject constructive look-ahead schedule",
-            "S",
-            priority=1000000,
-            freq=1,
-            timingmask=SCIP_HEURTIMING.BEFORENODE,
-        )
-        return True
+        return self._apply_heuristic_hints(heur)
 
-    def _inject_heuristic_sol(self, plugin) -> bool:
-        """Fill original-space values so presolve aggregations cannot block the start."""
-        heur = self._heuristic_start
+    def _apply_heuristic_hints(self, heur) -> bool:
         if self.m is None or heur is None:
             return False
-        m = self.m
+        self.m.clear_hints()
         N, T = self.N, self.T
-        d, D, L = self.d, self.D, self.L
-        sol = m.createOrigSol(plugin)
-
-        start_time = 1 if self.reoptimize_from_time is None else max(1, self.reoptimize_from_time)
-        m.setSolVal(sol, self.x[self.dummy_start, start_time], 1.0)
-
-        dummy_end_t = max(int(heur.install_start[i]) + d[i] for i in range(1, N + 1))
-        if self.time_windows is not None:
-            lo, hi = self.time_windows["dummy_end"]
-            dummy_end_t = min(max(dummy_end_t, lo), hi)
-        dummy_end_t = min(max(int(dummy_end_t), 1), T)
-        m.setSolVal(sol, self.x[self.dummy_end, dummy_end_t], 1.0)
-
+        d = {i: _to_int(self.d[i]) for i in range(1, N + 1)}
+        D = {i: _to_int(self.D[i]) for i in range(1, N + 1)}
+        L = {i: _to_int(self.L[i]) for i in range(1, N + 1)}
+        hinted = 0
         arrival_counts = Counter()
         try:
             for i in range(1, N + 1):
@@ -761,171 +622,163 @@ class PrefabScheduler:
                 ps = int(heur.arrival_time[i])
                 if not (1 <= xs <= T and 1 <= qs <= T and 1 <= ps <= T):
                     raise ValueError(f"heuristic times for module {i} outside 1..{T}")
-                m.setSolVal(sol, self.x[i, xs], 1.0)
-                m.setSolVal(sol, self.q[i, qs], 1.0)
-                m.setSolVal(sol, self.p[i, ps], 1.0)
+                self.m.add_hint(self.install_start[i], xs)
+                self.m.add_hint(self.prod_start[i], qs)
+                self.m.add_hint(self.arrival[i], ps)
+                self.m.add_hint(self.site_wait[i], max(0, xs - ps))
+                self.m.add_hint(self.fac_wait[i], max(0, (ps - L[i]) - (qs + D[i])))
                 arrival_counts[ps] += 1
-                last_install = min(T, xs + d[i] - 1)
-                for t in range(xs, last_install + 1):
-                    m.setSolVal(sol, self.y[i, t], 1.0)
-                for t in range(1, T + 1):
-                    m.setSolVal(sol, self.I[i, t], 1.0 if ps <= t < xs else 0.0)
+                hinted += 1
 
-            for t in arrival_counts:
-                m.setSolVal(sol, self.z[t], 1.0)
-            partial = [t for t, c in arrival_counts.items() if c < self.min_batch_size]
-            if partial:
-                m.setSolVal(sol, self.u[partial[0]], 1.0)
+            dummy_end_t = max(int(heur.install_start[i]) + d[i] for i in range(1, N + 1))
+            dummy_end_t = min(max(int(dummy_end_t), 1), T)
+            self.m.add_hint(self.finish_var, dummy_end_t)
 
-            m.setSolVal(sol, self.F[1], 0.0)
-            factory = 0.0
-            for s in range(2, T + 1):
-                finished = sum(
-                    1 for i in range(1, N + 1)
-                    if s - D[i] >= 1 and int(heur.prod_start[i]) == s - D[i]
-                )
-                shipped = sum(
-                    1 for i in range(1, N + 1)
-                    if s + L[i] <= T and int(heur.arrival_time[i]) == s + L[i]
-                )
-                factory = factory + finished - shipped
-                m.setSolVal(sol, self.F[s], factory)
+            for t, zt in self.z.items():
+                self.m.add_hint(zt, 1 if arrival_counts[t] else 0)
+            partial = [t for t, c in arrival_counts.items() if 0 < c < self.min_batch_size]
+            for t, ut in self.u.items():
+                self.m.add_hint(ut, 1 if (partial and t == partial[0]) else 0)
         except Exception as exc:
-            print(f"[MIP start] Could not assemble the heuristic solution: {exc}")
+            print(f"[CP-SAT hint] Could not assemble the heuristic solution: {exc}")
+            self.m.clear_hints()
             return False
 
-        accepted = m.trySol(
-            sol,
-            printreason=True,
-            completely=False,
-            checkbounds=True,
-            checkintegrality=True,
-            checklprows=True,
-        )
-        if accepted:
-            print("[MIP start] Heuristic schedule accepted as a primal solution.")
-        else:
-            print("[MIP start] Heuristic schedule was rejected; SCIP will search from scratch.")
-        return bool(accepted)
+        print(f"[CP-SAT hint] Heuristic schedule hinted for {hinted} modules.")
+        return True
 
     def solve(self, time_limit=None, mip_gap=None, heuristic=None):
         if self.m is None:
             self.build_model()
 
+        if time_limit is not None:
+            self._time_limit = time_limit
+        if mip_gap is not None:
+            self._mip_gap = mip_gap
+
         if heuristic is not None:
             self.load_heuristic_start(heuristic)
 
-        if time_limit is not None:
-            self.m.setParam("limits/time", time_limit)
-        if mip_gap is not None:
-            self.m.setParam("limits/gap", mip_gap)
+        solver = cp_model.CpSolver()
+        self._configure_solver(solver, self._time_limit, self._mip_gap)
+        self._solver = solver
+        self._cached_solution = None
+        self._true_obj = None
 
-        self.m.optimize()
-        return self.m.getStatus()
+        status = solver.solve(self.m)
+        self._status = status
+        name = self._status_name(status)
+
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            sol = self.get_solution_dict()
+            if sol is not None:
+                print(
+                    f"[CP-SAT] {name} in {solver.wall_time:.1f}s: "
+                    f"finish={sol['project_finish_time']}, "
+                    f"trucks={len(sol['order_times'])}, "
+                    f"obj={sol['objective']:.4f}, gap={self.mip_gap():.2%}"
+                )
+        else:
+            print(f"[CP-SAT] {name} in {solver.wall_time:.1f}s (no solution).")
+
+        if not self._quiet:
+            print(solver.response_stats())
+        return name
 
     def get_solution_dict(self) -> Optional[Dict[str, Any]]:
         """
         Extract solution values from the solved model.
         Returns a dictionary with all solution data, or None if model not solved.
         """
-        if self.m is None:
+        if self._cached_solution is not None:
+            return self._cached_solution
+        if self.m is None or self._solver is None:
             return None
-        if self.m.getNSols() == 0:
+        if self._status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             return None
-        status = self.m.getStatus() 
-        solution = {
-            'objective': self.m.getObjVal(),
-            'status': status,
-            'installation_start': {},  # {module_id: time}
-            'arrival_time': {},        # {module_id: time}
-            'production_start': {},    # {module_id: time}
-            'order_times': [],         # list of times when orders are placed
-            'factory_inventory': {},  # {time: inventory_level}
-            'site_inventory': {},     # {(module_id, time): inventory_level}
-            'project_finish_time': None
-        }
-        
+
+        solver = self._solver
         N, T = self.N, self.T
-        x, p, q, F, z = self.x, self.p, self.q, self.F, self.z
-        dummy_end = self.dummy_end
-        getVal = self.m.getVal
-        
-        # Extract installation start times
+        D = {i: _to_int(self.D[i]) for i in range(1, N + 1)}
+        L = {i: _to_int(self.L[i]) for i in range(1, N + 1)}
+
+        installation_start = {i: int(solver.value(self.install_start[i])) for i in range(1, N + 1)}
+        arrival_time = {i: int(solver.value(self.arrival[i])) for i in range(1, N + 1)}
+        production_start = {i: int(solver.value(self.prod_start[i])) for i in range(1, N + 1)}
+        order_times = sorted(t for t, zt in self.z.items() if solver.value(zt) > 0.5)
+        finish = int(solver.value(self.finish_var))
+
+        factory_inventory = {}
+        factory = 0
+        for s in range(2, T + 1):
+            finished = sum(
+                1 for i in range(1, N + 1) if production_start[i] + D[i] == s
+            )
+            shipped = sum(
+                1 for i in range(1, N + 1) if arrival_time[i] - L[i] == s
+            )
+            factory = factory + finished - shipped
+            if factory > 1e-6:
+                factory_inventory[s] = factory
+
+        site_inventory = {}
         for i in range(1, N + 1):
-            for t in range(1, T + 1):
-                if getVal(x[i, t]) > 0.5:
-                    solution['installation_start'][i] = t
-                    break
-        
-        # Extract arrival times
-        for i in range(1, N + 1):
-            for t in range(1, T + 1):
-                if getVal(p[i, t]) > 0.5:
-                    solution['arrival_time'][i] = t
-                    break
-        
-        # Extract production start times
-        for i in range(1, N + 1):
-            for t in range(1, T + 1):
-                if getVal(q[i, t]) > 0.5:
-                    solution['production_start'][i] = t
-                    break
-        
-        # Extract order times
-        for t in range(1, T + 1):
-            if getVal(z[t]) > 0.5:
-                solution['order_times'].append(t)
-        
-        # Extract factory inventory
-        for s in range(1, T + 1):
-            val = getVal(F[s])
-            if val > 1e-6:
-                solution['factory_inventory'][s] = val
-        
-        # Extract site inventory
-        for i in range(1, N + 1):
-            for t in range(1, T + 1):
-                val = getVal(self.I[i, t])
-                if val > 1e-6:
-                    solution['site_inventory'][(i, t)] = val
-        
-        # Extract project finish time
-        for t in range(1, T + 1):
-            if getVal(x[dummy_end, t]) > 0.5:
-                solution['project_finish_time'] = t
-                break
-        
+            for t in range(arrival_time[i], installation_start[i]):
+                site_inventory[(i, t)] = 1
+
+        site_total = sum(
+            max(0, installation_start[i] - arrival_time[i]) for i in range(1, N + 1)
+        )
+        factory_total = sum(
+            max(0, (arrival_time[i] - L[i]) - (production_start[i] + D[i]))
+            for i in range(1, N + 1)
+        )
+        true_obj = self._true_objective(finish, len(order_times), site_total, factory_total)
+        self._true_obj = true_obj
+
+        solution = {
+            "objective": true_obj,
+            "status": self._status_name(self._status),
+            "installation_start": installation_start,
+            "arrival_time": arrival_time,
+            "production_start": production_start,
+            "order_times": order_times,
+            "factory_inventory": factory_inventory,
+            "site_inventory": site_inventory,
+            "project_finish_time": finish,
+        }
+        self._cached_solution = solution
         return solution
 
-    def save_results_to_db(self, 
-                          engine: Engine, 
+    def save_results_to_db(self,
+                          engine: Engine,
                           project_id: int,
                           module_id_mapping: Optional[Dict[int, str]] = None,
                           version_id: Optional[int] = None) -> bool:
         """
         Save optimization results to the database.
-        
+
         For each project, this creates/maintains:
         - raw_schedule_{project_id}: Input data from user's file (read-only, managed by datamanager)
         - solution_schedule_{project_id}: Optimization solution results (this method creates/updates)
         - optimization_summary_{project_id}: Project-level summary statistics
         - factory_inventory_{project_id}: Factory inventory levels over time
         - site_inventory_{project_id}: Site inventory levels over time
-        
+
         Args:
             engine: SQLAlchemy Engine instance
             project_id: Project ID to save results for
             module_id_mapping: Optional mapping from module index (1..N) to module ID string.
                              If None, uses module index as ID.
             version_id: Optional version ID for version management. If None, uses latest version.
-        
+
         Returns:
             True if successful, False otherwise
         """
         solution = self.get_solution_dict()
         if solution is None:
             return False
-        
+
         try:
             # Get table names from datamanager if available
             try:
@@ -940,18 +793,18 @@ class PrefabScheduler:
                 summary_table = f'optimization_summary_{project_id}'
                 factory_inv_table = f'factory_inventory_{project_id}'
                 site_inv_table = f'site_inventory_{project_id}'
-            
+
             # Create results DataFrame
             results_data = []
             N = self.N
-            
+
             for i in range(1, N + 1):
                 module_id = module_id_mapping[i] if module_id_mapping else f"Module_{i}"
                 install_start = solution['installation_start'].get(i)
                 arrival_time = solution['arrival_time'].get(i)
                 prod_start = solution['production_start'].get(i)
                 prod_duration = self.D.get(i, 0)
-                prod_finish = prod_start + prod_duration -1 if prod_start else None 
+                prod_finish = prod_start + prod_duration -1 if prod_start else None
                 factory_wait_start = prod_finish + 1
                 onsite_wait_start = arrival_time
                 onsite_wait_duration = install_start - onsite_wait_start  # Duration is the difference between time indices
@@ -959,11 +812,11 @@ class PrefabScheduler:
                 transport_start = arrival_time - transport_duration if arrival_time else None
                 factory_wait_duration = transport_start - factory_wait_start  # Duration is the difference between time indices
                 install_duration = self.d.get(i, 0)
-                install_finish = install_start + install_duration -1 if install_start else None 
-                
+                install_finish = install_start + install_duration -1 if install_start else None
+
                 # Debug: Print when factory_wait_duration is 1 to understand why
                 print(f"Module {module_id}, prod_start: {prod_start}, prod_finish: {prod_finish}, factory_wait_start: {factory_wait_start}, factory_wait_duration: {factory_wait_duration}")
-                
+
                 results_data.append({
                     'Module_ID': module_id,
                     'Module_Index': i,
@@ -981,9 +834,9 @@ class PrefabScheduler:
                     'Transport_Duration': transport_duration,
                     'version_id': version_id
                 })
-            
+
             results_df = pd.DataFrame(results_data)
-            
+
             # Ensure solution table has version_id column and delete old data for this version if table exists
             with engine.begin() as conn:
                 from sqlalchemy import inspect
@@ -993,7 +846,7 @@ class PrefabScheduler:
                     columns = [col['name'] for col in inspector.get_columns(solution_table)]
                     if 'version_id' not in columns:
                         conn.exec_driver_sql(f'ALTER TABLE "{solution_table}" ADD COLUMN version_id INTEGER')
-                    
+
                     # Delete old data for this version before appending new data
                     if version_id is not None:
                         # Delete old data for this specific version
@@ -1005,17 +858,17 @@ class PrefabScheduler:
                         delete_query = text(f'DELETE FROM "{solution_table}" WHERE version_id IS NULL')
                         conn.execute(delete_query)
                 # If table doesn't exist, it will be created by to_sql with append mode
-            
+
             # Append new data (table will be created automatically if it doesn't exist)
             results_df.to_sql(
-                solution_table, 
-                engine, 
-                if_exists='append', 
+                solution_table,
+                engine,
+                if_exists='append',
                 index=False,
                 method='multi',
                 chunksize=1000
             )
-            
+
             # Also create a summary table with project-level results
             # ---- 版本累计策略 ----
             # 为 optimization_summary_{project_id} 增加 version_id 字段，
@@ -1031,7 +884,7 @@ class PrefabScheduler:
                 'num_orders': len(solution['order_times']),
                 'order_times': ','.join(map(str, sorted(solution['order_times'])))
             }]
-            
+
             summary_df = pd.DataFrame(summary_data)
 
             # 确保 summary 表存在 version_id 列，并按版本做“先删再插”
@@ -1060,7 +913,7 @@ class PrefabScheduler:
                 if_exists='append',
                 index=False
             )
-            
+
             # Create factory inventory table
             if solution['factory_inventory']:
                 factory_inv_data = [
@@ -1074,7 +927,7 @@ class PrefabScheduler:
                     if_exists='replace',
                     index=False
                 )
-            
+
             # Create site inventory table
             if solution['site_inventory']:
                 site_inv_data = [
@@ -1089,7 +942,7 @@ class PrefabScheduler:
                     index=False
                 )
             return True
-            
+
         except Exception as e:
             print(f"Error saving results to database: {e}")
             return False

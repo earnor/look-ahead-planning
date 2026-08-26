@@ -7,7 +7,8 @@ from datetime import datetime
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
-    QDoubleSpinBox, QDateTimeEdit, QLineEdit, QDialogButtonBox
+    QDoubleSpinBox, QSpinBox, QDateTimeEdit, QLineEdit, QDialogButtonBox,
+    QFormLayout,
 )
 from PyQt6.QtCore import QDateTime, QLocale
 
@@ -109,4 +110,72 @@ class DelayInputDialog(QDialog):
             "delay_hours": self.delay_hours_spin.value(),
             "detected_at_datetime": self.tau_datetime.dateTime().toString("yyyy-MM-dd HH:mm:ss"),
             "reason": self.reason_input.text() or None
+        }
+
+
+class AddModuleDialog(QDialog):
+    """Collect a new module's name, durations, and installation precedence."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Module")
+        self.setMinimumWidth(460)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("e.g. VS-03-01")
+        form.addRow("Module name:", self.name_input)
+
+        self.production_spin = self._duration_spin()
+        self.transport_spin = self._duration_spin()
+        self.installation_spin = self._duration_spin()
+        form.addRow("Production duration (h):", self.production_spin)
+        form.addRow("Transportation duration (h):", self.transport_spin)
+        form.addRow("Installation duration (h):", self.installation_spin)
+
+        self.precedence_input = QLineEdit()
+        self.precedence_input.setPlaceholderText("e.g. VS-02-21, VS-02-22")
+        form.addRow("Precedence:", self.precedence_input)
+        layout.addLayout(form)
+
+        hint = QLabel(
+            "Precedence is a comma-separated list of existing module IDs that must "
+            "finish installation before this module can start. Leave blank if none."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("font-size: 11px; color: #6B7280;")
+        layout.addWidget(hint)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+    @staticmethod
+    def _duration_spin() -> QSpinBox:
+        spin = QSpinBox()
+        spin.setMinimum(1)
+        spin.setMaximum(999)
+        spin.setValue(1)
+        return spin
+
+    def accept(self):
+        if not self.name_input.text().strip():
+            self.name_input.setFocus()
+            self.name_input.setPlaceholderText("Module name is required")
+            return
+        super().accept()
+
+    def get_module_info(self) -> dict:
+        return {
+            "module_id": self.name_input.text().strip(),
+            "production_duration": self.production_spin.value(),
+            "transportation_duration": self.transport_spin.value(),
+            "installation_duration": self.installation_spin.value(),
+            "precedence": self.precedence_input.text().strip() or None,
         }

@@ -21,11 +21,13 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import QDateTime, QTime, QLocale
 from pathlib import Path
+import shutil
 from sqlalchemy import create_engine
+from planning_tool.costs import count_handover_working_days, parse_project_start_date
 from planning_tool.datamanager import ScheduleDataManager
 from planning_tool.ui.widgets import KpiCard, Card, FileDropArea, Chip
 from planning_tool.ui.components import DashboardTable, StatusCell
-from planning_tool.ui.dialogs import DelayInputDialog
+from planning_tool.ui.dialogs import DelayInputDialog, AddModuleDialog
 from planning_tool.rescheduler import allowed_delay_types, delay_type_hint
 import pandas as pd
 import matplotlib
@@ -82,7 +84,7 @@ class DashboardPage(QWidget):
         self.card_critical_tasks = KpiCard(
             "Critical Tasks",
             "0",
-            "Requiring attention",
+            "No delays",
             "",
             accent_color="#F59E0B"  # Orange accent
         )
@@ -146,6 +148,7 @@ class DashboardPage(QWidget):
 
 class UploadPage(QWidget):
     projectCreated = pyqtSignal(int, str)  # (project_id, project_name)
+    EXAMPLE_CSV = Path(__file__).resolve().parents[3] / "data" / "test_input.csv"
     
     def __init__(self, engine, parent=None):
         super().__init__(parent)
@@ -157,7 +160,24 @@ class UploadPage(QWidget):
         root.setSpacing(60)
 
         # ------------------ Card 1: Schedule Data Import ------------------
-        card1 = Card("Schedule Data Import", trailing_widget=None)
+        download_btn = QPushButton("Download example CSV")
+        download_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        download_btn.setStyleSheet("""
+            QPushButton {
+                background: #FFFFFF;
+                color: #1D4ED8;
+                border: 1px solid #BFDBFE;
+                border-radius: 6px;
+                padding: 6px 12px;
+                font-size: 13px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background: #EFF6FF;
+            }
+        """)
+        download_btn.clicked.connect(self._download_example_csv)
+        card1 = Card("Schedule Data Import", trailing_widget=download_btn)
         drop1 = FileDropArea(
             title="Schedule Data Import",
             exts=[".csv"],
@@ -189,7 +209,7 @@ class UploadPage(QWidget):
         card2 = Card("3D Building Model Upload")
         drop2 = FileDropArea(
             title="3D Building Model Upload",
-            exts=[".rvt"],
+            exts=[".ifc"],
         )
         drop2.fileSelected.connect(self.on_model_files)
         card2.body.addWidget(drop2)
@@ -208,6 +228,28 @@ class UploadPage(QWidget):
         root.addStretch(1)
 
     # ---------------- callbacks ----------------
+
+    def _download_example_csv(self):
+        source = self.EXAMPLE_CSV
+        if not source.is_file():
+            QMessageBox.warning(
+                self,
+                "Example Not Found",
+                f"Could not find the example file:\n{source}",
+            )
+            return
+        dest, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save example CSV",
+            "test_input.csv",
+            "CSV Files (*.csv);;All Files (*)",
+        )
+        if not dest:
+            return
+        try:
+            shutil.copyfile(source, dest)
+        except OSError as exc:
+            QMessageBox.critical(self, "Download Failed", str(exc))
 
     def on_model_files(self, path: str):
         # TODO: 在这里解析IFC/GLTF等或触发后端处理
@@ -493,9 +535,11 @@ class SchedulePage(QWidget):
 
         # connect calculate button to a handler in parent window via signal/slot later
         # we expose it as an attribute so MainWindow can wire it
+        self.btn_add = btn_add
         self.btn_calculate = btn_calculate
         self.btn_export = btn_export
-        
+        self.btn_add.clicked.connect(self._on_add_module_clicked)
+
         return bar
 
     def _build_table(self) -> QTableWidget:
@@ -535,6 +579,57 @@ class SchedulePage(QWidget):
         # store for later population
         self.table = table
         return table
+
+    def _on_add_module_clicked(self):
+        project_id = self.project_id
+        if project_id is None and getattr(self, "main_window", None):
+            project_id = getattr(self.main_window, "current_project_id", None)
+        if project_id is None:
+            QMessageBox.warning(
+                self, "No Project",
+                "Please select or create a project before adding a module.",
+            )
+            return
+        if not getattr(self, "main_window", None) or not getattr(self.main_window, "mgr", None):
+            QMessageBox.warning(self, "Error", "Cannot add module: data manager is not available.")
+            return
+
+        try:
+            self.main_window.mgr.list_raw_module_ids(project_id)
+        except ValueError as e:
+            QMessageBox.warning(self, "Cannot Add Module", str(e))
+            return
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to read input modules:\n{e}")
+            return
+
+        dialog = AddModuleDialog(parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        info = dialog.get_module_info()
+        try:
+            self.main_window.mgr.add_raw_module(
+                project_id,
+                module_id=info["module_id"],
+                installation_duration=info["installation_duration"],
+                production_duration=info["production_duration"],
+                transportation_duration=info["transportation_duration"],
+                precedence=info["precedence"],
+            )
+        except ValueError as e:
+            QMessageBox.warning(self, "Cannot Add Module", str(e))
+            return
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to add module:\n{e}")
+            return
+
+        QMessageBox.information(
+            self,
+            "Module Added",
+            f'Module "{info["module_id"]}" was added to the project input data.\n'
+            "It will be included the next time you click Calculate.",
+        )
     
     def _on_delay_cell_double_clicked(self, row: int, col: int):
         """Handle double-click on Delay columns"""
@@ -832,6 +927,20 @@ class SchedulePage(QWidget):
         return info_widget
 
 
+class _FocusWheelTimeEdit(QTimeEdit):
+    """Time stepper: mouse-wheel only changes the value after the field is clicked."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
 class SettingsPage(QWidget):
     """Settings page for configuring project parameters"""
 
@@ -843,6 +952,7 @@ class SettingsPage(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.main_window = None
         self._build_ui()
     
     def _build_ui(self):
@@ -889,7 +999,7 @@ class SettingsPage(QWidget):
         """)
         save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         layout.addWidget(save_btn, alignment=Qt.AlignmentFlag.AlignCenter)
-        save_btn.clicked.connect(self._save_settings)
+        save_btn.clicked.connect(self._on_save_clicked)
         
         scroll.setWidget(content)
         
@@ -1049,7 +1159,7 @@ class SettingsPage(QWidget):
         start_label = QLabel("Start Time:")
         start_label.setStyleSheet("font-size: 12px; color: #6B7280;")
         start_time_layout.addWidget(start_label)
-        self.work_start_time = QTimeEdit()
+        self.work_start_time = _FocusWheelTimeEdit()
         self.work_start_time.setLocale(QLocale(QLocale.Language.English, QLocale.Country.Switzerland))
         self.work_start_time.setTime(QTime(8, 0))
         self.work_start_time.setDisplayFormat("hh:mm AP")
@@ -1071,7 +1181,7 @@ class SettingsPage(QWidget):
         end_label = QLabel("End Time:")
         end_label.setStyleSheet("font-size: 12px; color: #6B7280;")
         end_time_layout.addWidget(end_label)
-        self.work_end_time = QTimeEdit()
+        self.work_end_time = _FocusWheelTimeEdit()
         self.work_end_time.setLocale(QLocale(QLocale.Language.English, QLocale.Country.Switzerland))
         self.work_end_time.setTime(QTime(17, 0))
         self.work_end_time.setDisplayFormat("hh:mm AP")
@@ -1101,7 +1211,7 @@ class SettingsPage(QWidget):
         break_start_label = QLabel("Break Start:")
         break_start_label.setStyleSheet("font-size: 12px; color: #6B7280;")
         break_start_layout.addWidget(break_start_label)
-        self.break_start_time = QTimeEdit()
+        self.break_start_time = _FocusWheelTimeEdit()
         self.break_start_time.setLocale(QLocale(QLocale.Language.English, QLocale.Country.Switzerland))
         self.break_start_time.setTime(QTime(12, 0))
         self.break_start_time.setDisplayFormat("hh:mm AP")
@@ -1123,7 +1233,7 @@ class SettingsPage(QWidget):
         break_end_label = QLabel("Break End:")
         break_end_label.setStyleSheet("font-size: 12px; color: #6B7280;")
         break_end_layout.addWidget(break_end_label)
-        self.break_end_time = QTimeEdit()
+        self.break_end_time = _FocusWheelTimeEdit()
         self.break_end_time.setLocale(QLocale(QLocale.Language.English, QLocale.Country.Switzerland))
         self.break_end_time.setTime(QTime(13, 0))
         self.break_end_time.setDisplayFormat("hh:mm AP")
@@ -1306,6 +1416,29 @@ class SettingsPage(QWidget):
         if widget.date() == widget.minimumDate():
             return self.UNSET_DATE_TEXT
         return widget.date().toString("MM/dd/yyyy")
+
+    def apply_project_start_date(self, start_str: str | None, locked: bool = False):
+        """Fill the start-date field from the project record and lock it after the first Calculate."""
+        self.start_datetime.blockSignals(True)
+        qdate = QDate.fromString(str(start_str or "").strip(), "MM/dd/yyyy")
+        if qdate.isValid():
+            self.start_datetime.setDate(qdate)
+        else:
+            self.start_datetime.setDate(self.UNSET_DATE)
+        self.start_datetime.setEnabled(not locked)
+        self.start_datetime.setCalendarPopup(not locked)
+        if locked:
+            self.start_datetime.setToolTip(
+                "Start date is fixed for this project after the first Calculate."
+            )
+        else:
+            self.start_datetime.setToolTip("")
+        self.start_datetime.blockSignals(False)
+
+    def _on_save_clicked(self):
+        settings = self._save_settings()
+        if self.main_window:
+            self.main_window._on_project_variables_saved(settings)
 
     def _save_settings(self):
         return {
@@ -1569,7 +1702,7 @@ class ComparisonPage(QWidget):
             "Construction Hours",
             "Factory Storage Module Hours",
             "Site Storage Module Hours",
-            "Transport Bunch Number"
+            "Transport Batch Number"
         ]
 
         self.metric_cards = {}
@@ -1690,17 +1823,7 @@ class ComparisonPage(QWidget):
 
     @staticmethod
     def _parse_project_start_date(start_datetime_str: Optional[str], settings: Optional[dict]) -> Optional[date]:
-        candidates = [start_datetime_str]
-        if settings:
-            candidates.append(settings.get("start_datetime"))
-        for src in candidates:
-            if not src or str(src).strip().lower() in ("", "mm/dd/yyyy"):
-                continue
-            try:
-                return datetime.strptime(str(src).strip(), "%m/%d/%Y").date()
-            except ValueError:
-                continue
-        return None
+        return parse_project_start_date(start_datetime_str, settings)
 
     def _count_handover_working_days(
         self,
@@ -1709,30 +1832,12 @@ class ComparisonPage(QWidget):
         start_date: Optional[date],
     ) -> Optional[int]:
         """Working days from project start through latest installation finish (calendar days, not hours)."""
-        if solution_df.empty or start_date is None or not settings:
-            return None
-        if "Installation_Finish" not in solution_df.columns:
-            return None
-        finishes = solution_df["Installation_Finish"].dropna()
-        if finishes.empty:
-            return None
-        finish_idx = int(float(finishes.max()))
-        if finish_idx < 1:
-            return None
-        if not hasattr(self, "main_window") or not self.main_window:
-            return None
-        try:
-            slots = self.main_window._build_working_calendar_slots(settings, start_date, finish_idx)
-        except Exception:
-            return None
-        if finish_idx >= len(slots) or slots[finish_idx] is None:
-            return None
-        used_dates = {
-            slots[idx].date()
-            for idx in range(1, finish_idx + 1)
-            if idx < len(slots) and slots[idx] is not None
-        }
-        return len(used_dates)
+        build_slots = None
+        if hasattr(self, "main_window") and self.main_window:
+            build_slots = self.main_window._build_working_calendar_slots
+        return count_handover_working_days(
+            solution_df, settings, start_date, build_slots
+        )
 
     @staticmethod
     def _peak_site_occupancy(solution_df: pd.DataFrame) -> int:
@@ -1842,8 +1947,8 @@ class ComparisonPage(QWidget):
             v1_str = f"{v1_value:.1f} hours" if v1_value > 0 else "0 hours"
             v2_str = f"{v2_value:.1f} hours" if v2_value > 0 else "0 hours"
         elif "Number" in metric_name:
-            v1_str = f"{int(v1_value)} bunches" if v1_value > 0 else "0 bunches"
-            v2_str = f"{int(v2_value)} bunches" if v2_value > 0 else "0 bunches"
+            v1_str = f"{int(v1_value)} batches" if v1_value > 0 else "0 batches"
+            v2_str = f"{int(v2_value)} batches" if v2_value > 0 else "0 batches"
         else:
             v1_str = str(v1_value) if v1_value > 0 else "0"
             v2_str = str(v2_value) if v2_value > 0 else "0"
@@ -2347,35 +2452,8 @@ class ComparisonPage(QWidget):
             lower_metrics = self._calculate_metrics(lower_df, settings=settings, start_date=start_date)
             self._last_upper_metrics = upper_metrics
             self._last_lower_metrics = lower_metrics
-            
-            # Update metric cards
-            if hasattr(self, 'metric_cards'):
-                self._update_metric_card(
-                    self.metric_cards["Construction Hours"],
-                    "Construction Hours",
-                    upper_metrics["construction_days"],
-                    lower_metrics["construction_days"]
-                )
-                self._update_metric_card(
-                    self.metric_cards["Factory Storage Module Hours"],
-                    "Factory Storage Module Hours",
-                    upper_metrics["factory_storage_module_days"],
-                    lower_metrics["factory_storage_module_days"]
-                )
-                self._update_metric_card(
-                    self.metric_cards["Site Storage Module Hours"],
-                    "Site Storage Module Hours",
-                    upper_metrics["site_storage_module_days"],
-                    lower_metrics["site_storage_module_days"]
-                )
-                self._update_metric_card(
-                    self.metric_cards["Transport Bunch Number"],
-                    "Transport Bunch Number",
-                    upper_metrics["transport_bunch_number"],
-                    lower_metrics["transport_bunch_number"]
-                )
 
-            # Draw charts with date annotations
+            # Draw charts before metrics so a card-key mismatch cannot blank the Gantt.
             print(f"[DEBUG] Drawing charts...")
             self._draw_gantt_chart(self.upper_gantt_canvas, upper_df, upper_label,
                                   settings=settings,
@@ -2383,10 +2461,40 @@ class ComparisonPage(QWidget):
             self._draw_gantt_chart(self.lower_gantt_canvas, lower_df, lower_label,
                                   settings=settings,
                                   project_start_datetime=lower_start_datetime or project_start_datetime)
-            # Force UI update
             from PyQt6.QtWidgets import QApplication
             QApplication.processEvents()
             print(f"[DEBUG] Charts drawn")
+
+            try:
+                if hasattr(self, 'metric_cards'):
+                    self._update_metric_card(
+                        self.metric_cards["Construction Hours"],
+                        "Construction Hours",
+                        upper_metrics["construction_days"],
+                        lower_metrics["construction_days"]
+                    )
+                    self._update_metric_card(
+                        self.metric_cards["Factory Storage Module Hours"],
+                        "Factory Storage Module Hours",
+                        upper_metrics["factory_storage_module_days"],
+                        lower_metrics["factory_storage_module_days"]
+                    )
+                    self._update_metric_card(
+                        self.metric_cards["Site Storage Module Hours"],
+                        "Site Storage Module Hours",
+                        upper_metrics["site_storage_module_days"],
+                        lower_metrics["site_storage_module_days"]
+                    )
+                    self._update_metric_card(
+                        self.metric_cards["Transport Batch Number"],
+                        "Transport Batch Number",
+                        upper_metrics["transport_bunch_number"],
+                        lower_metrics["transport_bunch_number"]
+                    )
+            except Exception as e:
+                print(f"Error updating comparison metrics: {e}")
+                import traceback
+                traceback.print_exc()
             
         except Exception as e:
             print(f"Error loading Gantt data: {e}")
