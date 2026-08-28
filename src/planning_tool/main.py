@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout, QVBoxLayout, QGridLayout, QTableWidget, QTableWidgetItem, QHeaderView,
     QSizePolicy, QSpacerItem, QButtonGroup, QStackedWidget, QFileDialog, QMessageBox, QProgressBar,
     QSplitter, QCheckBox, QGroupBox, QScrollArea, QInputDialog, QDateTimeEdit, QTimeEdit, QDialog,
-    QDialogButtonBox, QSpinBox, QDoubleSpinBox
+    QDialogButtonBox, QSpinBox, QDoubleSpinBox, QProgressDialog
 )
 from PyQt6.QtCore import QDateTime, QTime, QDate, QLocale
 from pathlib import Path
@@ -19,7 +19,6 @@ from planning_tool.warm_start import (
     construct_solution,
     horizon_from_makespan,
     horizon_from_remaining,
-    reference_values,
     trivial_horizon_bound,
 )
 from planning_tool.rescheduler import (
@@ -33,11 +32,25 @@ from planning_tool.rescheduler import (
 )
 from datetime import datetime, time, timedelta
 import traceback
+from planning_tool.costs import (
+    DEFAULT_CONSTRUCTION_DAY_COST,
+    DEFAULT_TRANSPORT_BATCH_COST,
+    daily_construction_from_rates,
+    hours_per_working_day,
+    parse_cost_setting,
+    transport_batch_from_rates,
+)
 from planning_tool.ui import (
     DashboardPage, SchedulePage, UploadPage, SettingsPage, ComparisonPage, CostsPage,
     TopBar, Sidebar, DashboardTable, StatusCell,
-    DelayInputDialog, Card, FileDropArea, Chip
+    DelayInputDialog, Card, FileDropArea, Chip, ModelViewerDialog
 )
+
+# Qt WebEngine must be imported before QApplication is created on Windows.
+try:
+    from PyQt6.QtWebEngineWidgets import QWebEngineView  # noqa: F401
+except ImportError:
+    pass
 
 # Resolved from the source tree so the app finds the same database no matter
 # which directory it is launched from.
@@ -92,10 +105,13 @@ class MainWindow(QMainWindow):
 
         try:
             page_upload = UploadPage(engine=self.engine)
+            self.page_upload = page_upload
+            page_upload.main_window = self
             # Connect signal to update project combo in topbar
             page_upload.projectCreated.connect(self._on_project_created)
         except NameError:
             page_upload = QLabel("Upload"); page_upload.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.page_upload = None
 
         try:
             page_settings = SettingsPage()
@@ -131,6 +147,8 @@ class MainWindow(QMainWindow):
             "settings":  self.stack.addWidget(page_settings),
         }
         self.stack.setCurrentIndex(self.page_index["dashboard"])
+        if self.page_settings is not None:
+            self.page_settings.sync_objective_costs_from_rates()
         self._refresh_start_date_widget()
 
         # wire calculate button (SchedulePage) -> MainWindow handler
@@ -256,6 +274,324 @@ class MainWindow(QMainWindow):
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save delay: {str(e)}")
+
+    def _accumulated_delay_hours(
+        self,
+        project_id: int,
+        version_id: int | None,
+        *,
+        include_pending: bool = False,
+    ) -> tuple[dict[tuple[str, str], float], set[str], dict[tuple[str, str], float]]:
+        """Delay hours on this version: earlier versions, this version, and optionally pending rows."""
+        empty: dict[tuple[str, str], float] = {}
+        if project_id is None:
+            return empty, set(), empty
+        delay_table = ScheduleDataManager.delay_updates_table_name(project_id)
+        versions_table = ScheduleDataManager.optimization_versions_table_name(project_id)
+        inspector = inspect(self.engine)
+        tables = inspector.get_table_names()
+        if delay_table not in tables:
+            return empty, set(), empty
+
+        version_number = None
+        if version_id is not None and versions_table in tables:
+            with self.engine.begin() as conn:
+                version_number = conn.execute(
+                    text(
+                        f'SELECT version_number FROM "{versions_table}" '
+                        f"WHERE version_id = :version_id"
+                    ),
+                    {"version_id": version_id},
+                ).scalar()
+
+        clauses = []
+        params: dict = {}
+        if include_pending:
+            clauses.append("d.version_id IS NULL")
+        if version_number is not None and versions_table in tables:
+            clauses.append(
+                "(d.version_id IS NOT NULL AND v.version_number IS NOT NULL "
+                "AND v.version_number <= :vn)"
+            )
+            params["vn"] = int(version_number)
+        elif version_id is not None:
+            clauses.append("d.version_id = :version_id")
+            params["version_id"] = int(version_id)
+
+        if not clauses:
+            return empty, set(), empty
+
+        join_sql = ""
+        if versions_table in tables:
+            join_sql = f'LEFT JOIN "{versions_table}" v ON d.version_id = v.version_id'
+        query = (
+            f'SELECT d.module_id, d.phase, d.delay_hours, d.delay_type '
+            f'FROM "{delay_table}" d {join_sql} WHERE ' + " OR ".join(clauses)
+        )
+        try:
+            delays_df = pd.read_sql(text(query), self.engine, params=params)
+        except Exception as e:
+            print(f"Warning: Could not load accumulated delays: {e}")
+            return empty, set(), empty
+
+        hours_map: dict[tuple[str, str], float] = {}
+        extension_map: dict[tuple[str, str], float] = {}
+        modules: set[str] = set()
+        for _, delay_row in delays_df.iterrows():
+            module_id = str(delay_row["module_id"])
+            phase = str(delay_row["phase"]).upper()
+            delay_hours = float(delay_row["delay_hours"] or 0)
+            if delay_hours <= 0:
+                continue
+            key = (module_id, phase)
+            hours_map[key] = hours_map.get(key, 0.0) + delay_hours
+            delay_type = str(delay_row.get("delay_type") or "").upper()
+            if delay_type == "DURATION_EXTENSION":
+                extension_map[key] = extension_map.get(key, 0.0) + delay_hours
+            modules.add(module_id)
+        return hours_map, modules, extension_map
+
+    def _raw_module_durations(self, project_id: int) -> dict[str, dict[str, int]]:
+        """Original input durations keyed by module id and phase."""
+        raw = self.mgr.raw_table_name(project_id)
+        inspector = inspect(self.engine)
+        if raw not in inspector.get_table_names():
+            return {}
+        df = pd.read_sql_table(raw, self.engine)
+        id_col = next((c for c in ("Module_ID", "Module ID") if c in df.columns), None)
+        if id_col is None:
+            return {}
+        out: dict[str, dict[str, int]] = {}
+
+        def as_hours(value) -> int:
+            if value is None:
+                return 0
+            try:
+                if pd.isna(value):
+                    return 0
+            except (TypeError, ValueError):
+                pass
+            return int(float(value))
+
+        for _, row in df.iterrows():
+            module_id = str(row[id_col]).strip()
+            if not module_id:
+                continue
+            out[module_id] = {
+                "FABRICATION": as_hours(row.get("Production Duration")),
+                "TRANSPORT": as_hours(row.get("Transportation Duration")),
+                "INSTALLATION": as_hours(row.get("Installation Duration")),
+            }
+        return out
+
+    @staticmethod
+    def _duration_for_display(
+        stored, raw: int | None, extension_hours: float
+    ) -> int:
+        """Show planned duration including duration extensions, without double-counting."""
+        stored_i = int(stored or 0)
+        extra = int(math.ceil(float(extension_hours or 0)))
+        if extra <= 0 or raw is None:
+            return stored_i
+        return max(stored_i, int(raw) + extra)
+
+    def _apply_recorded_duration_extensions(
+        self,
+        I_d: dict[int, int],
+        D: dict[int, int],
+        L: dict[int, int],
+        id_to_index: dict[str, int],
+    ) -> None:
+        """Keep previously recorded duration extensions on later Calculates."""
+        if self.current_project_id is None:
+            return
+        delay_table = ScheduleDataManager.delay_updates_table_name(self.current_project_id)
+        inspector = inspect(self.engine)
+        if delay_table not in inspector.get_table_names():
+            return
+        query = (
+            f'SELECT module_id, phase, delay_hours FROM "{delay_table}" '
+            f"WHERE delay_type = 'DURATION_EXTENSION' AND version_id IS NOT NULL"
+        )
+        try:
+            delays_df = pd.read_sql(text(query), self.engine)
+        except Exception as e:
+            print(f"Warning: Could not load recorded duration extensions: {e}")
+            return
+        extras: dict[tuple[str, str], float] = {}
+        for _, row in delays_df.iterrows():
+            key = (str(row["module_id"]), str(row["phase"]).upper())
+            extras[key] = extras.get(key, 0.0) + float(row["delay_hours"] or 0)
+        for (module_id, phase), hours in extras.items():
+            idx = id_to_index.get(module_id)
+            if idx is None or hours <= 0:
+                continue
+            added = int(math.ceil(hours))
+            if phase == "FABRICATION" and idx in D:
+                D[idx] = int(D[idx]) + added
+            elif phase == "TRANSPORT" and idx in L:
+                L[idx] = int(L[idx]) + added
+            elif phase == "INSTALLATION" and idx in I_d:
+                I_d[idx] = int(I_d[idx]) + added
+
+    def _version_0_solution_df(self) -> pd.DataFrame | None:
+        """Original plan (Version 0), used as the baseline for start postponement."""
+        if self.current_project_id is None:
+            return None
+        solution_table = self.mgr.solution_table_name(self.current_project_id)
+        versions_table = self.mgr.optimization_versions_table_name(self.current_project_id)
+        inspector = inspect(self.engine)
+        tables = inspector.get_table_names()
+        if solution_table not in tables or versions_table not in tables:
+            return None
+        query = (
+            f'SELECT s.* FROM "{solution_table}" s '
+            f'JOIN "{versions_table}" v ON s.version_id = v.version_id '
+            f"WHERE v.version_number = 0"
+        )
+        try:
+            df = pd.read_sql(text(query), self.engine)
+        except Exception as e:
+            print(f"Warning: Could not load Version 0 starts: {e}")
+            return None
+        return None if df.empty else df
+
+    def _postponement_earliest_bounds(
+        self,
+        id_to_index: dict[str, int],
+        L: dict[int, int],
+        *,
+        include_pending: bool = False,
+    ) -> dict[str, dict[int, int]]:
+        """
+        Persistent START_POSTPONEMENT lower bounds: Version 0 planned start + accumulated hours.
+        Transport is converted to an earliest-arrival bound (start + travel duration).
+        """
+        empty = {
+            "earliest_production_starts": {},
+            "earliest_arrival_times": {},
+            "earliest_installation_starts": {},
+        }
+        if self.current_project_id is None:
+            return empty
+        original = self._version_0_solution_df()
+        if original is None or original.empty:
+            return empty
+        delay_table = ScheduleDataManager.delay_updates_table_name(self.current_project_id)
+        inspector = inspect(self.engine)
+        if delay_table not in inspector.get_table_names():
+            return empty
+        where = "delay_type = 'START_POSTPONEMENT'"
+        if not include_pending:
+            where += " AND version_id IS NOT NULL"
+        query = (
+            f'SELECT module_id, phase, delay_hours FROM "{delay_table}" WHERE {where}'
+        )
+        try:
+            delays_df = pd.read_sql(text(query), self.engine)
+        except Exception as e:
+            print(f"Warning: Could not load start postponements: {e}")
+            return empty
+        hours: dict[tuple[str, str], float] = {}
+        for _, row in delays_df.iterrows():
+            key = (str(row["module_id"]), str(row["phase"]).upper())
+            hours[key] = hours.get(key, 0.0) + float(row["delay_hours"] or 0)
+        if not hours:
+            return empty
+
+        starts: dict[str, dict[str, int]] = {}
+        for _, row in original.iterrows():
+            module_id = str(row.get("Module_ID") or "").strip()
+            if not module_id:
+                continue
+            starts[module_id] = {
+                "FABRICATION": row.get("Production_Start"),
+                "TRANSPORT": row.get("Transport_Start"),
+                "INSTALLATION": row.get("Installation_Start"),
+            }
+
+        bounds = {
+            "earliest_production_starts": {},
+            "earliest_arrival_times": {},
+            "earliest_installation_starts": {},
+        }
+        for (module_id, phase), extra_hours in hours.items():
+            idx = id_to_index.get(module_id)
+            if idx is None or extra_hours <= 0:
+                continue
+            extra = int(math.ceil(extra_hours))
+            orig = starts.get(module_id, {}).get(phase)
+            if orig is None or (isinstance(orig, float) and pd.isna(orig)):
+                continue
+            earliest = int(orig) + extra
+            if phase == "FABRICATION":
+                bounds["earliest_production_starts"][idx] = earliest
+            elif phase == "TRANSPORT":
+                bounds["earliest_arrival_times"][idx] = earliest + int(L.get(idx, 0) or 0)
+            elif phase == "INSTALLATION":
+                bounds["earliest_installation_starts"][idx] = earliest
+        return bounds
+
+    @staticmethod
+    def _merge_earliest_bounds(base: dict | None, extra: dict[int, int]) -> dict[int, int]:
+        merged = dict(base or {})
+        for idx, value in extra.items():
+            previous = merged.get(idx)
+            merged[idx] = int(value) if previous is None else max(int(previous), int(value))
+        return merged
+
+    @staticmethod
+    def _attach_persistent_postponement(
+        fixed_constraints: dict,
+        postponement_bounds: dict,
+    ) -> dict:
+        """Keep postponement lower bounds, but never on phases whose start is already pinned."""
+        attached = dict(fixed_constraints)
+        pairs = (
+            ("earliest_production_starts", "fixed_production_starts"),
+            ("earliest_arrival_times", "fixed_arrival_times"),
+            ("earliest_installation_starts", "fixed_installation_starts"),
+        )
+        for earliest_key, fixed_key in pairs:
+            merged = MainWindow._merge_earliest_bounds(
+                attached.get(earliest_key),
+                postponement_bounds.get(earliest_key) or {},
+            )
+            pinned = attached.get(fixed_key) or {}
+            attached[earliest_key] = {
+                i: t for i, t in merged.items() if i not in pinned
+            }
+        return attached
+
+    @staticmethod
+    def _schedule_cmax(df: pd.DataFrame) -> int:
+        prev_cmax = 1
+        for col in (
+            "Installation_Start",
+            "Installation_Finish",
+            "Arrival_Time",
+            "Production_Start",
+        ):
+            if col in df.columns and not df[col].isna().all():
+                prev_cmax = max(prev_cmax, int(df[col].max()))
+        return prev_cmax
+
+    @staticmethod
+    def _current_time_index(
+        working_calendar_slots: list,
+        current_datetime: datetime | None = None,
+    ) -> int:
+        current_datetime = current_datetime or datetime.now()
+        for idx, slot_dt in enumerate(working_calendar_slots[1:], start=1):
+            if slot_dt is not None and slot_dt >= current_datetime:
+                return idx
+        if (
+            len(working_calendar_slots) > 1
+            and working_calendar_slots[1] is not None
+            and working_calendar_slots[1] > current_datetime
+        ):
+            return 1
+        return max(1, len(working_calendar_slots) - 1)
 
     def _load_latest_solution_df(self) -> pd.DataFrame | None:
         """Latest saved schedule for the current project, or None."""
@@ -456,7 +792,29 @@ class MainWindow(QMainWindow):
         page.apply_project_start_date(stored, locked=locked)
 
     def _on_project_variables_saved(self, settings: dict) -> None:
-        self._commit_project_start_date((settings or {}).get("start_datetime", ""))
+        if self.current_project_id is None:
+            QMessageBox.warning(self, "No Project", "Select or create a project first.")
+            return
+        start_str = (settings or {}).get("start_datetime", "")
+        if (
+            self._project_has_calculated_schedule()
+            and self.mgr.get_project_start_date(self.current_project_id)
+        ):
+            QMessageBox.information(
+                self,
+                "Start Date Locked",
+                "The start date is fixed for this project after the first Calculate.",
+            )
+            return
+        if not self._is_configured_start_date(start_str):
+            QMessageBox.warning(
+                self,
+                "Start Date Not Set",
+                "Choose a project start date, then click Save Settings.",
+            )
+            return
+        self._commit_project_start_date(start_str)
+        QMessageBox.information(self, "Saved", "Project start date saved.")
 
     def _calculate_settings_snapshot(
         self,
@@ -741,15 +1099,25 @@ class MainWindow(QMainWindow):
                 return
             self._commit_project_start_date(start_str)
 
-            # crew / machines / capacities / objective weights
+            # crew / machines / capacities / monetised objective
             C_install = int(settings.get("crew_count", "1") or 1)
             M_machine = int(settings.get("machine_count", "1") or 1)
             S_site = int(settings.get("site_storage", "0") or 0)
             S_fac = int(settings.get("factory_storage", "0") or 0)
-            w_duration = float(settings.get("w_duration", "0") or 0)
-            w_transport = float(settings.get("w_transport", "0") or 0)
-            w_site_storage = float(settings.get("w_site_storage", "0") or 0)
-            w_factory_storage = float(settings.get("w_factory_storage", "0") or 0)
+            if getattr(self, "page_settings", None) is not None:
+                self.page_settings.sync_objective_costs_from_rates()
+            if getattr(self, "page_costs", None) is not None:
+                rates = self.page_costs._current_rates()
+                construction_day_cost = daily_construction_from_rates(C_install, rates)
+                transport_batch_cost = transport_batch_from_rates(rates)
+            else:
+                construction_day_cost = parse_cost_setting(
+                    settings, "construction_day_cost", DEFAULT_CONSTRUCTION_DAY_COST
+                )
+                transport_batch_cost = parse_cost_setting(
+                    settings, "transport_batch_cost", DEFAULT_TRANSPORT_BATCH_COST
+                )
+            hours_per_day = hours_per_working_day(settings)
             settings_snapshot = self._calculate_settings_snapshot(
                 settings,
                 crew_count=C_install,
@@ -757,13 +1125,16 @@ class MainWindow(QMainWindow):
                 site_storage=S_site,
                 factory_storage=S_fac,
             )
+            settings_snapshot["construction_day_cost"] = construction_day_cost
+            settings_snapshot["transport_batch_cost"] = transport_batch_cost
 
-            if w_duration + w_transport + w_site_storage + w_factory_storage <= 0:
+            if construction_day_cost <= 0 and transport_batch_cost <= 0:
                 self._abort_calculation(
                     calc_dialog, calculate_btn, original_btn_text,
-                    "No Objective Weights",
-                    "All objective weights are zero, so there is nothing to optimize. "
-                    "Set them in Settings before running Calculate.",
+                    "No Objective Costs",
+                    "Construction day cost and transport batch cost are both zero, "
+                    "so there is nothing to optimize. Set crane, crew, and truck "
+                    "rates on the Costs page.",
                 )
                 return
 
@@ -837,10 +1208,9 @@ class MainWindow(QMainWindow):
                 )
                 return
 
-            # 3) horizon and objective reference
-            # First optimization: a constructive heuristic sizes T and the
-            # reference. Re-optimization reuses the stored reference and sizes
-            # T from the work still left after tau, so skip the heuristic then.
+            # 3) horizon
+            # First optimization: a constructive heuristic sizes T.
+            # Re-optimization sizes T from the work still left after tau.
             QApplication.processEvents()
             delay_table = ScheduleDataManager.delay_updates_table_name(self.current_project_id)
             versions_table = ScheduleDataManager.optimization_versions_table_name(self.current_project_id)
@@ -849,11 +1219,12 @@ class MainWindow(QMainWindow):
                     text(f'SELECT COUNT(*) FROM "{delay_table}" WHERE version_id IS NULL')
                 ).scalar()
             is_reoptimization = pending_count > 0
+            if not is_reoptimization:
+                self._apply_recorded_duration_extensions(I_d, D, L, id_to_index)
 
-            reference = self.mgr.get_normalization_reference(self.current_project_id)
             heuristic_solution = None
             T = None
-            need_heuristic = (not is_reoptimization) or (reference is None)
+            need_heuristic = not is_reoptimization
             if need_heuristic:
                 try:
                     heuristic_solution = construct_solution(
@@ -883,22 +1254,31 @@ class MainWindow(QMainWindow):
                 else:
                     T = trivial_horizon_bound(N, I_d, D, L)
                     print(f"[Heuristic] No schedule; falling back to horizon T={T}")
-
-            if reference is None:
-                if heuristic_solution is None:
-                    self._abort_calculation(
-                        calc_dialog, calculate_btn, original_btn_text,
-                        "Cannot Scale Objective",
-                        "The heuristic could not build a schedule for this project, so "
-                        "there is no reference to weigh the objective against.\n\n"
-                        "Check the crew, machine and storage settings.",
+                postponement_hours = 0
+                try:
+                    delay_table = ScheduleDataManager.delay_updates_table_name(
+                        self.current_project_id
                     )
-                    return
-                reference = reference_values(heuristic_solution, D, L)
-                self.mgr.set_normalization_reference(self.current_project_id, reference)
-                print(f"[Objective] Reference stored for this project: {reference}")
-            else:
-                print(f"[Objective] Reusing stored reference: {reference}")
+                    with self.engine.begin() as conn:
+                        postponement_hours = conn.execute(
+                            text(
+                                f"SELECT COALESCE(SUM(delay_hours), 0) FROM \"{delay_table}\" "
+                                f"WHERE delay_type = 'START_POSTPONEMENT' "
+                                f"AND version_id IS NOT NULL"
+                            )
+                        ).scalar() or 0
+                except Exception:
+                    postponement_hours = 0
+                extra = int(math.ceil(float(postponement_hours)))
+                if extra > 0:
+                    T = int(T) + extra
+                    print(f"[Calculate] Added {extra}h for recorded start postponements, T={T}")
+
+            print(
+                f"[Objective] construction_day_cost={construction_day_cost}, "
+                f"transport_batch_cost={transport_batch_cost}, "
+                f"hours_per_day={hours_per_day}"
+            )
 
             # Check if we have pending delays (Phase 5.2 & 6: Re-optimization workflow)
             QApplication.processEvents()
@@ -980,36 +1360,11 @@ class MainWindow(QMainWindow):
                 # Calendar only needs to cover the base schedule so that "now"
                 # can be mapped to tau. T itself is computed after the leftover
                 # work from tau is known.
-                time_cols = [
-                    "Installation_Start", "Installation_Finish",
-                    "Arrival_Time", "Production_Start",
-                ]
-                prev_cmax = 1
-                for col in time_cols:
-                    if col in df_base_solution.columns and not df_base_solution[col].isna().all():
-                        prev_cmax = max(prev_cmax, int(df_base_solution[col].max()))
+                prev_cmax = self._schedule_cmax(df_base_solution)
                 working_calendar_slots = self._build_working_calendar_slots(
                     settings, start_date, int(prev_cmax)
                 )
-                
-                # Determine current_time (actual current time for re-optimization)
-                # Use system time or allow future extension for simulation time
-                current_datetime = datetime.now()
-                
-                # Convert current_datetime to time index
-                current_time = None
-                for idx, slot_dt in enumerate(working_calendar_slots[1:], start=1):  # Skip index 0
-                    if slot_dt >= current_datetime:
-                        current_time = idx
-                        break
-                
-                if current_time is None:
-                    # If current_datetime is after all slots, use the last slot index
-                    # If current_datetime is before all slots, use index 1 (first slot)
-                    if len(working_calendar_slots) > 1 and working_calendar_slots[1] > current_datetime:
-                        current_time = 1
-                    else:
-                        current_time = len(working_calendar_slots) - 1
+                current_time = self._current_time_index(working_calendar_slots)
                 
                 # 2. Identify task states (based on current_time)
                 QApplication.processEvents()
@@ -1094,6 +1449,19 @@ class MainWindow(QMainWindow):
                     df_base_solution
                 )
                 fixed_constraints = fixed_builder.build_fixed_constraints()
+                postponement_bounds = self._postponement_earliest_bounds(
+                    id_to_index, L, include_pending=True
+                )
+                fixed_constraints = self._attach_persistent_postponement(
+                    fixed_constraints, postponement_bounds
+                )
+                print(
+                    f"[Fix] tau={current_time}: "
+                    f"{len(fixed_constraints.get('fixed_production_starts') or {})} production, "
+                    f"{len(fixed_constraints.get('fixed_arrival_times') or {})} arrival, "
+                    f"{len(fixed_constraints.get('fixed_installation_starts') or {})} installation "
+                    f"starts pinned"
+                )
                 
                 # 6. Create new version record (Phase 5.2)
                 QApplication.processEvents()
@@ -1165,11 +1533,9 @@ class MainWindow(QMainWindow):
                     M_machine=M_machine,
                     S_site=S_site,
                     S_fac=S_fac,
-                    w_duration=w_duration,
-                    w_transport=w_transport,
-                    w_site_storage=w_site_storage,
-                    w_factory_storage=w_factory_storage,
-                    reference=reference,
+                    construction_day_cost=construction_day_cost,
+                    transport_batch_cost=transport_batch_cost,
+                    hours_per_day=hours_per_day,
                 )
                 
                 # Set fixed constraints and re-optimization time (use current_time, not tau)
@@ -1259,28 +1625,99 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "Re-optimization Complete", 
                     f"Re-optimization completed successfully.\nVersion: {new_version_number}\nCurrent time: {current_time}")
             else:
-                # Initial optimization (existing logic)
-                # 4) build and solve model
+                # Recalculate without new pending delays. If a previous schedule
+                # exists, pin already-started/completed phases at their actual
+                # starts so later versions cannot rewrite the past.
                 QApplication.processEvents()
+                postponement_bounds = self._postponement_earliest_bounds(
+                    id_to_index, L, include_pending=False
+                )
+                df_prev = self._load_latest_solution_df()
+                freeze_started = df_prev is not None and not df_prev.empty
+                freeze_current_time = None
+                freeze_constraints = None
+                if freeze_started:
+                    prev_cmax = self._schedule_cmax(df_prev)
+                    T = max(int(T), int(prev_cmax))
+                    freeze_slots = self._build_working_calendar_slots(
+                        settings, start_date, int(T)
+                    )
+                    freeze_current_time = self._current_time_index(freeze_slots)
+                    freeze_states = TaskStateIdentifier(
+                        df_prev, freeze_current_time, freeze_slots
+                    ).identify_all_states()
+                    freeze_constraints = FixedConstraintsBuilder(
+                        freeze_states,
+                        freeze_current_time,
+                        df_prev,
+                        freeze_slots,
+                        df_prev,
+                    ).build_fixed_constraints()
+                    freeze_constraints = self._attach_persistent_postponement(
+                        freeze_constraints, postponement_bounds
+                    )
+                    print(
+                        f"[Fix] tau={freeze_current_time}: "
+                        f"{len(freeze_constraints.get('fixed_production_starts') or {})} production, "
+                        f"{len(freeze_constraints.get('fixed_arrival_times') or {})} arrival, "
+                        f"{len(freeze_constraints.get('fixed_installation_starts') or {})} installation "
+                        f"starts pinned"
+                    )
+
                 scheduler = PrefabScheduler(
-                N=N,
-                T=T,
-                d=I_d,
-                E=E,
-                D=D,
-                L=L,
-                C_install=C_install,
-                M_machine=M_machine,
-                S_site=S_site,
-                S_fac=S_fac,
-                w_duration=w_duration,
-                w_transport=w_transport,
-                w_site_storage=w_site_storage,
-                w_factory_storage=w_factory_storage,
-                reference=reference,
-            )
-                QApplication.processEvents()
-                status = scheduler.solve(heuristic=heuristic_solution)
+                    N=N,
+                    T=T,
+                    d=I_d,
+                    E=E,
+                    D=D,
+                    L=L,
+                    C_install=C_install,
+                    M_machine=M_machine,
+                    S_site=S_site,
+                    S_fac=S_fac,
+                    construction_day_cost=construction_day_cost,
+                    transport_batch_cost=transport_batch_cost,
+                    hours_per_day=hours_per_day,
+                )
+                if freeze_started:
+                    scheduler.set_fixed_constraints(
+                        fixed_installation_starts=freeze_constraints.get(
+                            "fixed_installation_starts"
+                        ),
+                        fixed_production_starts=freeze_constraints.get(
+                            "fixed_production_starts"
+                        ),
+                        fixed_arrival_times=freeze_constraints.get(
+                            "fixed_arrival_times"
+                        ),
+                        reoptimize_from_time=freeze_current_time,
+                        earliest_production_starts=freeze_constraints.get(
+                            "earliest_production_starts"
+                        ),
+                        earliest_arrival_times=freeze_constraints.get(
+                            "earliest_arrival_times"
+                        ),
+                        earliest_installation_starts=freeze_constraints.get(
+                            "earliest_installation_starts"
+                        ),
+                    )
+                    QApplication.processEvents()
+                    status = scheduler.solve()
+                else:
+                    if any(postponement_bounds.values()):
+                        scheduler.set_fixed_constraints(
+                            earliest_production_starts=postponement_bounds[
+                                "earliest_production_starts"
+                            ],
+                            earliest_arrival_times=postponement_bounds[
+                                "earliest_arrival_times"
+                            ],
+                            earliest_installation_starts=postponement_bounds[
+                                "earliest_installation_starts"
+                            ],
+                        )
+                    QApplication.processEvents()
+                    status = scheduler.solve(heuristic=heuristic_solution)
 
                 if scheduler.get_solution_dict() is None:
                     self._abort_calculation(
@@ -1401,18 +1838,48 @@ class MainWindow(QMainWindow):
                 current_time = datetime.now() if use_system_time else datetime.now()  # For now always use system time, may change later
 
                 rows = []
-                # Use pending delays map if available (only for re-optimization)
-                pending_delay_map = locals().get("pending_delay_map", {})
-                modules_with_delay = locals().get("modules_with_delay", set())
+                latest_version_id = None
+                versions_table = ScheduleDataManager.optimization_versions_table_name(
+                    self.current_project_id
+                )
+                try:
+                    with self.engine.begin() as conn:
+                        latest_version_id = conn.execute(
+                            text(f'SELECT MAX(version_id) FROM "{versions_table}"')
+                        ).scalar()
+                except Exception:
+                    latest_version_id = None
+                delay_hours_map, modules_with_delay, extension_map = self._accumulated_delay_hours(
+                    self.current_project_id,
+                    int(latest_version_id) if latest_version_id is not None else None,
+                    include_pending=False,
+                )
+                raw_durations = self._raw_module_durations(self.current_project_id)
 
                 for _, row in display_df.iterrows():
                     mod_id = row.get("Module_ID", "")
+                    fab_delay = delay_hours_map.get((str(mod_id), "FABRICATION"), 0)
+                    trans_delay = delay_hours_map.get((str(mod_id), "TRANSPORT"), 0)
+                    inst_delay = delay_hours_map.get((str(mod_id), "INSTALLATION"), 0)
+                    raw = raw_durations.get(str(mod_id), {})
+                    fab_dur = self._duration_for_display(
+                        row.get("Production_Duration", 0),
+                        raw.get("FABRICATION"),
+                        extension_map.get((str(mod_id), "FABRICATION"), 0),
+                    )
+                    trans_dur = self._duration_for_display(
+                        row.get("Transport_Duration", 0),
+                        raw.get("TRANSPORT"),
+                        extension_map.get((str(mod_id), "TRANSPORT"), 0),
+                    )
+                    inst_dur = self._duration_for_display(
+                        row.get("Installation_Duration", 0),
+                        raw.get("INSTALLATION"),
+                        extension_map.get((str(mod_id), "INSTALLATION"), 0),
+                    )
                     fab_start_idx = int(row["Production_Start"]) if not pd.isna(row.get("Production_Start")) else None
-                    fab_dur = int(row.get("Production_Duration", 0))
                     trans_start_idx = int(row["Transport_Start"]) if not pd.isna(row.get("Transport_Start")) else None
-                    trans_dur = int(row.get("Transport_Duration", 0))
                     inst_start_idx = int(row["Installation_Start"]) if not pd.isna(row.get("Installation_Start")) else None
-                    inst_dur = int(row.get("Installation_Duration", 0))
                     install_finish_idx = int(row["Installation_Finish"]) if not pd.isna(row.get("Installation_Finish")) else None
                     
                     # Calculate status based on current time
@@ -1426,10 +1893,7 @@ class MainWindow(QMainWindow):
                     install_finish_dt = idx_to_dt_obj(install_finish_idx) if install_finish_idx else None
                     fab_start_dt = idx_to_dt_obj(fab_start_idx) if fab_start_idx else None
                     
-                    # Get pending delay values per phase (only pending delays, version_id IS NULL)
-                    fab_delay = pending_delay_map.get((str(mod_id), "FABRICATION"), 0)
-                    trans_delay = pending_delay_map.get((str(mod_id), "TRANSPORT"), 0)
-                    inst_delay = pending_delay_map.get((str(mod_id), "INSTALLATION"), 0)
+                    # Delay hours from this version and every earlier recorded disruption
                     has_delay = (fab_delay > 0) or (trans_delay > 0) or (inst_delay > 0)
                     
                     status = "Upcoming"  # default
@@ -1648,33 +2112,52 @@ class MainWindow(QMainWindow):
             
             current_time = datetime.now() if use_system_time else datetime.now()
             
-            # Load delays for this version (if any)
-            delay_table = ScheduleDataManager.delay_updates_table_name(project_id)
-            pending_delay_map = {}
-            modules_with_delay = set()
-            try:
-                if delay_table in inspector.get_table_names():
-                    delays_query = f'SELECT module_id, phase, delay_hours FROM "{delay_table}" WHERE version_id = :version_id'
-                    delays_df = pd.read_sql(text(delays_query), self.engine, params={"version_id": version_id})
-                    for _, delay_row in delays_df.iterrows():
-                        module_id = str(delay_row['module_id'])
-                        phase = str(delay_row['phase']).upper()
-                        delay_hours = float(delay_row['delay_hours'] or 0)
-                        if delay_hours > 0:
-                            pending_delay_map[(module_id, phase)] = delay_hours
-                            modules_with_delay.add(module_id)
-            except Exception as e:
-                print(f"Warning: Could not load delays for version {version_id}: {e}")
+            # Load delays recorded on this version and every earlier version.
+            # Pending (not yet calculated) rows only belong on the latest version.
+            latest_version_id = None
+            versions_table = self.mgr.optimization_versions_table_name(project_id)
+            if versions_table in table_names:
+                try:
+                    with self.engine.begin() as conn:
+                        latest_version_id = conn.execute(
+                            text(f'SELECT MAX(version_id) FROM "{versions_table}"')
+                        ).scalar()
+                except Exception:
+                    latest_version_id = None
+            delay_hours_map, modules_with_delay, extension_map = self._accumulated_delay_hours(
+                project_id,
+                version_id,
+                include_pending=bool(
+                    latest_version_id is not None and int(latest_version_id) == int(version_id)
+                ),
+            )
+            raw_durations = self._raw_module_durations(project_id)
             
             rows = []
             for _, row in df_sol.iterrows():
                 mod_id = row.get("Module_ID", "")
+                fab_delay = delay_hours_map.get((str(mod_id), "FABRICATION"), 0)
+                trans_delay = delay_hours_map.get((str(mod_id), "TRANSPORT"), 0)
+                inst_delay = delay_hours_map.get((str(mod_id), "INSTALLATION"), 0)
+                raw = raw_durations.get(str(mod_id), {})
+                fab_dur = self._duration_for_display(
+                    row.get("Production_Duration", 0),
+                    raw.get("FABRICATION"),
+                    extension_map.get((str(mod_id), "FABRICATION"), 0),
+                )
+                trans_dur = self._duration_for_display(
+                    row.get("Transport_Duration", 0),
+                    raw.get("TRANSPORT"),
+                    extension_map.get((str(mod_id), "TRANSPORT"), 0),
+                )
+                inst_dur = self._duration_for_display(
+                    row.get("Installation_Duration", 0),
+                    raw.get("INSTALLATION"),
+                    extension_map.get((str(mod_id), "INSTALLATION"), 0),
+                )
                 fab_start_idx = int(row["Production_Start"]) if not pd.isna(row.get("Production_Start")) else None
-                fab_dur = int(row.get("Production_Duration", 0))
                 trans_start_idx = int(row["Transport_Start"]) if not pd.isna(row.get("Transport_Start")) else None
-                trans_dur = int(row.get("Transport_Duration", 0))
                 inst_start_idx = int(row["Installation_Start"]) if not pd.isna(row.get("Installation_Start")) else None
-                inst_dur = int(row.get("Installation_Duration", 0))
                 install_finish_idx = int(row["Installation_Finish"]) if not pd.isna(row.get("Installation_Finish")) else None
                 
                 # Calculate status based on current time
@@ -1682,10 +2165,6 @@ class MainWindow(QMainWindow):
                 install_finish_dt = idx_to_dt_obj(install_finish_idx) if install_finish_idx else None
                 fab_start_dt = idx_to_dt_obj(fab_start_idx) if fab_start_idx else None
                 
-                # Get delay values per phase for this version
-                fab_delay = pending_delay_map.get((str(mod_id), "FABRICATION"), 0)
-                trans_delay = pending_delay_map.get((str(mod_id), "TRANSPORT"), 0)
-                inst_delay = pending_delay_map.get((str(mod_id), "INSTALLATION"), 0)
                 has_delay = (fab_delay > 0) or (trans_delay > 0) or (inst_delay > 0)
                 
                 status = "Upcoming"  # default
@@ -1828,10 +2307,8 @@ class MainWindow(QMainWindow):
             # Get settings for weight values
             settings = self._get_active_settings() or {}
             weight_settings_data = [
-                {"Setting": "Project Duration Weight", "Value": settings.get("w_duration", "")},
-                {"Setting": "Transportation Weight", "Value": settings.get("w_transport", "")},
-                {"Setting": "Onsite Storage Weight", "Value": settings.get("w_site_storage", "")},
-                {"Setting": "Factory Storage Weight", "Value": settings.get("w_factory_storage", "")},
+                {"Setting": "Construction Day Cost", "Value": settings.get("construction_day_cost", "")},
+                {"Setting": "Transport Batch Cost", "Value": settings.get("transport_batch_cost", "")},
             ]
             weight_settings_df = pd.DataFrame(weight_settings_data)
             
@@ -1985,6 +2462,209 @@ class MainWindow(QMainWindow):
                 if current_idx == self.page_index.get("schedule"):
                     self.page_schedule.load_version_list(self.engine, None)
             self._refresh_start_date_widget()
+
+    @staticmethod
+    def _viewer_color_from_phases(states) -> str:
+        by_phase = {s.phase: s.status for s in (states or [])}
+        inst = by_phase.get("INSTALLATION", "NOT_STARTED")
+        trans = by_phase.get("TRANSPORT", "NOT_STARTED")
+        fab = by_phase.get("FABRICATION", "NOT_STARTED")
+        if inst in ("IN_PROGRESS", "COMPLETED"):
+            return "installing"
+        if trans in ("IN_PROGRESS", "COMPLETED"):
+            return "transporting"
+        if fab in ("IN_PROGRESS", "COMPLETED"):
+            return "producing"
+        return "unknown"
+
+    def _selected_schedule_version_id(self) -> int | None:
+        page = getattr(self, "page_schedule", None)
+        if page is None or not hasattr(page, "version_combo"):
+            return None
+        try:
+            version_id = page.version_id_map.get(page.version_combo.currentIndex())
+            return int(version_id) if version_id is not None else None
+        except Exception:
+            return None
+
+    def _load_solution_df_for_viewer(self):
+        if self.current_project_id is None:
+            return None
+        version_id = self._selected_schedule_version_id()
+        if version_id is not None:
+            try:
+                solution_table = self.mgr.solution_table_name(self.current_project_id)
+                inspector = inspect(self.engine)
+                if solution_table in inspector.get_table_names():
+                    df = pd.read_sql(
+                        text(
+                            f'SELECT * FROM "{solution_table}" '
+                            f"WHERE version_id = :version_id"
+                        ),
+                        self.engine,
+                        params={"version_id": version_id},
+                    )
+                    if not df.empty:
+                        return df
+            except Exception:
+                pass
+        return self._load_latest_solution_df()
+
+    def _viewer_status_by_module(self) -> dict[str, str]:
+        status: dict[str, str] = {}
+        try:
+            for module_id in self.mgr.list_raw_module_ids(self.current_project_id):
+                status[str(module_id)] = "unknown"
+        except Exception:
+            pass
+        df_sol = self._load_solution_df_for_viewer()
+        if df_sol is None or df_sol.empty:
+            return status
+        settings = self._get_active_settings() or {}
+        try:
+            start_date = self._parse_settings_date(settings.get("start_datetime", ""))
+        except ValueError:
+            return status
+        max_idx = 2
+        for col in (
+            "Installation_Finish",
+            "Arrival_Time",
+            "Production_Start",
+            "Transport_Start",
+        ):
+            if col in df_sol.columns and not df_sol[col].dropna().empty:
+                try:
+                    max_idx = max(max_idx, int(float(df_sol[col].max())))
+                except (TypeError, ValueError):
+                    pass
+        slots = self._build_working_calendar_slots(settings, start_date, max_idx)
+        now = datetime.now()
+        tau = max(1, len(slots) - 1)
+        for idx, slot_dt in enumerate(slots[1:], start=1):
+            if slot_dt >= now:
+                tau = idx
+                break
+        try:
+            identifier = TaskStateIdentifier(df_sol, tau, slots)
+            for module_id, states in identifier.identify_all_states().items():
+                status[str(module_id)] = self._viewer_color_from_phases(states)
+        except Exception as exc:
+            print(f"[4D] status map skipped: {exc}")
+        return status
+
+    def _run_ifc_job(self, title: str, label: str, job):
+        dialog = QProgressDialog(label, None, 0, 0, self)
+        dialog.setWindowTitle(title)
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setCancelButton(None)
+        dialog.show()
+        QApplication.processEvents()
+
+        def on_line(text: str):
+            shown = (text or "").strip() or label
+            if shown.startswith("PROGRESS "):
+                shown = f"Converting IFC… {shown.split()[-1]}%"
+            dialog.setLabelText(shown[:240])
+            QApplication.processEvents()
+
+        try:
+            return job(on_line)
+        finally:
+            dialog.close()
+
+    def import_ifc_model(self, source_path: str):
+        from planning_tool.ifc_model import IfcModelError, convert_project_ifc, save_ifc
+
+        if self.current_project_id is None:
+            QMessageBox.warning(
+                self, "No Project",
+                "Create or select a project first, then upload the IFC model.",
+            )
+            return
+        try:
+            save_ifc(self.current_project_id, Path(source_path))
+            self._run_ifc_job(
+                "3D Model",
+                "Converting IFC to fragments…",
+                lambda on_line: convert_project_ifc(self.current_project_id, on_line=on_line),
+            )
+        except IfcModelError as exc:
+            QMessageBox.critical(self, "IFC Conversion Failed", str(exc))
+            return
+        except Exception as exc:
+            QMessageBox.critical(self, "IFC Conversion Failed", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "3D Model",
+            "IFC uploaded and converted. Open 4D Model on the Schedule page to view it.",
+        )
+
+    def open_4d_model_viewer(self):
+        from planning_tool.ifc_model import (
+            IfcModelError,
+            convert_project_ifc,
+            ensure_viewer_ready,
+            frag_path,
+            has_fragments,
+            ifc_path,
+            mapping_path,
+            save_guid_mapping,
+            write_status_json,
+        )
+
+        if self.current_project_id is None:
+            QMessageBox.warning(
+                self, "No Project",
+                "Select a project first.",
+            )
+            return
+        try:
+            if not has_fragments(self.current_project_id):
+                if ifc_path(self.current_project_id).is_file():
+                    self._run_ifc_job(
+                        "4D Model",
+                        "Converting IFC to fragments…",
+                        lambda on_line: convert_project_ifc(
+                            self.current_project_id, on_line=on_line
+                        ),
+                    )
+                else:
+                    QMessageBox.information(
+                        self,
+                        "No 3D Model",
+                        "Upload an IFC file on the Upload Data page first.",
+                    )
+                    return
+            else:
+                self._run_ifc_job(
+                    "4D Model",
+                    "Opening viewer…",
+                    lambda on_line: ensure_viewer_ready(on_line=on_line),
+                )
+            if not mapping_path(self.current_project_id).is_file():
+                self._run_ifc_job(
+                    "4D Model",
+                    "Reading GUID–Mark mapping…",
+                    lambda on_line: save_guid_mapping(
+                        self.current_project_id, on_line=on_line
+                    ),
+                )
+            dialog = ModelViewerDialog(
+                frag_path(self.current_project_id),
+                self,
+                extra_files={
+                    "/module_guids.json": mapping_path(self.current_project_id),
+                    "/module_status.json": write_status_json(
+                        self.current_project_id,
+                        self._viewer_status_by_module(),
+                    ),
+                },
+            )
+            dialog.exec()
+        except IfcModelError as exc:
+            QMessageBox.critical(self, "4D Model", str(exc))
 
     def _on_project_created(self, project_id: int, project_name: str):
         """Handler for when a new project is created - updates the project combo"""

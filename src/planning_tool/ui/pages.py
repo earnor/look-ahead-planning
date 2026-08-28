@@ -10,7 +10,7 @@ This module contains all main page widgets for the application:
 """
 from functools import reduce
 from datetime import datetime
-from PyQt6.QtCore import Qt, pyqtSignal, QDate
+from PyQt6.QtCore import Qt, pyqtSignal, QDate, QEvent
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QWidget, QFrame, QLabel, QPushButton, QLineEdit, QComboBox,
@@ -23,7 +23,16 @@ from PyQt6.QtCore import QDateTime, QTime, QLocale
 from pathlib import Path
 import shutil
 from sqlalchemy import create_engine
-from planning_tool.costs import count_handover_working_days, parse_project_start_date
+from planning_tool.costs import (
+    DEFAULT_CONSTRUCTION_DAY_COST,
+    DEFAULT_CREW_COUNT,
+    DEFAULT_TRANSPORT_BATCH_COST,
+    CostRates,
+    count_handover_working_days,
+    daily_construction_from_rates,
+    parse_project_start_date,
+    transport_batch_from_rates,
+)
 from planning_tool.datamanager import ScheduleDataManager
 from planning_tool.ui.widgets import KpiCard, Card, FileDropArea, Chip
 from planning_tool.ui.components import DashboardTable, StatusCell
@@ -154,6 +163,7 @@ class UploadPage(QWidget):
         super().__init__(parent)
         self.engine = engine
         self.dm = ScheduleDataManager(self.engine)
+        self.main_window = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)
@@ -217,7 +227,9 @@ class UploadPage(QWidget):
         hint = QLabel(
             "<div style='background:#EFF6FF; border:1px solid #DBEAFE; color:#1E3A8A; "
             "border-radius:10px; padding:8px; font-size:20px;'>"
-            "Ensure your model includes element IDs that can be linked to tasks in your schedule. "
+            "Select a project first, then upload an IFC file. Names in the IFC should match "
+            "Module IDs in the CSV. The file is converted to fragments in the background; "
+            "open it with 4D Model on the Schedule page."
             "</div>"
         )
         card2.body.addWidget(hint)
@@ -252,8 +264,15 @@ class UploadPage(QWidget):
             QMessageBox.critical(self, "Download Failed", str(exc))
 
     def on_model_files(self, path: str):
-        # TODO: 在这里解析IFC/GLTF等或触发后端处理
-        print("[Model Upload] selected:", path)
+        mw = getattr(self, "main_window", None)
+        if mw is None or getattr(mw, "current_project_id", None) is None:
+            QMessageBox.warning(
+                self,
+                "No Project",
+                "Create or select a project first, then upload the IFC model.",
+            )
+            return
+        mw.import_ifc_model(path)
 
     # ---------------- Process Our Data ----------------
     # Required column -> spellings accepted in the uploaded file.
@@ -535,9 +554,11 @@ class SchedulePage(QWidget):
 
         # connect calculate button to a handler in parent window via signal/slot later
         # we expose it as an attribute so MainWindow can wire it
+        self.btn_4d = btn_4d
         self.btn_add = btn_add
         self.btn_calculate = btn_calculate
         self.btn_export = btn_export
+        self.btn_4d.clicked.connect(self._on_4d_model_clicked)
         self.btn_add.clicked.connect(self._on_add_module_clicked)
 
         return bar
@@ -579,6 +600,10 @@ class SchedulePage(QWidget):
         # store for later population
         self.table = table
         return table
+
+    def _on_4d_model_clicked(self):
+        if getattr(self, "main_window", None):
+            self.main_window.open_4d_model_viewer()
 
     def _on_add_module_clicked(self):
         project_id = self.project_id
@@ -944,10 +969,10 @@ class _FocusWheelTimeEdit(QTimeEdit):
 class SettingsPage(QWidget):
     """Settings page for configuring project parameters"""
 
-    # A date widget shows its special value text only while it sits on its minimum,
-    # so the minimum is reserved as the "not set" marker and 2025-01-01 stays the
-    # earliest date the user can actually pick.
-    UNSET_DATE = QDate(2026, 1, 1)
+    # specialValueText only appears while the widget sits on its minimum date.
+    # Use a sentinel far from real project dates, otherwise picking that day
+    # (or the first calendar click) is stored as "not set".
+    UNSET_DATE = QDate(1900, 1, 1)
     UNSET_DATE_TEXT = "mm/dd/yyyy"
 
     def __init__(self, parent=None):
@@ -1072,6 +1097,7 @@ class SettingsPage(QWidget):
         start_layout.addStretch(1)
         start_group.addLayout(start_layout)
         layout.addLayout(start_group)
+        self._wire_start_date_picker()
         
         # Current Simulation Time
         sim_group = QHBoxLayout()
@@ -1289,7 +1315,7 @@ class SettingsPage(QWidget):
         # Installation Crew Number
         crew_group = QVBoxLayout()
         crew_input_layout = QHBoxLayout()
-        self.crew_count = QLineEdit("2")
+        self.crew_count = QLineEdit(str(DEFAULT_CREW_COUNT))
         self.crew_count.setMaximumWidth(100)
         self.crew_count.setStyleSheet("""
             QLineEdit {
@@ -1364,27 +1390,30 @@ class SettingsPage(QWidget):
         layout.addLayout(storage_grid)
         layout.addSpacing(12)
         
-        # ---------- Cost Parameters in compact grid ----------
+        # ---------- Objective costs ----------
         cost_group = QGridLayout()
         cost_group.setHorizontalSpacing(24)
         cost_group.setVerticalSpacing(8)
-        cost_label = QLabel("Objective Weights")
+        cost_label = QLabel("Objective Costs")
         cost_label.setStyleSheet("font-size: 13px; font-weight: 500; color: #374151;")
         cost_group.addWidget(cost_label, 0, 0, 1, 2)
 
-        cost_hint = QLabel("Relative priority of each goal. The weights should add up to 1.")
+        cost_hint = QLabel(
+            "Monetised objective: construction-day cost × project working days "
+            "+ transport-batch cost × number of trucks. These two values follow "
+            "the Costs page (crane + crew rate × crews + extra daily terms, and cost per truck)."
+        )
+        cost_hint.setWordWrap(True)
         cost_hint.setStyleSheet("font-size: 11px; color: #9CA3AF;")
         cost_group.addWidget(cost_hint, 1, 0, 1, 2)
 
         cost_params = [
-            ("Project Duration:", "w_duration", "0.4"),
-            ("Transportation:", "w_transport", "0.1"),
-            ("Onsite Storage:", "w_site_storage", "0.4"),
-            ("Factory Storage:", "w_factory_storage", "0.1"),
+            ("Construction day cost:", "construction_day_cost", str(int(DEFAULT_CONSTRUCTION_DAY_COST)), "CHF / day"),
+            ("Transport batch cost:", "transport_batch_cost", str(int(DEFAULT_TRANSPORT_BATCH_COST)), "CHF / batch"),
         ]
         
         self.cost_inputs = {}
-        for idx, (label_text, key, default) in enumerate(cost_params):
+        for idx, (label_text, key, default, unit) in enumerate(cost_params):
             row = 2 + idx // 2
             col = idx % 2
             cost_input_layout = QHBoxLayout()
@@ -1392,28 +1421,70 @@ class SettingsPage(QWidget):
             cost_label_widget.setStyleSheet("font-size: 12px; color: #6B7280;")
             cost_input_layout.addWidget(cost_label_widget)
             cost_input = QLineEdit(default)
-            cost_input.setMaximumWidth(150)
+            cost_input.setMaximumWidth(120)
+            cost_input.setReadOnly(True)
             cost_input.setStyleSheet("""
                 QLineEdit {
                     border: 1px solid #D1D5DB;
                     border-radius: 6px;
                     padding: 8px 12px;
                     font-size: 13px;
-                    background: #FFFFFF;
+                    background: #F3F4F6;
                 }
             """)
             self.cost_inputs[key] = cost_input
             cost_input_layout.addWidget(cost_input)
+            unit_label = QLabel(unit)
+            unit_label.setStyleSheet("font-size: 12px; color: #9CA3AF;")
+            cost_input_layout.addWidget(unit_label)
             cost_input_layout.addStretch(1)
             cost_group.addLayout(cost_input_layout, row, col)
         
         layout.addLayout(cost_group)
+        self._crew_count_for_day_cost = DEFAULT_CREW_COUNT
+        self.crew_count.textChanged.connect(self._on_crew_count_changed)
+        self.sync_objective_costs_from_rates()
         
         return card
     
+    def _wire_start_date_picker(self) -> None:
+        """First calendar click and typed text both have to become a real date."""
+        calendar = self.start_datetime.calendarWidget()
+        if calendar is None:
+            return
+        calendar.clicked.connect(self._apply_picked_start_date)
+        calendar.activated.connect(self._apply_picked_start_date)
+        calendar.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        calendar = (
+            self.start_datetime.calendarWidget()
+            if hasattr(self, "start_datetime")
+            else None
+        )
+        if obj is calendar and event.type() == QEvent.Type.Show:
+            self._show_current_month_if_unset()
+        return super().eventFilter(obj, event)
+
+    def _show_current_month_if_unset(self) -> None:
+        if self.start_datetime.date() != self.UNSET_DATE:
+            return
+        calendar = self.start_datetime.calendarWidget()
+        if calendar is None:
+            return
+        today = QDate.currentDate()
+        calendar.setSelectedDate(today)
+        calendar.setCurrentPage(today.year(), today.month())
+
+    def _apply_picked_start_date(self, qdate: QDate) -> None:
+        if qdate.isValid() and qdate != self.UNSET_DATE:
+            self.start_datetime.setDate(qdate)
+
     def _date_value(self, widget) -> str:
         """Return the picked date, or the placeholder text while the field is unset."""
-        if widget.date() == widget.minimumDate():
+        if hasattr(widget, "interpretText"):
+            widget.interpretText()
+        if widget.date() == widget.minimumDate() or widget.date() == self.UNSET_DATE:
             return self.UNSET_DATE_TEXT
         return widget.date().toString("MM/dd/yyyy")
 
@@ -1436,11 +1507,67 @@ class SettingsPage(QWidget):
         self.start_datetime.blockSignals(False)
 
     def _on_save_clicked(self):
+        self.start_datetime.interpretText()
+        if self.start_datetime.hasFocus():
+            self.start_datetime.clearFocus()
         settings = self._save_settings()
         if self.main_window:
             self.main_window._on_project_variables_saved(settings)
 
+    def _crew_count_value(self) -> int | None:
+        raw = (self.crew_count.text() or "").strip()
+        if not raw:
+            return None
+        try:
+            return max(0, int(float(raw)))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _format_day_cost(value: float) -> str:
+        rounded = round(float(value))
+        if abs(float(value) - rounded) < 0.005:
+            return str(int(rounded))
+        return f"{float(value):.2f}"
+
+    def _live_cost_rates(self) -> CostRates:
+        mw = self.main_window
+        page = getattr(mw, "page_costs", None) if mw else None
+        if page is not None and hasattr(page, "_current_rates"):
+            return page._current_rates()
+        return CostRates()
+
+    def _set_cost_field(self, key: str, value: float) -> None:
+        field = self.cost_inputs.get(key)
+        if field is None:
+            return
+        text = self._format_day_cost(value)
+        if field.text() != text:
+            field.blockSignals(True)
+            field.setText(text)
+            field.blockSignals(False)
+
+    def sync_objective_costs_from_rates(self) -> None:
+        """Fill objective costs from the Costs page rates and current crew count."""
+        if not getattr(self, "cost_inputs", None):
+            return
+        n = self._crew_count_value()
+        if n is None:
+            n = DEFAULT_CREW_COUNT
+        rates = self._live_cost_rates()
+        self._set_cost_field(
+            "construction_day_cost", daily_construction_from_rates(n, rates)
+        )
+        self._set_cost_field(
+            "transport_batch_cost", transport_batch_from_rates(rates)
+        )
+        self._crew_count_for_day_cost = n
+
+    def _on_crew_count_changed(self, _text: str = "") -> None:
+        self.sync_objective_costs_from_rates()
+
     def _save_settings(self):
+        self.sync_objective_costs_from_rates()
         return {
             "start_datetime": self._date_value(self.start_datetime),
             "working_days": self.get_working_days_map(),
@@ -1452,10 +1579,8 @@ class SettingsPage(QWidget):
             "crew_count": self.crew_count.text(),
             "site_storage": self.site_storage.text(),
             "factory_storage": self.factory_storage.text(),
-            "w_duration": self.cost_inputs["w_duration"].text(),
-            "w_transport": self.cost_inputs["w_transport"].text(),
-            "w_site_storage": self.cost_inputs["w_site_storage"].text(),
-            "w_factory_storage": self.cost_inputs["w_factory_storage"].text(),
+            "construction_day_cost": self.cost_inputs["construction_day_cost"].text(),
+            "transport_batch_cost": self.cost_inputs["transport_batch_cost"].text(),
         }
 
     def get_working_days_map(self) -> dict[str, bool]:
@@ -1631,9 +1756,9 @@ class ComparisonPage(QWidget):
         upper_label.setStyleSheet("font-size: 14px; font-weight: 500; color: #374151; margin-bottom: 4px;")
         upper_gantt_layout.addWidget(upper_label)
         self.upper_gantt_canvas = self._create_gantt_canvas()
-        # Initialize with empty state
+        self.upper_gantt_scroll = self._wrap_gantt_scroll(self.upper_gantt_canvas)
         self._draw_gantt_chart(self.upper_gantt_canvas, pd.DataFrame(), "Upper Version")
-        upper_gantt_layout.addWidget(self.upper_gantt_canvas)
+        upper_gantt_layout.addWidget(self.upper_gantt_scroll, 1)
         gantt_layout.addWidget(upper_gantt_frame, 1)
         
         # Lower Gantt chart
@@ -1646,9 +1771,9 @@ class ComparisonPage(QWidget):
         lower_label.setStyleSheet("font-size: 14px; font-weight: 500; color: #374151; margin-bottom: 4px;")
         lower_gantt_layout.addWidget(lower_label)
         self.lower_gantt_canvas = self._create_gantt_canvas()
-        # Initialize with empty state
+        self.lower_gantt_scroll = self._wrap_gantt_scroll(self.lower_gantt_canvas)
         self._draw_gantt_chart(self.lower_gantt_canvas, pd.DataFrame(), "Lower Version")
-        lower_gantt_layout.addWidget(self.lower_gantt_canvas)
+        lower_gantt_layout.addWidget(self.lower_gantt_scroll, 1)
         gantt_layout.addWidget(lower_gantt_frame, 1)
         
         layout.addWidget(gantt_container, 1)
@@ -1991,11 +2116,39 @@ class ComparisonPage(QWidget):
             card.trend_icon.setText("→")
         card.trend_icon.setStyleSheet(f"font-size: 14px; color: {color};")
 
+    GANTT_ROW_PX = 22
+    GANTT_AXIS_PAD_PX = 90
+    GANTT_MIN_HEIGHT_PX = 280
+
+    def _gantt_canvas_height(self, n_modules: int) -> int:
+        if n_modules <= 0:
+            return self.GANTT_MIN_HEIGHT_PX
+        return max(self.GANTT_MIN_HEIGHT_PX, n_modules * self.GANTT_ROW_PX + self.GANTT_AXIS_PAD_PX)
+
+    def _wrap_gantt_scroll(self, canvas: FigureCanvas) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setStyleSheet("QScrollArea { background: #FFFFFF; border: none; }")
+        scroll.setMinimumHeight(220)
+        scroll.setWidget(canvas)
+        return scroll
+
+    def _size_gantt_canvas(self, canvas: FigureCanvas, n_modules: int) -> None:
+        height_px = self._gantt_canvas_height(n_modules)
+        canvas.setFixedHeight(height_px)
+        dpi = float(canvas.figure.get_dpi() or 100)
+        width_px = max(canvas.width(), 400)
+        canvas.figure.set_size_inches(width_px / dpi, height_px / dpi, forward=True)
+
     def _create_gantt_canvas(self) -> FigureCanvas:
         """Create a matplotlib canvas for Gantt chart"""
-        fig = Figure(figsize=(12, 6), facecolor='white')
+        fig = Figure(figsize=(12, 4), facecolor='white')
         canvas = FigureCanvas(fig)
-        canvas.setMinimumHeight(300)
+        canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        canvas.setFixedHeight(self.GANTT_MIN_HEIGHT_PX)
         return canvas
     
     def _draw_gantt_chart(self, canvas: FigureCanvas, solution_df: pd.DataFrame, version_label: str = "",
@@ -2017,7 +2170,7 @@ class ComparisonPage(QWidget):
             project_start_datetime: Project start datetime string (format: "%m/%d/%Y")
         """
         if solution_df.empty:
-            # Clear and show empty message
+            self._size_gantt_canvas(canvas, 0)
             canvas.figure.clear()
             ax = canvas.figure.add_subplot(111)
             ax.text(0.5, 0.5, 'No data available', ha='center', va='center', 
@@ -2047,12 +2200,15 @@ class ComparisonPage(QWidget):
         num_modules = len(solution_df)
         
         if num_modules == 0:
+            self._size_gantt_canvas(canvas, 0)
             ax.text(0.5, 0.5, 'No modules to display', ha='center', va='center',
                    transform=ax.transAxes, fontsize=14, color='#9CA3AF')
             ax.axis('off')
             canvas.draw()
             canvas.update()
             return
+
+        self._size_gantt_canvas(canvas, num_modules)
         
         # Calculate y positions (one row per module)
         # Reverse the y positions so earliest fabrication starts appear at the top
@@ -2246,7 +2402,7 @@ class ComparisonPage(QWidget):
         ax.spines['bottom'].set_color('#E5E7EB')
         # Use smaller font size for y-axis labels (module IDs) for better readability
         ax.tick_params(axis='x', colors='#6B7280', labelsize=10)
-        ax.tick_params(axis='y', colors='#6B7280', labelsize=6)  # Smaller font for module IDs
+        ax.tick_params(axis='y', colors='#6B7280', labelsize=9)
         ax.grid(True, axis='x', linestyle='--', alpha=0.3, color='#D1D5DB')
         
         canvas.figure.tight_layout()

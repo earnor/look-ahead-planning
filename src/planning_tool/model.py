@@ -7,13 +7,12 @@ from typing import Optional, Dict, Any
 from ortools.sat.python import cp_model
 
 
-# Integer objective scale. CP-SAT wants integer coefficients; the true
-# weighted objective is recovered after solve from the schedule values.
-_OBJ_SCALE = 10_000
-
-
 def _to_int(value) -> int:
     return int(round(float(value)))
+
+
+def _cents(value) -> int:
+    return int(round(float(value) * 100.0))
 
 
 class PrefabScheduler:
@@ -28,15 +27,12 @@ class PrefabScheduler:
                  M_machine,
                  S_site,
                  S_fac,
-                 w_duration,
-                 w_transport,
-                 w_site_storage,
-                 w_factory_storage,
-                 reference,
+                 construction_day_cost,
+                 transport_batch_cost,
+                 hours_per_day: int = 8,
                  min_batch_size: int = 3,
                  max_batch_size: int = 5):
         """
-        in English
         N: number of modules (real modules 1..N)
         T: time horizon
         d: installation duration dict{i: duration}
@@ -47,12 +43,9 @@ class PrefabScheduler:
         M_machine: machine number at factory
         S_site: onsite storage capacity
         S_fac: factory buffer storage capacity
-        w_*: priority of each objective term, meant to add up to 1
-        reference: values each term is divided by. Duration and transport keep
-            their own scale. The two storage terms share one denominator (the
-            heuristic's total waiting time), so the weights compare a factory
-            module-period with a site module-period instead of being decided
-            by whichever side happened to be empty in the heuristic.
+        construction_day_cost: CHF per working day of project duration
+        transport_batch_cost: CHF per truck batch
+        hours_per_day: working hours on one calendar workday
         """
         self.N = N
         self.T = T
@@ -64,25 +57,9 @@ class PrefabScheduler:
         self.M_machine = M_machine
         self.S_site = S_site
         self.S_fac = S_fac
-        self.w_duration = w_duration
-        self.w_transport = w_transport
-        self.w_site_storage = w_site_storage
-        self.w_factory_storage = w_factory_storage
-        raw = {k: float(v) for k, v in reference.items()}
-        # A zero divisor would blow up the term it scales. The two storage
-        # columns are kept separately for diagnostics; the model uses their sum
-        # so a JIT heuristic (factory wait = 0) cannot make factory storage
-        # look a hundred times more expensive than site storage.
-        self.reference = {
-            "ref_duration": max(1.0, raw["ref_duration"]),
-            "ref_transport": max(1.0, raw["ref_transport"]),
-            "ref_site_storage": raw.get("ref_site_storage", 0.0),
-            "ref_factory_storage": raw.get("ref_factory_storage", 0.0),
-            "ref_storage": max(
-                1.0,
-                raw.get("ref_site_storage", 0.0) + raw.get("ref_factory_storage", 0.0),
-            ),
-        }
+        self.construction_day_cost = float(construction_day_cost or 0)
+        self.transport_batch_cost = float(transport_batch_cost or 0)
+        self.hours_per_day = max(1, int(hours_per_day or 8))
         # A delivery carries between min and max modules; a single load may be
         # smaller because the module count rarely fills every truck.
         self.min_batch_size = min_batch_size
@@ -104,7 +81,7 @@ class PrefabScheduler:
         self._cached_solution = None
         self._true_obj = None
         self._time_limit = 120.0
-        self._mip_gap = 0.2
+        self._mip_gap = 0.15
 
         self.prod_start = {}
         self.arrival = {}
@@ -338,9 +315,22 @@ class PrefabScheduler:
         windows["dummy_end"] = (max(1, min(dummy_end_earliest, T)), T)
         return windows
 
+    def _pinned_time(self, kind: str, i: int):
+        if kind == "production":
+            return self.fixed_production_starts.get(i)
+        if kind == "arrival":
+            return self.fixed_arrival_times.get(i)
+        if kind == "install":
+            return self.fixed_installation_starts.get(i)
+        return None
+
     def _domain(self, kind: str, i: int) -> tuple:
         """Inclusive (lo, hi) for a start variable, clamped to 1..T."""
         T = self.T
+        pinned = self._pinned_time(kind, i)
+        if pinned is not None:
+            t = max(1, min(int(pinned), T))
+            return t, t
         if self.time_windows is None:
             tau = self.reoptimize_from_time
             lo = 1 if tau is None else max(1, tau)
@@ -348,13 +338,12 @@ class PrefabScheduler:
         lo, hi = self.time_windows[kind][i]
         return max(1, min(int(lo), T)), max(1, min(int(hi), T))
 
-    def _true_objective(self, finish: int, n_trucks: int, site: int, factory: int) -> float:
-        ref = self.reference
+    def _true_objective(self, finish: int, n_trucks: int) -> float:
+        hours = max(1, int(self.hours_per_day))
+        days = int(math.ceil(max(0, int(finish)) / hours))
         return (
-            self.w_duration * finish / ref["ref_duration"]
-            + self.w_transport * n_trucks / ref["ref_transport"]
-            + self.w_site_storage * site / ref["ref_storage"]
-            + self.w_factory_storage * factory / ref["ref_storage"]
+            self.construction_day_cost * days
+            + self.transport_batch_cost * n_trucks
         )
 
     def _status_name(self, status) -> str:
@@ -472,7 +461,7 @@ class PrefabScheduler:
 
         m.add_max_equality(finish, [install_start[i] + d[i] for i in range(1, N + 1)])
 
-        # ---- re-optimization pins ----
+        # ---- re-optimization pins and persistent earliest bounds ----
         for i, t in self.fixed_installation_starts.items():
             if 1 <= i <= N:
                 m.add(install_start[i] == _to_int(t))
@@ -482,6 +471,15 @@ class PrefabScheduler:
         for i, t in self.fixed_arrival_times.items():
             if 1 <= i <= N:
                 m.add(arrival[i] == _to_int(t))
+        for i, t in self.earliest_production_starts.items():
+            if 1 <= i <= N and i not in self.fixed_production_starts:
+                m.add(prod_start[i] >= _to_int(t))
+        for i, t in self.earliest_arrival_times.items():
+            if 1 <= i <= N and i not in self.fixed_arrival_times:
+                m.add(arrival[i] >= _to_int(t))
+        for i, t in self.earliest_installation_starts.items():
+            if 1 <= i <= N and i not in self.fixed_installation_starts:
+                m.add(install_start[i] >= _to_int(t))
 
         # ---- truck channeling ----
         # arrival[i] == t <=> arrival_at[i][t]. Load at t is the number of
@@ -521,24 +519,17 @@ class PrefabScheduler:
         if u:
             m.add(sum(u[t] for t in u) <= 1)
 
-        # ---- objective ----
+        # ---- objective: construction-day cost × working days + batch cost × trucks ----
         n_trucks = sum(z[t] for t in z) if z else 0
-        site_storage = sum(site_wait[i] for i in range(1, N + 1))
-        factory_storage = sum(fac_wait[i] for i in range(1, N + 1))
-        ref = self.reference
-        scale = _OBJ_SCALE
-        coeff_d = int(round(self.w_duration * scale / ref["ref_duration"]))
-        coeff_t = int(round(self.w_transport * scale / ref["ref_transport"]))
-        coeff_s = int(round(self.w_site_storage * scale / ref["ref_storage"]))
-        coeff_f = int(round(self.w_factory_storage * scale / ref["ref_storage"]))
-        if coeff_d == coeff_t == coeff_s == coeff_f == 0:
-            coeff_d = 1
-        m.minimize(
-            coeff_d * finish
-            + coeff_t * n_trucks
-            + coeff_s * site_storage
-            + coeff_f * factory_storage
-        )
+        hours = max(1, int(self.hours_per_day))
+        max_days = max(1, (T + hours - 1) // hours)
+        finish_days = m.new_int_var(1, max_days, "finish_days")
+        m.add(finish_days * hours >= finish)
+        cents_day = _cents(self.construction_day_cost)
+        cents_truck = _cents(self.transport_batch_cost)
+        if cents_day == cents_truck == 0:
+            cents_day = 1
+        m.minimize(cents_day * finish_days + cents_truck * n_trucks)
 
         self.m = m
         self.prod_start = prod_start
@@ -578,12 +569,12 @@ class PrefabScheduler:
             return self._true_obj
         if self._solver is None:
             return 0.0
-        return float(self._solver.objective_value) / _OBJ_SCALE
+        return float(self._solver.objective_value) / 100.0
 
     def dual_bound(self) -> float:
         if self._solver is None:
             return 0.0
-        return float(self._solver.best_objective_bound) / _OBJ_SCALE
+        return float(self._solver.best_objective_bound) / 100.0
 
     def mip_gap(self) -> float:
         if self._solver is None:
@@ -733,7 +724,7 @@ class PrefabScheduler:
             max(0, (arrival_time[i] - L[i]) - (production_start[i] + D[i]))
             for i in range(1, N + 1)
         )
-        true_obj = self._true_objective(finish, len(order_times), site_total, factory_total)
+        true_obj = self._true_objective(finish, len(order_times))
         self._true_obj = true_obj
 
         solution = {

@@ -1,0 +1,22 @@
+{
+  "name": "planning-tool-viewer",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "postinstall": "node scripts/copy-worker.mjs"
+  },
+  "devDependencies": {
+    "vite": "^8.0.4"
+  },
+  "dependencies": {
+    "@thatopen/components": "^3.4.0",
+    "@thatopen/components-front": "^3.4.0",
+    "@thatopen/fragments": "^3.4.1",
+    "three": "^0.183.2",
+    "web-ifc": "^0.0.77"
+  }
+}

@@ -11,7 +11,38 @@ from dataclasses import dataclass
 import pandas as pd
 from sqlalchemy import Engine, text
 from .datamanager import ScheduleDataManager
-  
+
+
+def _as_time_index(value) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def calendar_index_to_datetime(slots: List[datetime], idx) -> Optional[datetime]:
+    """slots[t] is the datetime of time index t; slots[0] is unused."""
+    idx = _as_time_index(idx)
+    if idx is None or not (1 <= idx < len(slots)):
+        return None
+    slot = slots[idx]
+    return slot if slot is not None else None
+
+
+def calendar_datetime_to_index(slots: List[datetime], dt: datetime) -> Optional[int]:
+    if dt is None:
+        return None
+    for idx, slot in enumerate(slots[1:], start=1):
+        if slot is not None and slot >= dt:
+            return idx
+    return None
 
 
 @dataclass
@@ -54,27 +85,15 @@ class TaskStateIdentifier:
         self.solution_df = solution_df
         self.current_time = current_time
         self.working_calendar_slots = working_calendar_slots
-        # Convert current_time (time index) to datetime for comparison
-        self.current_datetime = self._index_to_datetime(current_time) if current_time > 0 else None
-        self._time_to_index_map = self._build_time_map()
-    
-    def _build_time_map(self) -> Dict[datetime, int]:
-        """Build mapping from datetime to time index"""
-        return {dt: idx + 1 for idx, dt in enumerate(self.working_calendar_slots)}
+        self.current_datetime = calendar_index_to_datetime(
+            working_calendar_slots, current_time
+        )
     
     def _datetime_to_index(self, dt: datetime) -> Optional[int]:
-        """Convert datetime to time index"""
-        # Find closest time index
-        for idx, slot in enumerate(self.working_calendar_slots):
-            if slot >= dt:
-                return idx + 1
-        return None
+        return calendar_datetime_to_index(self.working_calendar_slots, dt)
     
     def _index_to_datetime(self, idx: int) -> Optional[datetime]:
-        """Convert time index to datetime"""
-        if 1 <= idx <= len(self.working_calendar_slots):
-            return self.working_calendar_slots[idx - 1]
-        return None
+        return calendar_index_to_datetime(self.working_calendar_slots, idx)
     
     def identify_all_states(self) -> Dict[str, List[TaskState]]:
         """
@@ -146,15 +165,12 @@ class TaskStateIdentifier:
     def _identify_phase_state(self, module_id: str, module_index: int, 
                               phase: str, start_idx: Optional[int], 
                               finish_idx: Optional[int], duration: int) -> Optional[TaskState]:
-        """Identify state for a single phase based on current_time"""
-        
-        # Convert time indices to datetimes
-        start_dt = self._index_to_datetime(start_idx)
-        finish_dt = self._index_to_datetime(finish_idx) if finish_idx else None
-        
-        # Determine status based on current_time (actual current time)
-        if self.current_datetime is None:
-            # If current_datetime is not available, treat all as not started
+        """Identify state for a single phase based on current_time (discrete indices)."""
+        start_idx = _as_time_index(start_idx)
+        finish_idx = _as_time_index(finish_idx)
+        tau = _as_time_index(self.current_time)
+
+        if tau is None or tau <= 0:
             return TaskState(
                 module_id=module_id,
                 module_index=module_index,
@@ -164,32 +180,21 @@ class TaskStateIdentifier:
                 finish_time=finish_idx,
                 progress=0.0
             )
-        
-        # Determine status at current_time
-        if finish_dt and finish_dt < self.current_datetime:
-            # Completed by current_time
+
+        if finish_idx is not None and finish_idx < tau:
             status = "COMPLETED"
             progress = 1.0
-            actual_start = None  # Not needed for completed tasks
-        elif start_dt and start_dt <= self.current_datetime:
-            # In progress at current_time
+            actual_start = None
+        elif start_idx is not None and start_idx <= tau:
             status = "IN_PROGRESS"
-            actual_start = start_idx  # Assume started at planned start (could be refined with actual records)
-            if finish_dt:
-                total_duration = (finish_dt - start_dt).total_seconds() / 3600
-                elapsed = (self.current_datetime - start_dt).total_seconds() / 3600
-                if total_duration > 0:
-                    progress = min(1.0, max(0.0, elapsed / total_duration))
-                else:
-                    progress = 0.0  # avoid division by zero when duration invalid
-            else:
-                progress = 0.5  # Unknown progress
+            actual_start = start_idx
+            total = max(1, int(duration or 0))
+            progress = min(1.0, max(0.0, (tau - start_idx) / total))
         else:
-            # Not started at current_time
             status = "NOT_STARTED"
             progress = 0.0
             actual_start = None
-        
+
         return TaskState(
             module_id=module_id,
             module_index=module_index,
@@ -491,17 +496,10 @@ class FixedConstraintsBuilder:
         }
         
     def _index_to_datetime(self, idx: int) -> Optional[datetime]:
-        """Convert time index to datetime"""
-        if 1 <= idx <= len(self.working_calendar_slots):
-            return self.working_calendar_slots[idx - 1]
-        return None
+        return calendar_index_to_datetime(self.working_calendar_slots, idx)
     
     def _datetime_to_index(self, dt: datetime) -> Optional[int]:
-        """Convert datetime to time index"""
-        for idx, slot in enumerate(self.working_calendar_slots):
-            if slot >= dt:
-                return idx + 1
-        return None
+        return calendar_datetime_to_index(self.working_calendar_slots, dt)
     
     def build_fixed_constraints(self) -> Dict[str, any]:
         """
@@ -586,16 +584,16 @@ class FixedConstraintsBuilder:
                                   earliest_production_starts: Dict[int, int]):
         """Handle fabrication phase constraints"""
         if state.status == "COMPLETED":
-            if state.start_time:
+            if state.start_time is not None:
                 fixed_production_starts[module_index] = state.start_time
             fixed_durations.setdefault(module_index, {})['FABRICATION'] = original_row.get('Production_Duration', 0)
 
         elif state.status == "IN_PROGRESS":
-            actual_start = state.actual_start_time if state.actual_start_time else state.start_time
-            if actual_start:
+            actual_start = state.actual_start_time if state.actual_start_time is not None else state.start_time
+            if actual_start is not None:
                 fixed_production_starts[module_index] = actual_start
             total_duration = row.get('Production_Duration', 0)
-            elapsed = max(0, self.current_time - actual_start) if actual_start else 0
+            elapsed = max(0, self.current_time - actual_start) if actual_start is not None else 0
             remaining_duration = max(0, total_duration - elapsed)
             fixed_durations.setdefault(module_index, {})['FABRICATION'] = remaining_duration
 
@@ -616,15 +614,15 @@ class FixedConstraintsBuilder:
             arrival = row.get('Arrival_Time')
             if arrival is None and state.finish_time:
                 arrival = state.finish_time
-            if arrival:
-                fixed_arrival_times[module_index] = arrival
+            if pd.notna(arrival):
+                fixed_arrival_times[module_index] = int(arrival)
             fixed_durations.setdefault(module_index, {})['TRANSPORT'] = original_row.get('Transport_Duration', 0)
 
         elif state.status == "IN_PROGRESS":
             # The truck has left: pin arrival at departure plus the (possibly extended) travel time.
-            actual_start = state.actual_start_time if state.actual_start_time else state.start_time
+            actual_start = state.actual_start_time if state.actual_start_time is not None else state.start_time
             total_duration = row.get('Transport_Duration', 0)
-            elapsed = max(0, self.current_time - actual_start) if actual_start else 0
+            elapsed = max(0, self.current_time - actual_start) if actual_start is not None else 0
             remaining_duration = max(0, int(total_duration or 0) - elapsed)
             fixed_durations.setdefault(module_index, {})['TRANSPORT'] = remaining_duration
             if actual_start is not None and pd.notna(total_duration):
@@ -645,16 +643,16 @@ class FixedConstraintsBuilder:
                                   earliest_installation_starts: Dict[int, int]):
         """Handle installation phase constraints"""
         if state.status == "COMPLETED":
-            if state.start_time:
+            if state.start_time is not None:
                 fixed_installation_starts[module_index] = state.start_time
             fixed_durations.setdefault(module_index, {})['INSTALLATION'] = original_row.get('Installation_Duration', 0)
 
         elif state.status == "IN_PROGRESS":
-            actual_start = state.actual_start_time if state.actual_start_time else state.start_time
-            if actual_start:
+            actual_start = state.actual_start_time if state.actual_start_time is not None else state.start_time
+            if actual_start is not None:
                 fixed_installation_starts[module_index] = actual_start
             total_duration = row.get('Installation_Duration', 0)
-            elapsed = max(0, self.current_time - actual_start) if actual_start else 0
+            elapsed = max(0, self.current_time - actual_start) if actual_start is not None else 0
             remaining_duration = max(0, total_duration - elapsed)
             fixed_durations.setdefault(module_index, {})['INSTALLATION'] = remaining_duration
 

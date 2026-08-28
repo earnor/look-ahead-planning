@@ -3,7 +3,9 @@ Costs page: monetised comparison of a chosen schedule against the original plan.
 
 Gantt comparison lives on the Comparison page. This page only shows costs:
 the chosen (new) version on top, Version 0 underneath.
-Unit rates stay on this page only and are not written to the database.
+Unit rates on this page drive construction-day cost (crane + crew rate ×
+crews + extra daily terms) and transport-batch cost (cost per truck).
+Occupant and biodiversity rates also stay here.
 """
 from __future__ import annotations
 
@@ -455,8 +457,10 @@ class CostsPage(QWidget):
         heading_row.addWidget(currency_caption)
         heading_row.addWidget(self.currency_combo)
         note = QLabel(
-            "The same unit rates are applied to both schedules. "
-            "Working-crew counts come from the Project Variables used when each version was calculated."
+            "Construction-day cost is crane + working-crew rate × that version’s crew count "
+            "+ extra daily terms. Transport-batch cost is the truck rate. Occupant and "
+            "biodiversity rates are also entered here. Crew counts come from the Project "
+            "Variables used when each version was calculated."
         )
         note.setWordWrap(True)
         note.setStyleSheet("font-size: 12px; color: #64748B;")
@@ -602,6 +606,8 @@ class CostsPage(QWidget):
         if project_id is None or engine is None:
             self.chosen_version_combo.blockSignals(False)
             self.original_version_combo.blockSignals(False)
+            self._chosen_settings = {}
+            self._original_settings = {}
             self._set_quantities(ScheduleQuantities(), ScheduleQuantities())
             self.chosen_panel.set_heading("Chosen schedule")
             self.original_panel.set_heading("Lower schedule")
@@ -671,6 +677,8 @@ class CostsPage(QWidget):
 
         self.chosen_panel.set_heading(chosen_label)
         self.original_panel.set_heading(lower_label)
+        self._chosen_settings = self._load_version_settings(chosen_id)
+        self._original_settings = self._load_version_settings(lower_id)
         self._set_quantities(
             self._quantities_for_version(chosen_id, chosen_df, chosen_start),
             self._quantities_for_version(lower_id, lower_df, lower_start),
@@ -817,6 +825,12 @@ class CostsPage(QWidget):
                 rates.append(parsed)
         return rates
 
+    def _push_rates_to_settings(self) -> None:
+        mw = getattr(self, "main_window", None)
+        page = getattr(mw, "page_settings", None) if mw else None
+        if page is not None and hasattr(page, "sync_objective_costs_from_rates"):
+            page.sync_objective_costs_from_rates()
+
     def _current_rates(self) -> CostRates:
         return CostRates(
             crane_per_day=parse_non_negative_number(self.crane_cost_input.text()),
@@ -840,8 +854,13 @@ class CostsPage(QWidget):
         chosen = getattr(self, "chosen_qty", ScheduleQuantities())
         original = getattr(self, "original_qty", ScheduleQuantities())
         currency = self._current_currency()
+        self._push_rates_to_settings()
         costs = compute_monetised_costs(
-            chosen, original, self._current_rates(), households, area_m2
+            chosen,
+            original,
+            self._current_rates(),
+            households,
+            area_m2,
         )
         self.chosen_panel.set_breakdown(
             days=chosen.working_days,

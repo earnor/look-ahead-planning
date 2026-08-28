@@ -4,13 +4,22 @@ Dialog Windows
 This module contains all dialog windows used in the application.
 """
 from datetime import datetime
-from PyQt6.QtCore import Qt
+from pathlib import Path
+import threading
+from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
     QDoubleSpinBox, QSpinBox, QDateTimeEdit, QLineEdit, QDialogButtonBox,
     QFormLayout,
 )
 from PyQt6.QtCore import QDateTime, QLocale
+
+try:
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    from PyQt6.QtWebEngineCore import QWebEngineSettings
+except ImportError:
+    QWebEngineView = None
+    QWebEngineSettings = None
 
 
 class DelayInputDialog(QDialog):
@@ -179,3 +188,61 @@ class AddModuleDialog(QDialog):
             "installation_duration": self.installation_spin.value(),
             "precedence": self.precedence_input.text().strip() or None,
         }
+
+
+class ModelViewerDialog(QDialog):
+    """Popup ThatOpen viewer for a project's converted fragments model."""
+
+    def __init__(self, frag_file: Path, parent=None, extra_files: dict | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("4D Model")
+        self.resize(1100, 760)
+        self._httpd = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        if QWebEngineView is None or QWebEngineSettings is None:
+            message = QLabel(
+                "PyQt6-WebEngine is required to show the 3D viewer in this window.\n"
+                "Install it with:\n\npip install PyQt6-WebEngine"
+            )
+            message.setWordWrap(True)
+            message.setStyleSheet("padding: 24px; font-size: 13px;")
+            layout.addWidget(message)
+            return
+
+        from planning_tool.ifc_model import start_viewer_server
+
+        self._httpd, port = start_viewer_server(
+            Path(frag_file), extra_files=extra_files
+        )
+        thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        thread.start()
+
+        self.view = QWebEngineView(self)
+        settings = self.view.settings()
+        settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, True)
+        settings.setAttribute(
+            QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True
+        )
+        self.view.setUrl(QUrl(f"http://127.0.0.1:{port}/"))
+        layout.addWidget(self.view)
+
+    def closeEvent(self, event):
+        self._shutdown_server()
+        super().closeEvent(event)
+
+    def done(self, result: int):
+        self._shutdown_server()
+        super().done(result)
+
+    def _shutdown_server(self):
+        if self._httpd is None:
+            return
+        try:
+            self._httpd.shutdown()
+            self._httpd.server_close()
+        except Exception:
+            pass
+        self._httpd = None

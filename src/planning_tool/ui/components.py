@@ -231,7 +231,7 @@ class DashboardTable(QFrame):
         self.subtitle.setObjectName("sectionSubtitle")
 
         self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Module ID", "Fabrication Start Time", "Fabrication Duration (h)", "Production Start Index"])
+        self.table.setHorizontalHeaderLabels(["Module ID", "Fabrication Start Time", "Fabrication Duration (h)", "Fabrication Start Index"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)

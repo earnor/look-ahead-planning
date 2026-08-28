@@ -5,12 +5,9 @@ import pandas as pd
 from sqlalchemy import text, Engine, inspect
 
 class ScheduleDataManager:
-    # The objective weights are priorities, so each term is divided by a reference
-    # value before they are added up. The reference comes from the constructive
-    # heuristic on the first optimization and is then kept, so that the objective
-    # values of later versions stay comparable with the first one. The two storage
-    # columns are kept separate for diagnostics; the MIP divides both inventory
-    # terms by their sum.
+    # Optional columns kept for older projects. The solver objective is now
+    # monetised (construction-day cost and transport-batch cost) and no longer
+    # divides terms by these references.
     NORMALIZATION_COLUMNS = (
         "ref_duration",
         "ref_transport",

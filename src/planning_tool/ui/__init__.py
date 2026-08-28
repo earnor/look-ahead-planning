@@ -30,6 +30,7 @@ from .components import (
 from .dialogs import (
     DelayInputDialog,
     AddModuleDialog,
+    ModelViewerDialog,
 )
 
 from .pages import (
@@ -60,6 +61,7 @@ __all__ = [
     # Dialogs
     'DelayInputDialog',
     'AddModuleDialog',
+    'ModelViewerDialog',
     # Pages
     'DashboardPage',
     'SchedulePage',

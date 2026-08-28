@@ -4,27 +4,32 @@
 
 This repository is a research prototype. It is not a production product, has not been certified for operational use, and may change without notice.
 
-The scheduler is a constraint program solved with **OR-Tools CP-SAT**. Production, installation, and storage are interval variables with cumulative resource constraints; truck batching stays discrete. CP-SAT is open source (Apache 2.0); no commercial solver licence is required.
+The scheduler is a constraint program solved with **OR-Tools CP-SAT**. Fabrication, installation, and storage are interval variables with cumulative resource constraints; truck batching stays discrete. CP-SAT is open source (Apache 2.0); no commercial solver licence is required.
 
 ---
 
 ## Overview
 
-The tool supports **look-ahead scheduling** of prefabricated building modules: factory production, factory storage, truck transport, on-site storage, and installation. Given module durations, installation precedence, resource capacities, and a working calendar, it builds a CP-SAT model (interval variables and cumulatives), solves it with OR-Tools, and shows the resulting schedule in a desktop UI.
+The tool supports **look-ahead scheduling** of prefabricated building modules: factory fabrication, factory storage, truck transport, on-site storage, and installation. Given module durations, installation precedence, resource capacities, and a working calendar, it builds a CP-SAT model, solves it with OR-Tools, and shows the plan in a desktop UI.
 
-When delays are recorded against a live schedule, the tool can **re-optimize from a detection time τ**, keeping completed and in-progress work fixed and planning the remainder.
+The time grid is **working hours**. The monetised objective charges **working days** (hours rounded up by the length of a working day) plus **truck batches**. When delays are recorded, the tool can **re-optimize from a detection time τ**, keeping completed and in-progress work fixed.
+
+A demonstration project is stored in `data/input_database.db`. After clone and launch, open that project on **Schedule** to inspect **Version 0**, **Version 2**, and **Version 3** (see [Demonstration versions](#demonstration-versions)).
 
 ## Features
 
 - Import a module list from CSV and store it per project in SQLite
 - Add a module later (name, three durations, installation precedence) so the next Calculate includes it
-- Configure the project start date, working days, work/break hours, machines, crews, and storage capacities
-- Optimize a weighted objective (project duration, transport batches, on-site storage, factory storage)
-- Display the schedule (production → factory wait → transport → site wait → installation)
-- Record production, transport, or installation delays and re-optimize
-- Compare two plan versions (Gantt charts and operational metrics)
-- Monetise two schedule versions (construction, transport batches, occupant disruption, biodiversity)
+- Configure the project start date, working days, work/break hours, machines, crews, and storage
+- Construction-day and transport-batch rates follow the **Costs** page (crane + crew rate × crews + extra daily terms; cost per truck)
+- Minimize construction-day cost × working days + transport-batch cost × trucks
+- Display the schedule (fabrication → factory wait → transport → site wait → installation)
+- Record fabrication, transport, or installation delays and re-optimize
+- Recalculate with new Project Variables (for example crew count) without overwriting Version 0; already-started activities keep their start
+- Compare two versions (Gantt charts and operational metrics)
+- Monetise two versions (construction, transport batches, occupant disruption, biodiversity)
 - Export the current schedule to Excel
+- Upload an IFC, convert it to ThatOpen fragments, and open a **4D Model** popup coloured by schedule status (Mark ↔ Module ID)
 
 ## Requirements
 
@@ -33,9 +38,10 @@ When delays are recorded against a live schedule, the tool can **re-optimize fro
 | Python | 3.11 or newer |
 | OS | Windows, macOS, or Linux with a desktop session |
 | Solver | [OR-Tools CP-SAT](https://developers.google.com/optimization) (`ortools`) |
-| GUI | PyQt6 |
+| GUI | PyQt6, PyQt6-WebEngine (3D viewer popup) |
+| Viewer | Node.js 18+ (only needed to convert a new IFC to fragments) |
 
-Python packages used by the application:
+Python packages:
 
 ```text
 PyQt6
@@ -44,10 +50,12 @@ sqlalchemy
 matplotlib
 numpy
 ortools
-openpyxl          # required for Excel export
+openpyxl          # Excel export
+PyQt6-WebEngine   # 4D Model popup
+ifcopenshell      # IFC GUID–Mark mapping
 ```
 
-Confirm CP-SAT is available with:
+Confirm CP-SAT:
 
 ```bash
 python -c "from ortools.sat.python import cp_model; print('ortools ok')"
@@ -79,10 +87,10 @@ source .venv/bin/activate
 ### 2. Install Python dependencies
 
 ```bash
-pip install PyQt6 pandas sqlalchemy matplotlib numpy openpyxl ortools
+pip install PyQt6 pandas sqlalchemy matplotlib numpy openpyxl ortools PyQt6-WebEngine ifcopenshell
 ```
 
-The application package lives under `src/planning_tool`. Set `PYTHONPATH` to `src` (see below), or install the project in editable mode if you use Poetry:
+The package lives under `src/planning_tool`. Set `PYTHONPATH` to `src` (see below), or install in editable mode:
 
 ```bash
 pip install -e .
@@ -105,22 +113,45 @@ python src/planning_tool/main.py
 PYTHONPATH=src python src/planning_tool/main.py
 ```
 
-The SQLite database is `data/input_database.db`. It is created automatically on first launch.
+The SQLite file is `data/input_database.db`. A clone that includes this file already contains the demonstration project. If the file is missing, the application creates an empty database on first launch.
+
+## Demonstration versions
+
+The bundled project (typically named **Test Input**) stores three plans that are meant to be compared.
+
+| Version | What it is |
+| --- | --- |
+| **Version 0** | First feasible Calculate. Baseline with **no disruptions**. Project Variables at this run (including crew count **2**) stay the reference plan. Later Calculates do not overwrite it. |
+| **Version 2** | Same Project Variables as Version 0, after **three disruptions** and a re-optimize from detection time τ. |
+| **Version 3** | Built on Version 2: crew count changed to **3**, then Calculate again (no new delay). Started/completed activities keep their start times; the remainder is re-planned with three crews. Construction-day cost follows the extra crew (Costs page: crane + 1313 × 3 + extras). |
+
+**Disruptions recorded for Version 2**
+
+| Module | Phase | Change |
+| --- | --- | --- |
+| `C-L1-16` | Fabrication | Duration extended by **2** working hours |
+| `C-L1-12` | Installation | Start postponed by **1** working hour |
+| `S-L2-01` | Transport | Start postponed by **2** working hours |
+
+On **Schedule**, pick a version in the dropdown. On **Comparison** and **Costs**, put Version 2 or 3 in the upper panel and Version 0 in the lower panel to see operational and money differences versus the undisrupted plan.
 
 ## How to use
 
-Work through the sidebar pages in this order.
+Work through the sidebar pages in this order (or open the bundled project and skip to Schedule).
 
 ### 1. Upload Data — create a project
 
 1. Open **Upload Data**.
-2. Optionally click **Download example CSV** to get a template.
+2. Optionally click **Download example CSV** for a template.
 3. Drop or select a CSV file (see [Input format](#input-format)).
 4. Enter a project name and confirm.
+5. With that project selected, drop an IFC on **3D Building Model Upload**. The app converts it to fragments in the background (first run installs the viewer npm packages). Re-uploading an IFC for the same project **overwrites** the previous model.
 
-The uploaded table is stored as read-only. Later optimization writes separate solution tables; it does not rewrite the CSV. **Add Module** on the Schedule page is the supported way to append rows for the next Calculate.
+The CSV table is stored as read-only. Optimization writes separate solution tables. **Add Module** on Schedule is the way to append rows for the next Calculate.
 
-### 2. Project Variables — calendar, resources, weights
+IFC colouring matches property **Mark** (on IfcBeam / IfcColumn / IfcSlab) to CSV **Module ID**. The schedule may cover only a subset of IFC modules: unmatched IFC elements stay the default colour; modules in the CSV with no Mark are skipped without error.
+
+### 2. Project Variables — calendar, resources, costs
 
 Open **Project Variables** and save before the first **Calculate**.
 
@@ -129,86 +160,92 @@ Open **Project Variables** and save before the first **Calculate**.
 | Project start date | Calendar date of time index 1 (first working hour). Stored per project. Locked after the first successful Calculate. |
 | Working days | Weekdays that contain working hours (default Mon–Fri) |
 | Work / break times | Daily working windows; each hour is one time index |
-| Machine count | Parallel factory production capacity |
-| Crew count | Parallel on-site installation capacity |
+| Machine count | Parallel factory fabrication capacity |
+| Crew count | Parallel on-site installation capacity. Changing this updates construction-day cost. |
 | Onsite / factory storage | Maximum modules that may wait at site / factory |
-| Objective weights | Relative priorities; they should sum to 1 |
+| Construction day cost | CHF per working day. Read-only; follows Costs: **crane + crew rate × crews + extra daily terms** (defaults: 1500 + 1313 × 2 = **4126**) |
+| Transport batch cost | CHF per truck. Read-only; follows the Costs page truck rate (default **500**) |
 
-Default weights: duration **0.4**, transport **0.1**, on-site storage **0.4**, factory storage **0.1**.
+The solver minimises
 
-Each objective term is divided by a reference taken from a constructive heuristic on the **first** optimization of the project, then kept, so later versions stay comparable.
+\[
+\text{construction day cost} \times \lceil \text{finish hours} / \text{hours per day} \rceil
++ \text{transport batch cost} \times \text{number of trucks}
+\]
+
+The grid is hours; the first term bills **working days**. Storage is a hard constraint, not in the objective. The two rates are taken from the Costs page at Calculate time and stored with that version.
 
 ### 3. Schedule — optimize
 
 1. Open **Schedule**.
-2. Optionally click **Add Module** and enter a module name, production / transportation / installation durations (working hours), and comma-separated predecessor IDs. The new row is stored in the project input table and is included the next time you click Calculate (Currently, the precedence relationships of uploaded modules cannot be modified).
+2. Optionally click **Add Module** (name, fabrication / transportation / installation durations in working hours, comma-separated predecessor IDs). The row is stored in the input table and included on the next Calculate. Precedence of already uploaded modules cannot be edited.
 3. Click **Calculate**.
 
 The solver:
 
 1. Builds a working-hour calendar from Project Variables.
-2. Runs a constructive heuristic to size the horizon \(T\) and to obtain objective reference values.
-3. Solves the CP-SAT model with OR-Tools (default time limit 120 s, relative gap 20%).
+2. Runs a constructive heuristic to size the horizon \(T\).
+3. Solves CP-SAT (default time limit **120 s**, relative gap **15%**).
 4. Stores the first successful run as **Version 0**.
 
-A later **Calculate** with no pending delay does **not** replace Version 0. It writes a new version with the current Project Variables (for example a different crew count). Delay re-optimization still creates a new version as well.
+A later **Calculate** with no pending delay does **not** replace Version 0. It writes a new version with the current Project Variables (Version 3 in the demo: three crews). Activities that have already started or finished keep their start. Delay re-optimization also writes a new version (Version 2 in the demo).
 
 If no feasible solution is found, no version is written. Check capacities, precedence, and the start date.
 
-The schedule table shows each module’s planned times. Status is derived from “now” versus production start and installation finish.
+The table shows planned times. Row status is derived from “now” versus fabrication start and installation finish.
 
-**Export** writes an Excel workbook of the current version (requires `openpyxl`).
+**Export** writes an Excel workbook of the current version (`openpyxl`).
+
+**4D Model** opens the converted IFC in a ThatOpen popup. Modules that match the schedule are coloured by current phase (producing / transporting / installing). Double-click a coloured element to select the whole module.
 
 ### 4. Record delays and re-optimize
 
-On **Schedule**, double-click a delay cell for **Production**, **Transport**, or **Installation**.
+On **Schedule**, double-click a delay cell for **Fabrication**, **Transport**, or **Installation**.
 
 | Delay type | Typical use |
 | --- | --- |
-| `DURATION_EXTENSION` | The phase takes longer than planned |
-| `START_POSTPONEMENT` | The phase cannot start at the planned time |
+| `DURATION_EXTENSION` | The phase takes longer than planned (demo: `C-L1-16` fabrication +2 h) |
+| `START_POSTPONEMENT` | The phase cannot start at the planned time (demo: `C-L1-12` installation +1 h, `S-L2-01` transport +2 h) |
 
-**Transport** is restricted by progress at detection time τ:
+**Transport** depends on progress at detection time τ:
 
 - Not departed → start postponement only (the truck is re-batched).
-- On the road → duration extension for the **whole truck** (same planned arrival slot, longer travel).
+- On the road → duration extension for the **whole truck**.
 - Already arrived → no transport delay.
 
-Enter delay hours, detection time τ, and an optional reason, then run **Calculate** again. Completed work is frozen; in-progress work keeps its leftover duration; unfixed tasks cannot start before τ. A new version is stored, linked to the base plan.
+Enter delay hours, detection time τ, and an optional reason, then **Calculate**. Completed work is frozen; in-progress work keeps leftover duration; unfixed tasks cannot start before τ. A new version is stored, linked to the base plan.
 
 ### 5. Dashboard
 
-**Dashboard** shows:
-
 - **Planned vs Actual** — share of modules on the latest version whose installation finish is at or before now
-- **Critical Tasks** — distinct modules that have any delay record (pending or already applied)
-- **Start Date**, **Forecast Completion**, and how many modules currently sit in factory or site storage
+- **Critical Tasks** — distinct modules with any delay record
+- **Start Date**, **Forecast Completion**, and modules currently in factory or site storage
 
 ### 6. Comparison
 
 1. Open **Comparison**.
-2. Choose an **Upper** and a **Lower** version.
+2. Choose an **Upper** and a **Lower** version (for the demo: Version 2 or 3 vs Version 0).
 3. Click **Compare**.
 
-Operational metrics (working-hour indices / batches):
+Each Gantt is in its own scroll area. Operational metrics:
 
 - Construction hours
 - Factory storage module hours
 - Site storage module hours
 - Transport batch number
 
-Percentage change on operational cards is relative to the **Lower** version. If Lower is zero, the percentage is shown as `n/a`.
+Percentage change is relative to the **Lower** version. If Lower is zero, the percentage is `n/a`.
 
 ### 7. Costs
 
-**Costs** compares monetised values. Unit costs live on this page only; they are not written to the database.
+Construction and batch money use the **live** unit rates on this page together with **each version’s crew count** from its Calculate snapshot. Occupant and biodiversity rates are also entered here. Extra daily terms apply to every version’s construction-day cost.
 
 1. Open **Costs**.
-2. Enter unit costs (they apply to both panels). Defaults are Swiss-market figures in **CHF**; replace them with your own costs if needed.
-3. Optionally switch the currency label to **EUR**. This changes the displayed abbreviation only; there is no exchange-rate conversion.
-4. Pick a version in the **upper** panel (the chosen / new schedule) and one in the **lower** panel. The default is the latest version versus **Version 0**. The upper total also shows the difference versus the lower panel.
+2. Occupant and biodiversity defaults are Swiss-market figures in **CHF**; replace them if needed.
+3. Optionally switch the label to **EUR** (display only; no exchange-rate conversion).
+4. Pick versions in the upper and lower panels. Default: latest versus **Version 0**. The upper total shows the difference versus the lower panel.
 
-Nearby households and occupied area stay empty until you enter them. Occupant and biodiversity money is then shown as “—”. Crew counts come from the Project Variables snapshot stored with each Calculate, not from the live page.
+Nearby households and occupied area stay empty until you enter them; occupant and biodiversity money is then “—”.
 
 **Default unit costs**
 
@@ -220,16 +257,14 @@ Nearby households and occupied area stay empty until you enter them. Occupant an
 | Occupant cost | **7** CHF/household/day | Default for monetising disruption to neighbouring households (Çelik et al., 2019) |
 | Biodiversity restore price | **50** CHF/m² | Default restoration unit price for lawn, for example turf reinstatement in Switzerland (Ofri, 2026) |
 
-You can add extra daily construction terms on the page. They are added to crane and crew cost before multiplying by working days.
+At two crews the implied construction-day cost is **4126** CHF/day; at three crews it is **5439** CHF/day (1500 + 1313 × 3).
 
-| Category | Quantity from results / settings | User input | Formula |
+| Category | Quantity | User input | Formula |
 | --- | --- | --- | --- |
-| Construction | Working days (project start through latest installation finish, working calendar) and crew count from that version’s Project Variables | Crane CHF/day, crew CHF/crew/day, optional extra daily terms | days × (crane + crew_rate × crews + extras) |
-| Batch | Number of truck trips | Cost per truck | trucks × cost per truck |
-| Disruption to occupants | Working days | Cost per household per day, number of nearby households | days × cost/household/day × households |
+| Construction | Working days (project start through latest installation finish, working calendar) | Crane, crew rate, extras × that version’s crew count | days × (crane + crew rate × crews + extras) |
+| Batch | Truck trips | Cost per truck | trucks × truck rate |
+| Disruption to occupants | Working days | Cost per household per day, nearby households | days × cost/household/day × households |
 | Biodiversity | Occupied area (m²) | Restore price per m² | area × price |
-
-Each version panel lists the four categories and a total.
 
 ## Input format
 
@@ -237,13 +272,13 @@ CSV, UTF-8, header row required.
 
 | Column | Required | Description |
 | --- | --- | --- |
-| `Module ID` or `Module_ID` | yes | Unique module identifier |
+| `Module ID` or `Module_ID` | yes | Unique module identifier (must match IFC **Mark** for 4D colouring) |
 | `Installation Duration` | yes | Installation length in **working hours** |
 | `Production Duration` | yes | Factory production length in **working hours** |
 | `Transportation Duration` | yes | Transport length in **working hours** |
-| `Installation Precedence` | yes | Predecessor module IDs; empty if none. Multiple predecessors: comma-separated (`VS-02-21,VS-02-22`) |
+| `Installation Precedence` | yes | Predecessor module IDs; empty if none. Multiple: comma-separated (`VS-02-21,VS-02-22`) |
 
-Durations are non-negative whole numbers on the same hour grid as the working calendar (one time index = one working hour).
+Durations are non-negative whole numbers on the working-hour grid (one time index = one working hour).
 
 Example:
 
@@ -259,26 +294,31 @@ VS-01-2,3,4,1,VS-02-21
 ```text
 look-ahead-planning/
 ├── data/
-│   ├── input_database.db      # SQLite store (created at runtime)
-│   └── test_input.csv         # small example
+│   ├── input_database.db      # SQLite (projects, schedules, versions)
+│   ├── test_input.csv         # small example CSV
+│   └── models/                # per-project IFC / fragments (local, not required to clone)
 ├── src/planning_tool/
 │   ├── main.py                # application entry
-│   ├── model.py               # CP-SAT scheduler (OR-Tools intervals)
-│   ├── warm_start.py          # constructive heuristic (horizon + references)
+│   ├── model.py               # CP-SAT scheduler
+│   ├── warm_start.py          # constructive heuristic
 │   ├── rescheduler.py         # delay application and re-opt constraints
 │   ├── datamanager.py         # SQLite schema and project tables
-│   ├── costs.py               # unit-rate defaults and monetised cost formulas
+│   ├── costs.py               # unit-rate defaults and monetised formulas
+│   ├── ifc_model.py           # IFC storage, fragments conversion, viewer server
+│   ├── ifc_guid_map.py        # IFC Mark → GUID grouping
 │   └── ui/                    # PyQt6 pages, dialogs, widgets
-│       └── costs_page.py      # Costs page
-└── tests/                     # scripts for selected policies and metrics
+├── viewer/                    # ThatOpen viewer and Node IFC→frag converter
+└── tests/
 ```
 
 ## Solver notes
 
-- One time period is one **working hour** on the calendar from Project Variables (weekends and non-working days are skipped).
+- One time period is one **working hour** on the Project Variables calendar (weekends and non-working days are skipped).
+- The objective uses **working days**: \(\lceil \text{finish hours} / \text{hours per day} \rceil\), plus the number of trucks.
 - Truck loads are batched (typically 3–5 modules; one partial load is allowed).
-- The heuristic chooses \(T\) (so search stays on a short horizon) and is also given to CP-SAT as a solution hint.
-- Default CP-SAT limits: time **120** seconds, relative gap **0.2** (20%). Production, installation, site storage, and factory storage are cumulative constraints on interval variables.
+- The heuristic chooses \(T\) and is passed to CP-SAT as a solution hint.
+- Default CP-SAT limits: **120** seconds, relative gap **0.15** (15%). Fabrication, installation, site storage, and factory storage are cumulative constraints on interval variables.
+- A reported status of `OPTIMAL` can mean the gap limit was met, not that the dual bound is fully closed.
 
 ## Disclaimer
 
