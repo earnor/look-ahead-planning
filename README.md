@@ -14,7 +14,7 @@ The tool supports **look-ahead scheduling** of prefabricated building modules: f
 
 The time grid is **working hours**. The monetised objective charges **working days** (hours rounded up by the length of a working day) plus **truck batches**. When delays are recorded, the tool can **re-optimize from a detection time τ**, keeping completed and in-progress work fixed.
 
-A demonstration project is stored in `data/input_database.db`. After clone and launch, open that project on **Schedule** to inspect **Version 0**, **Version 1**, and **Version 2** (see [Demonstration versions](#demonstration-versions)).
+A demonstration project is stored in `data/input_database.db`. The matching demo IFC (and converted fragments) is in `data/models/`. After clone and launch, open that project on **Schedule** to inspect **Version 0**, **Version 1**, and **Version 2** (see [Demonstration versions](#demonstration-versions)), then click **4D Model**. Node.js 18+ is required the first time the viewer is built.
 
 ## Features
 
@@ -38,7 +38,7 @@ A demonstration project is stored in `data/input_database.db`. After clone and l
 | OS | Windows, macOS, or Linux with a desktop session |
 | Solver | [OR-Tools CP-SAT](https://developers.google.com/optimization) (`ortools`) |
 | GUI | PyQt6, PyQt6-WebEngine (3D viewer popup) |
-| Viewer | Node.js 18+ (only needed to convert a new IFC to fragments) |
+| Viewer | Node.js 18+ (needed to open **4D Model**, or to convert a new IFC) |
 
 Python packages:
 
@@ -112,7 +112,7 @@ python src/planning_tool/main.py
 PYTHONPATH=src python src/planning_tool/main.py
 ```
 
-The SQLite file is `data/input_database.db`. A clone that includes this file already contains the demonstration project. If the file is missing, the application creates an empty database on first launch.
+The SQLite file is `data/input_database.db`. A clone already contains the demonstration project and its IFC under `data/models/`. If the database file is missing, the application creates an empty database on first launch.
 
 ## Demonstration versions
 
@@ -196,7 +196,7 @@ The table shows planned times. Row status is derived from “now” versus fabri
 
 **Export** writes an Excel workbook of the current version (`openpyxl`).
 
-**4D Model** opens the converted IFC in a ThatOpen popup. Modules that match the schedule are coloured by current phase (producing / transporting / installing). Double-click a coloured element to select the whole module.
+**4D Model** opens the converted IFC in a ThatOpen popup. The demo IFC is already in the repository (`data/models/`); clone and open **4D Model** on the bundled project — no separate file transfer or re-upload is needed. Modules that match the schedule are coloured by current phase (producing / transporting / installing). Double-click a coloured element to select the whole module.
 
 ![4D Model viewer](docs/screenshots/4d-model.png)
 
@@ -296,7 +296,7 @@ look-ahead-planning/
 ├── data/
 │   ├── input_database.db      # SQLite (projects, schedules, versions)
 │   ├── test_input.csv         # small example CSV
-│   └── models/                # per-project IFC / fragments (local, not required to clone)
+│   └── models/                # demo IFC + fragments (included in clone)
 ├── src/planning_tool/
 │   ├── main.py                # application entry
 │   ├── model.py               # CP-SAT scheduler
