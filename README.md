@@ -167,10 +167,10 @@ Open **Project Variables** and save before the first **Calculate**.
 
 The solver minimises
 
-\[
-\text{construction day cost} \times \lceil \text{finish hours} / \text{hours per day} \rceil
-+ \text{transport batch cost} \times \text{number of trucks}
-\]
+```text
+construction-day cost × ⌈finish hours / hours per day⌉
++ transport-batch cost × number of trucks
+```
 
 The grid is hours; the first term bills **working days**. Storage is a hard constraint, not in the objective. The two costs are taken from the Costs page at Calculate time and stored with that version.
 
@@ -182,7 +182,7 @@ The grid is hours; the first term bills **working days**. Storage is a hard cons
 The solver:
 
 1. Builds a working-hour calendar from Project Variables.
-2. Runs a constructive heuristic to size the horizon \(T\).
+2. Runs a constructive heuristic to size the horizon *T*.
 3. Solves CP-SAT (default time limit **120 s**, relative gap **15%**).
 4. Stores the first successful run as **Version 0**.
 
@@ -197,6 +197,8 @@ The table shows planned times. Row status is derived from “now” versus fabri
 **Export** writes an Excel workbook of the current version (`openpyxl`).
 
 **4D Model** opens the converted IFC in a ThatOpen popup. Modules that match the schedule are coloured by current phase (producing / transporting / installing). Double-click a coloured element to select the whole module.
+
+![4D Model viewer](docs/screenshots/4d-model.png)
 
 ### 4. Record delays and re-optimize
 
@@ -313,9 +315,9 @@ look-ahead-planning/
 ## Solver notes
 
 - One time period is one **working hour** on the Project Variables calendar (weekends and non-working days are skipped).
-- The objective uses **working days**: \(\lceil \text{finish hours} / \text{hours per day} \rceil\), plus the number of trucks.
+- The objective uses **working days**: ⌈finish hours / hours per day⌉, plus the number of trucks.
 - Truck loads are batched (typically 3–5 modules; one partial load is allowed).
-- The heuristic chooses \(T\) and is passed to CP-SAT as a solution hint.
+- The heuristic chooses *T* and is passed to CP-SAT as a solution hint.
 - Default CP-SAT limits: **120** seconds, relative gap **0.15** (15%). Fabrication, installation, site storage, and factory storage are cumulative constraints on interval variables.
 - A reported status of `OPTIMAL` can mean the gap limit was met, not that the dual bound is fully closed.
 
