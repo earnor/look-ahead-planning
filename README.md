@@ -4,17 +4,18 @@
 
 This repository is a research prototype. It is not a production product, has not been certified for operational use, and may change without notice.
 
-The scheduler is a constraint program solved with **OR-Tools CP-SAT**. Fabrication, installation, and storage are interval variables with cumulative resource constraints; truck batching stays discrete. CP-SAT is open source (Apache 2.0); no commercial solver licence is required.
+The scheduler is a constraint program solved with the package **OR-Tools CP-SAT**. Fabrication, installation, and storage are interval variables with cumulative resource constraints; truck batching stays discrete. CP-SAT is open source (Apache 2.0); no commercial solver license is required.
 
+This is a link to a video demonstrating the functionality of the tool: [instruction_video.mp4](https://polybox.ethz.ch/index.php/s/RXCLXdnGSFL7MCw)
 ---
 
 ## Overview
 
-The tool supports **look-ahead scheduling** of prefabricated building modules: factory fabrication, factory storage, truck transport, on-site storage, and installation. Given module durations, installation precedence, resource capacities, and a working calendar, it builds a CP-SAT model, solves it with OR-Tools, and shows the plan in a desktop UI.
+The tool supports **look-ahead planning** of prefabricated building modules. This includes the planning of factory fabrication, factory storage, truck transport, on-site storage, and installation. Given module durations, installation precedence, resource capacities, and a working calendar, it builds a CP-SAT model, solves it with OR-Tools, and shows the plan in a desktop UI.
 
 The time grid is **working hours**. The monetised objective charges **working days** (hours rounded up by the length of a working day) plus **truck batches**. When delays are recorded, the tool can **re-optimize from a detection time τ**, keeping completed and in-progress work fixed.
 
-A demonstration project is stored in `data/input_database.db`. The matching demo IFC (and converted fragments) is in `data/models/`. After clone and launch, open that project on **Schedule** to inspect **Version 0**, **Version 1**, and **Version 2** (see [Demonstration versions](#demonstration-versions)), then click **4D Model**. Node.js 18+ is required the first time the viewer is built.
+The tool is stored with a demonstration project, so that a new user can run the tool using a demonstration project. The demonstration project is stored in `data/input_database.db`. The matching demo IFC (and converted fragments) is in `data/models/`. After clone and launch, open that project on **Schedule** to inspect **Version 0**, **Version 1**, and **Version 2** (see [Demonstration versions](#demonstration-versions)), then click **4D Model**. Node.js 18+ is required the first time the viewer is built.
 
 ## Features
 
@@ -118,11 +119,11 @@ The SQLite file is `data/input_database.db`. A clone already contains the demons
 
 The bundled project (typically named **Test Input**) stores three plans that are meant to be compared.
 
-| Version | What it is |
-| --- | --- |
-| **Version 0** | First feasible Calculate. Baseline with **no disruptions**. |
-| **Version 1** | Same Project Variables as Version 0, after **three disruptions** and a re-optimize from detection time τ. |
-| **Version 2** | Built on Version 1: crew count changed to **3**, then Calculate again (no new delay). |
+| Version | What it is | Hypothetical situation |
+| --- | --- | --- |
+| **Version 0** | First feasible Calculate. Baseline with **no disruptions**. | This is the schedule that is computed during the planning stages of the project. |
+| **Version 1** | Same Project Variables as Version 0, after **three disruptions** and a re-optimize from detection time τ. | This is the schedule that a project manager computes after a disruption is identified at time τ. |
+| **Version 2** | Built on Version 1: crew count changed to **3**, then Calculate again (no new delay). | This is the schedule that a project manager computes after a disruption is identified at time τ, given different boundary constraints than in Version 1. |
 
 **Disruptions recorded for Version 1**
 
@@ -131,6 +132,11 @@ The bundled project (typically named **Test Input**) stores three plans that are
 | `C-L1-16` | Fabrication | Duration extended by **2** working hours |
 | `C-L1-12` | Installation | Start postponed by **2** working hours |
 | `S-L2-01` | Transport | Start postponed by **2** working hours |
+
+
+**Boundary constraint changes recorded for Version 2**
+
+Same three disruptions as Version 1. Crew count changed from **2** to **3**, then Calculate again (no new delay).
 
 On **Schedule**, pick a version in the dropdown. On **Comparison** and **Costs**, put different versions in the upper panel and the lower panel to see operational and money differences between them.
 
