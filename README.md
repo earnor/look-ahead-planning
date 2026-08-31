@@ -7,6 +7,7 @@ This repository is a research prototype. It is not a production product, has not
 The scheduler is a constraint program solved with the package **OR-Tools CP-SAT**. Fabrication, installation, and storage are interval variables with cumulative resource constraints; truck batching stays discrete. CP-SAT is open source (Apache 2.0); no commercial solver license is required.
 
 This is a link to a video demonstrating the functionality of the tool: [instruction_video.mp4](https://polybox.ethz.ch/index.php/s/RXCLXdnGSFL7MCw)
+
 ---
 
 ## Overview
